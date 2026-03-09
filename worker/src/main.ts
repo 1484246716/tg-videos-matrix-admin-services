@@ -2,8 +2,8 @@ import { Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import dotenv from 'dotenv';
 import { createReadStream, openAsBlob } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
-import { basename, extname, resolve } from 'node:path';
+import { mkdir, readdir, rename, stat } from 'node:fs/promises';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
   CatalogTaskStatus,
@@ -64,6 +64,27 @@ function normalizeTelegramApiBase(raw: string): string {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function moveToArchive(localPath: string): Promise<string> {
+  // Skip if already in an archived folder
+  if (localPath.includes(`${join('archived')}`)) {
+    return localPath;
+  }
+
+  const fileName = basename(localPath);
+  // localPath: .../data/tg-crm/channels/1003896883365/file.mp4
+  const channelIdDir = dirname(localPath);              // .../channels/1003896883365
+  const channelDirName = basename(channelIdDir);        // 1003896883365
+  const channelsDir = dirname(channelIdDir);            // .../channels
+  const dataBaseDir = dirname(channelsDir);             // .../data/tg-crm
+  const archiveDir = join(dataBaseDir, 'archived', channelDirName);
+  await mkdir(archiveDir, { recursive: true });
+  const archivePath = join(archiveDir, fileName);
+  await rename(localPath, archivePath);
+  // eslint-disable-next-line no-console
+  console.log(`[archive] moved ${localPath} -> ${archivePath}`);
+  return archivePath;
+}
 
 async function waitForFileStable(filePath: string) {
   let previousSize: bigint | null = null;
@@ -131,8 +152,8 @@ async function sendTelegramRequest(args: {
     headers: isFormData
       ? undefined
       : {
-          'content-type': 'application/json',
-        },
+        'content-type': 'application/json',
+      },
     body: isFormData ? args.payload : JSON.stringify(args.payload),
   });
 
@@ -374,7 +395,10 @@ async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
         createdAssets += 1;
       }
 
-      if (asset.status === MediaStatus.relay_uploaded) {
+      if (
+        asset.status === MediaStatus.relay_uploaded ||
+        asset.status === MediaStatus.ingesting
+      ) {
         continue;
       }
 
@@ -644,10 +668,22 @@ async function scheduleDueRelayUploadTasks() {
       where: asset.status === MediaStatus.ready ? whereReady : whereStaleIngesting,
       data: {
         status: MediaStatus.ingesting,
+        updatedAt: new Date(),
       },
     });
 
     if (updated.count === 0) continue;
+
+    const jobId = `relay-upload-${asset.id.toString()}`;
+    const existingJob = await relayUploadQueue.getJob(jobId);
+    if (existingJob) {
+      const state = await existingJob.getState();
+      if (state === 'failed') {
+        await existingJob.remove();
+      } else {
+        continue;
+      }
+    }
 
     await relayUploadQueue.add(
       'relay-upload',
@@ -656,7 +692,7 @@ async function scheduleDueRelayUploadTasks() {
         relayChannelId,
       },
       {
-        jobId: `relay-upload-${asset.id.toString()}`,
+        jobId,
         removeOnComplete: true,
         removeOnFail: 200,
       },
@@ -993,6 +1029,14 @@ const relayUploadWorker = new Worker(
       throw new Error('Relay upload succeeded but missing telegram video file_id');
     }
 
+    let archivePath: string | null = null;
+    try {
+      archivePath = await moveToArchive(mediaAsset.localPath);
+    } catch (moveErr) {
+      // eslint-disable-next-line no-console
+      console.warn(`[q_relay_upload] failed to move file to archive:`, moveErr);
+    }
+
     await prisma.mediaAsset.update({
       where: { id: mediaAssetId },
       data: {
@@ -1001,6 +1045,7 @@ const relayUploadWorker = new Worker(
         telegramFileId: sendResult.videoFileId,
         telegramFileUniqueId: sendResult.videoFileUniqueId ?? null,
         ingestError: null,
+        ...(archivePath ? { archivePath, localPath: archivePath } : {}),
       },
     });
 
@@ -1183,6 +1228,37 @@ catalogWorker.on('failed', (job, err) => {
   console.error(`[q_catalog] failed job ${job?.id}:`, err.message);
 });
 
+async function drainStaleRelayJobs() {
+  // eslint-disable-next-line no-console
+  console.log('[bootstrap] draining stale relay upload jobs...');
+  let removed = 0;
+
+  const failedJobs = await relayUploadQueue.getFailed(0, 500);
+  for (const job of failedJobs) {
+    await job.remove();
+    removed += 1;
+  }
+
+  const waitingJobs = await relayUploadQueue.getWaiting(0, 500);
+  for (const job of waitingJobs) {
+    if (job.name !== 'bootstrap-check') {
+      await job.remove();
+      removed += 1;
+    }
+  }
+
+  const delayedJobs = await relayUploadQueue.getDelayed(0, 500);
+  for (const job of delayedJobs) {
+    await job.remove();
+    removed += 1;
+  }
+
+  if (removed > 0) {
+    // eslint-disable-next-line no-console
+    console.log(`[bootstrap] removed ${removed} stale relay upload job(s)`);
+  }
+}
+
 async function bootstrap() {
   await dispatchQueue.add(
     'bootstrap-check',
@@ -1201,6 +1277,8 @@ async function bootstrap() {
     { source: 'worker_startup', timestamp: new Date().toISOString() },
     { removeOnComplete: true, removeOnFail: 100 },
   );
+
+  await drainStaleRelayJobs();
 
   setInterval(() => {
     void scheduleEnabledTaskDefinitions().catch((err) => {
