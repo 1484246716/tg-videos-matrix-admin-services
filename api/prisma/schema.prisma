@@ -1,0 +1,352 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserStatus {
+  active
+  disabled
+}
+
+enum BotStatus {
+  active
+  paused
+  blocked
+  invalid
+}
+
+enum ChannelStatus {
+  active
+  paused
+  archived
+}
+
+enum MediaStatus {
+  new
+  ingesting
+  ready
+  relay_uploaded
+  failed
+  deleted
+}
+
+enum TaskStatus {
+  pending
+  scheduled
+  running
+  success
+  failed
+  cancelled
+  dead
+}
+
+enum SourceType {
+  alist
+  manual
+  api
+}
+
+enum CatalogTaskStatus {
+  pending
+  running
+  success
+  failed
+  cancelled
+}
+
+enum RiskLevel {
+  low
+  medium
+  high
+  critical
+}
+
+model User {
+  id           BigInt      @id @default(autoincrement())
+  username     String      @unique @db.VarChar(64)
+  email        String?     @unique @db.VarChar(128)
+  passwordHash String      @map("password_hash") @db.VarChar(255)
+  displayName  String?     @map("display_name") @db.VarChar(64)
+  status       UserStatus  @default(active)
+  lastLoginAt  DateTime?   @map("last_login_at") @db.Timestamptz(6)
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("users")
+}
+
+model Bot {
+  id                BigInt      @id @default(autoincrement())
+  name              String      @db.VarChar(64)
+  tokenEncrypted    String      @map("token_encrypted")
+  tokenMasked       String      @map("token_masked") @db.VarChar(64)
+  telegramBotId     BigInt?     @map("telegram_bot_id")
+  username          String?     @db.VarChar(64)
+  status            BotStatus   @default(active)
+  rateLimitPerMin   Int         @default(8) @map("rate_limit_per_min")
+  dailyQuota        Int?        @map("daily_quota")
+  lastHealthCheckAt DateTime?   @map("last_health_check_at") @db.Timestamptz(6)
+  lastError         String?     @map("last_error")
+  extra             Json?
+  createdAt         DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  channels          Channel[]      @relation("ChannelDefaultBot")
+  relayChannels     RelayChannel[]
+
+  @@index([status])
+  @@map("bots")
+}
+
+model RelayChannel {
+  id              BigInt      @id @default(autoincrement())
+  name            String      @db.VarChar(128)
+  tgChatId        BigInt      @unique @map("tg_chat_id")
+  botId           BigInt      @map("bot_id")
+  isActive        Boolean     @default(true) @map("is_active")
+  autoCleanupDays Int         @default(30) @map("auto_cleanup_days")
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  bot             Bot         @relation(fields: [botId], references: [id])
+  channels        Channel[]
+
+  @@index([botId])
+  @@map("relay_channels")
+}
+
+model AiModelProfile {
+  id                    BigInt      @id @default(autoincrement())
+  name                  String      @db.VarChar(128)
+  provider              String      @db.VarChar(64)
+  model                 String      @db.VarChar(128)
+  apiKeyEncrypted       String      @map("api_key_encrypted")
+  endpointUrl           String?     @map("endpoint_url") @db.VarChar(255)
+  systemPrompt          String?     @map("system_prompt")
+  captionPromptTemplate String?     @map("caption_prompt_template")
+  temperature           Decimal?    @db.Decimal(4, 2)
+  topP                  Decimal?    @map("top_p") @db.Decimal(4, 2)
+  maxTokens             Int?        @map("max_tokens")
+  timeoutMs             Int         @default(20000) @map("timeout_ms")
+  isActive              Boolean     @default(true) @map("is_active")
+  fallbackProfileId     BigInt?     @map("fallback_profile_id")
+  createdAt             DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  channels              Channel[]
+
+  @@index([isActive])
+  @@map("ai_model_profiles")
+}
+
+model Channel {
+  id                 BigInt          @id @default(autoincrement())
+  name               String          @db.VarChar(128)
+  tgChatId           String          @unique @map("tg_chat_id") @db.VarChar(32)
+  tgUsername         String?         @map("tg_username") @db.VarChar(64)
+  folderPath         String          @map("folder_path") @db.VarChar(255)
+  status             ChannelStatus   @default(active)
+
+  defaultBotId       BigInt?         @map("default_bot_id")
+  relayChannelId     BigInt?         @map("relay_channel_id")
+  aiModelProfileId   BigInt?         @map("ai_model_profile_id")
+  catalogTemplateId  BigInt?         @map("catalog_template_id")
+  aiSystemPromptTemplate String?     @map("ai_system_prompt_template")
+  navTemplateText    String?         @map("nav_template_text")
+  aiReplyMarkup      Json?           @map("ai_reply_markup")
+  navReplyMarkup     Json?           @map("nav_reply_markup")
+
+  postIntervalSec    Int             @default(120) @map("post_interval_sec")
+  postJitterMinSec   Int             @default(5) @map("post_jitter_min_sec")
+  postJitterMaxSec   Int             @default(30) @map("post_jitter_max_sec")
+
+  navIntervalSec     Int             @default(604800) @map("nav_interval_sec")
+  navRecentLimit     Int             @default(60) @map("nav_recent_limit")
+
+  adEnabled          Boolean         @default(false) @map("ad_enabled")
+  adPinEnabled       Boolean         @default(false) @map("ad_pin_enabled")
+
+  alistTargetPath    String?         @map("alist_target_path") @db.VarChar(255)
+  autoImportEnabled  Boolean         @default(true) @map("auto_import_enabled")
+
+  lastPostAt         DateTime?       @map("last_post_at") @db.Timestamptz(6)
+  lastNavUpdateAt    DateTime?       @map("last_nav_update_at") @db.Timestamptz(6)
+
+  createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  defaultBot         Bot?            @relation("ChannelDefaultBot", fields: [defaultBotId], references: [id])
+  relayChannel       RelayChannel?   @relation(fields: [relayChannelId], references: [id])
+  aiModelProfile     AiModelProfile? @relation(fields: [aiModelProfileId], references: [id])
+  catalogTemplate    CatalogTemplate? @relation(fields: [catalogTemplateId], references: [id])
+
+  mediaAssets        MediaAsset[]
+  catalogTasks       CatalogTask[]
+  catalogHistories   CatalogHistory[]
+  dispatchTasks      DispatchTask[]
+
+  @@index([status])
+  @@index([defaultBotId, status])
+  @@index([catalogTemplateId])
+  @@map("channels")
+}
+
+model MediaAsset {
+  id                    BigInt      @id @default(autoincrement())
+  channelId             BigInt      @map("channel_id")
+  originalName          String      @map("original_name") @db.VarChar(255)
+  localPath             String      @map("local_path") @db.VarChar(512)
+  archivePath           String?     @map("archive_path") @db.VarChar(512)
+  fileSize              BigInt      @map("file_size")
+  fileHash              String      @map("file_hash") @db.VarChar(128)
+  durationSec           Int?        @map("duration_sec")
+  status                MediaStatus @default(new)
+  relayMessageId        BigInt?     @map("relay_message_id")
+  telegramFileId        String?     @map("telegram_file_id")
+  telegramFileUniqueId  String?     @map("telegram_file_unique_id")
+  sourceMeta            Json?       @map("source_meta")
+  ingestError           String?     @map("ingest_error")
+  createdAt             DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  channel               Channel     @relation(fields: [channelId], references: [id])
+  dispatchTasks         DispatchTask[]
+
+  @@unique([fileHash, fileSize])
+  @@index([channelId, status])
+  @@map("media_assets")
+}
+
+model CatalogTemplate {
+  id              BigInt           @id @default(autoincrement())
+  name            String           @db.VarChar(128)
+  bodyTemplate    String           @map("body_template")
+  recentLimit     Int              @default(60) @map("recent_limit")
+  isActive        Boolean          @default(true) @map("is_active")
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  channels        Channel[]
+  catalogTasks    CatalogTask[]
+  catalogHistories CatalogHistory[]
+
+  @@index([isActive])
+  @@map("catalog_templates")
+}
+
+model CatalogTask {
+  id                 BigInt            @id @default(autoincrement())
+  channelId          BigInt            @map("channel_id")
+  catalogTemplateId  BigInt            @map("catalog_template_id")
+  status             CatalogTaskStatus @default(pending)
+  plannedAt          DateTime?         @map("planned_at") @db.Timestamptz(6)
+  startedAt          DateTime?         @map("started_at") @db.Timestamptz(6)
+  finishedAt         DateTime?         @map("finished_at") @db.Timestamptz(6)
+  contentPreview     String?           @map("content_preview")
+  pinAfterPublish    Boolean           @default(false) @map("pin_after_publish")
+  pinSuccess         Boolean?          @map("pin_success")
+  pinErrorMessage    String?           @map("pin_error_message")
+  telegramMessageId  BigInt?           @map("telegram_message_id")
+  telegramMessageLink String?          @map("telegram_message_link")
+  errorMessage       String?           @map("error_message")
+  createdAt          DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime          @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  channel            Channel           @relation(fields: [channelId], references: [id])
+  catalogTemplate    CatalogTemplate   @relation(fields: [catalogTemplateId], references: [id])
+
+  @@index([channelId, status])
+  @@index([catalogTemplateId])
+  @@map("catalog_tasks")
+}
+
+model CatalogHistory {
+  id                BigInt          @id @default(autoincrement())
+  channelId         BigInt          @map("channel_id")
+  catalogTemplateId BigInt          @map("catalog_template_id")
+  content           String
+  renderedCount     Int             @default(0) @map("rendered_count")
+  publishedAt       DateTime        @default(now()) @map("published_at") @db.Timestamptz(6)
+  createdAt         DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  channel           Channel         @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  catalogTemplate   CatalogTemplate @relation(fields: [catalogTemplateId], references: [id], onDelete: Cascade)
+
+  @@index([channelId, publishedAt(sort: Desc)])
+  @@index([catalogTemplateId, publishedAt(sort: Desc)])
+  @@map("catalog_histories")
+}
+
+model DispatchTask {
+  id                    BigInt      @id @default(autoincrement())
+  channelId             BigInt      @map("channel_id")
+  mediaAssetId          BigInt      @map("media_asset_id")
+  botId                 BigInt?     @map("bot_id")
+
+  scheduleSlot          DateTime    @map("schedule_slot") @db.Timestamptz(6)
+  plannedAt             DateTime    @map("planned_at") @db.Timestamptz(6)
+  nextRunAt             DateTime    @map("next_run_at") @db.Timestamptz(6)
+
+  captionText           String?     @map("caption_text")
+  replyMarkup           Json?       @map("reply_markup")
+  parseMode             String?     @default("HTML") @map("parse_mode") @db.VarChar(16)
+
+  status                TaskStatus  @default(pending)
+  priority              Int         @default(100)
+  retryCount            Int         @default(0) @map("retry_count")
+  maxRetries            Int         @default(6) @map("max_retries")
+
+  telegramMessageId     BigInt?     @map("telegram_message_id")
+  telegramMessageLink   String?     @map("telegram_message_link")
+  telegramErrorCode     String?     @map("telegram_error_code") @db.VarChar(32)
+  telegramErrorMessage  String?     @map("telegram_error_message")
+
+  startedAt             DateTime?   @map("started_at") @db.Timestamptz(6)
+  finishedAt            DateTime?   @map("finished_at") @db.Timestamptz(6)
+  createdAt             DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime    @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  channel               Channel     @relation(fields: [channelId], references: [id])
+  mediaAsset            MediaAsset  @relation(fields: [mediaAssetId], references: [id])
+  logs                  DispatchTaskLog[]
+  riskEvents            RiskEvent[]
+
+  @@unique([channelId, mediaAssetId, scheduleSlot])
+  @@index([status, nextRunAt])
+  @@index([channelId, status])
+  @@map("dispatch_tasks")
+}
+
+model DispatchTaskLog {
+  id              BigInt       @id @default(autoincrement())
+  dispatchTaskId  BigInt       @map("dispatch_task_id")
+  action          String       @db.VarChar(64)
+  detail          Json?
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  dispatchTask    DispatchTask @relation(fields: [dispatchTaskId], references: [id], onDelete: Cascade)
+
+  @@index([dispatchTaskId, createdAt(sort: Desc)])
+  @@map("dispatch_task_logs")
+}
+
+model RiskEvent {
+  id              BigInt        @id @default(autoincrement())
+  level           RiskLevel
+  eventType       String        @map("event_type") @db.VarChar(64)
+  botId           BigInt?       @map("bot_id")
+  channelId       BigInt?       @map("channel_id")
+  dispatchTaskId  BigInt?       @map("dispatch_task_id")
+  payload         Json?
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  dispatchTask    DispatchTask? @relation(fields: [dispatchTaskId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt(sort: Desc)])
+  @@index([botId, createdAt(sort: Desc)])
+  @@map("risk_events")
+}
