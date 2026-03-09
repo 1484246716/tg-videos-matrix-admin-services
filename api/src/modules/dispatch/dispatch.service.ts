@@ -90,7 +90,6 @@ export class DispatchService {
         scheduleSlot,
         plannedAt,
         nextRunAt,
-        captionText: dto.captionText,
         priority: dto.priority ?? 100,
         maxRetries: dto.maxRetries ?? 6,
       },

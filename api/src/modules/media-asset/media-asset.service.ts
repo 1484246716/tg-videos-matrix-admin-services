@@ -1,9 +1,27 @@
-import { Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { readdir, stat } from 'node:fs/promises';
+import { basename, extname, resolve } from 'node:path';
 import { MediaStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateMediaAssetDto } from './dto/create-media-asset.dto';
 import { UpdateMediaAssetStatusDto } from './dto/update-media-asset-status.dto';
 import { MarkRelayUploadedDto } from './dto/mark-relay-uploaded.dto';
+import { BatchEnqueueRelayUploadDto } from './dto/batch-enqueue-relay-upload.dto';
+
+const SUPPORTED_VIDEO_EXT = new Set([
+  '.mp4',
+  '.mkv',
+  '.mov',
+  '.avi',
+  '.m4v',
+  '.webm',
+]);
 
 @Injectable()
 export class MediaAssetService {
@@ -73,5 +91,120 @@ export class MediaAssetService {
         ingestError: null,
       },
     });
+  }
+
+  private async hashFile(filePath: string): Promise<string> {
+    return new Promise((resolveHash, reject) => {
+      const hash = createHash('sha256');
+      const stream = createReadStream(filePath);
+
+      stream.on('data', (chunk) => hash.update(chunk));
+      stream.on('end', () => resolveHash(hash.digest('hex')));
+      stream.on('error', reject);
+    });
+  }
+
+  private async scanChannelVideos(folderPath: string) {
+    const absolute = resolve(folderPath);
+    const entries = await readdir(absolute, { withFileTypes: true });
+
+    const files = entries
+      .filter((entry) => entry.isFile())
+      .map((entry) => resolve(absolute, entry.name))
+      .filter((filePath) => SUPPORTED_VIDEO_EXT.has(extname(filePath).toLowerCase()));
+
+    return files;
+  }
+
+  async batchEnqueueRelayUpload(dto: BatchEnqueueRelayUploadDto) {
+    const relayChannel = await this.prisma.relayChannel.findUnique({
+      where: { id: BigInt(dto.relayChannelId) },
+      select: { id: true, isActive: true },
+    });
+
+    if (!relayChannel) {
+      throw new NotFoundException('relay channel not found');
+    }
+
+    if (!relayChannel.isActive) {
+      throw new BadRequestException('relay channel is not active');
+    }
+
+    const channels = await this.prisma.channel.findMany({
+      where: { status: 'active' },
+      select: { id: true, folderPath: true },
+    });
+
+    let scannedFiles = 0;
+    let createdAssets = 0;
+    let enqueuedTasks = 0;
+
+    for (const channel of channels) {
+      let files: string[] = [];
+      try {
+        files = await this.scanChannelVideos(channel.folderPath);
+      } catch {
+        continue;
+      }
+
+      for (const filePath of files) {
+        scannedFiles += 1;
+
+        const s = await stat(filePath);
+        const fileHash = await this.hashFile(filePath);
+
+        let asset = await this.prisma.mediaAsset.findUnique({
+          where: {
+            fileHash_fileSize: {
+              fileHash,
+              fileSize: s.size,
+            },
+          },
+          select: { id: true, status: true },
+        });
+
+        if (!asset) {
+          asset = await this.prisma.mediaAsset.create({
+            data: {
+              channelId: channel.id,
+              originalName: basename(filePath),
+              localPath: filePath,
+              fileSize: BigInt(s.size),
+              fileHash,
+              status: MediaStatus.downloaded,
+            },
+            select: { id: true, status: true },
+          });
+          createdAssets += 1;
+        }
+
+        if (asset.status === MediaStatus.relay_uploaded) {
+          continue;
+        }
+
+        await this.prisma.mediaAsset.update({
+          where: { id: asset.id },
+          data: {
+            status: MediaStatus.ready,
+            sourceMeta: {
+              relayChannelId: dto.relayChannelId,
+              relayEnqueueAt: new Date().toISOString(),
+              relayPriority: dto.priority ?? 100,
+              relayMaxRetries: dto.maxRetries ?? 6,
+            },
+          },
+        });
+
+        enqueuedTasks += 1;
+      }
+    }
+
+    return {
+      relayChannelId: dto.relayChannelId,
+      scannedFiles,
+      createdAssets,
+      enqueuedTasks,
+      message: 'Type A 扫描并入队完成（当前入 dispatch_tasks 队列）',
+    };
   }
 }

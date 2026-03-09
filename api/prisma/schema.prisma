@@ -65,6 +65,12 @@ enum RiskLevel {
   critical
 }
 
+enum TaskDefinitionType {
+  relay_upload
+  dispatch_send
+  catalog_publish
+}
+
 model User {
   id           BigInt      @id @default(autoincrement())
   username     String      @unique @db.VarChar(64)
@@ -114,6 +120,7 @@ model RelayChannel {
 
   bot             Bot         @relation(fields: [botId], references: [id])
   channels        Channel[]
+  taskDefinitions TaskDefinition[]
 
   @@index([botId])
   @@map("relay_channels")
@@ -230,9 +237,10 @@ model CatalogTemplate {
   createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt       DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  channels        Channel[]
-  catalogTasks    CatalogTask[]
+  channels         Channel[]
+  catalogTasks     CatalogTask[]
   catalogHistories CatalogHistory[]
+  taskDefinitions  TaskDefinition[]
 
   @@index([isActive])
   @@map("catalog_templates")
@@ -291,7 +299,6 @@ model DispatchTask {
   plannedAt             DateTime    @map("planned_at") @db.Timestamptz(6)
   nextRunAt             DateTime    @map("next_run_at") @db.Timestamptz(6)
 
-  captionText           String?     @map("caption_text")
   replyMarkup           Json?       @map("reply_markup")
   parseMode             String?     @default("HTML") @map("parse_mode") @db.VarChar(16)
 
@@ -349,4 +356,28 @@ model RiskEvent {
   @@index([createdAt(sort: Desc)])
   @@index([botId, createdAt(sort: Desc)])
   @@map("risk_events")
+}
+
+model TaskDefinition {
+  id                 BigInt              @id @default(autoincrement())
+  name               String              @db.VarChar(128)
+  taskType           TaskDefinitionType  @map("task_type")
+  isEnabled          Boolean             @default(true) @map("is_enabled")
+  scheduleCron       String?             @map("schedule_cron") @db.VarChar(64)
+  relayChannelId     BigInt?             @map("relay_channel_id")
+  catalogTemplateId  BigInt?             @map("catalog_template_id")
+  priority           Int                 @default(100)
+  maxRetries         Int                 @default(6) @map("max_retries")
+  payload            Json?
+  lastRunAt          DateTime?           @map("last_run_at") @db.Timestamptz(6)
+  lastRunStatus      String?             @map("last_run_status") @db.VarChar(32)
+  lastRunSummary     Json?               @map("last_run_summary")
+  createdAt          DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  relayChannel       RelayChannel?       @relation(fields: [relayChannelId], references: [id], onDelete: SetNull)
+  catalogTemplate    CatalogTemplate?    @relation(fields: [catalogTemplateId], references: [id], onDelete: SetNull)
+
+  @@index([taskType, isEnabled])
+  @@map("task_definitions")
 }

@@ -1,13 +1,14 @@
 import {
   IsBoolean,
-  IsEnum,
+  IsIn,
   IsInt,
   IsOptional,
   IsString,
   Max,
   Min,
 } from 'class-validator';
-import { ChannelStatus } from '@prisma/client';
+
+const CHANNEL_STATUS_VALUES = ['active', 'paused', 'archived'] as const;
 
 export class UpdateChannelDto {
   @IsOptional()
@@ -27,8 +28,8 @@ export class UpdateChannelDto {
   folderPath?: string;
 
   @IsOptional()
-  @IsEnum(ChannelStatus)
-  status?: ChannelStatus;
+  @IsIn(CHANNEL_STATUS_VALUES)
+  status?: 'active' | 'paused' | 'archived';
 
   @IsOptional()
   @IsInt()

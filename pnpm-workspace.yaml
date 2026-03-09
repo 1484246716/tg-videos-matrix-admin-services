@@ -1,0 +1,12 @@
+packages:
+  - api
+  - worker
+
+ignoredBuiltDependencies:
+  - '@nestjs/core'
+  - msgpackr-extract
+
+onlyBuiltDependencies:
+  - '@prisma/client'
+  - '@prisma/engines'
+  - prisma

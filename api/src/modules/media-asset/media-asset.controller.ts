@@ -4,6 +4,7 @@ import { MediaAssetService } from './media-asset.service';
 import { CreateMediaAssetDto } from './dto/create-media-asset.dto';
 import { UpdateMediaAssetStatusDto } from './dto/update-media-asset-status.dto';
 import { MarkRelayUploadedDto } from './dto/mark-relay-uploaded.dto';
+import { BatchEnqueueRelayUploadDto } from './dto/batch-enqueue-relay-upload.dto';
 
 @Controller('media-assets')
 export class MediaAssetController {
@@ -35,5 +36,10 @@ export class MediaAssetController {
   @Patch(':id/relay-uploaded')
   markRelayUploaded(@Param('id') id: string, @Body() dto: MarkRelayUploadedDto) {
     return this.mediaAssetService.markRelayUploaded(id, dto);
+  }
+
+  @Post('relay-upload/batch-enqueue')
+  batchEnqueueRelayUpload(@Body() dto: BatchEnqueueRelayUploadDto) {
+    return this.mediaAssetService.batchEnqueueRelayUpload(dto);
   }
 }

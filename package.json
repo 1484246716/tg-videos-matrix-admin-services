@@ -1,0 +1,17 @@
+{
+  "name": "@tg-crm/backend-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "api",
+    "worker"
+  ],
+  "scripts": {
+    "dev:api": "npm run start:dev -w @tg-crm/api",
+    "dev:worker": "npm run dev -w @tg-crm/worker",
+    "build": "npm run build -ws",
+    "build:api": "npm run build -w @tg-crm/api",
+    "build:worker": "npm run build -w @tg-crm/worker",
+    "prisma:generate": "npm run prisma:generate -w @tg-crm/api"
+  }
+}

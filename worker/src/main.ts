@@ -1,9 +1,19 @@
 import { Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import dotenv from 'dotenv';
-import { CatalogTaskStatus, PrismaClient, TaskStatus } from '@prisma/client';
+import { createReadStream, openAsBlob } from 'node:fs';
+import { readdir, stat } from 'node:fs/promises';
+import { basename, extname, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import {
+  CatalogTaskStatus,
+  MediaStatus,
+  PrismaClient,
+  TaskDefinitionType,
+  TaskStatus,
+} from '@prisma/client';
 
-dotenv.config({ path: '../../.env' });
+dotenv.config({ path: '../.env' });
 dotenv.config();
 
 const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
@@ -14,9 +24,35 @@ const prisma = new PrismaClient();
 
 const dispatchQueue = new Queue('q_dispatch', { connection });
 const catalogQueue = new Queue('q_catalog', { connection });
+const relayUploadQueue = new Queue('q_relay_upload', { connection });
 
 const SCHEDULER_POLL_MS = 5000;
 const MAX_SCHEDULE_BATCH = 100;
+const RELAY_MIN_STABLE_CHECKS = Number(process.env.RELAY_MIN_STABLE_CHECKS || '3');
+const RELAY_STABLE_INTERVAL_MS = Number(process.env.RELAY_STABLE_INTERVAL_MS || '10000');
+const RELAY_MTIME_COOLDOWN_MS = Number(process.env.RELAY_MTIME_COOLDOWN_MS || '60000');
+
+const SUPPORTED_VIDEO_EXT = new Set([
+  '.mp4',
+  '.mkv',
+  '.mov',
+  '.avi',
+  '.m4v',
+  '.webm',
+]);
+
+let hasWarnedMissingTaskDefinitionsTable = false;
+
+function getTaskDefinitionModel() {
+  const model = prisma.taskDefinition;
+  if (!model) {
+    throw new Error(
+      'Prisma taskDefinition model is unavailable. Please run prisma generate and restart worker.',
+    );
+  }
+
+  return model;
+}
 
 function getBackoffSeconds(retryCount: number): number {
   const base = Math.max(1, Math.pow(2, retryCount));
@@ -25,6 +61,34 @@ function getBackoffSeconds(retryCount: number): number {
 
 function normalizeTelegramApiBase(raw: string): string {
   return raw.replace(/\/+$/, '');
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitForFileStable(filePath: string) {
+  let previousSize: bigint | null = null;
+  let stableCount = 0;
+
+  while (stableCount < RELAY_MIN_STABLE_CHECKS) {
+    const s = await stat(filePath);
+
+    if (previousSize !== null && s.size === previousSize) {
+      stableCount += 1;
+    } else {
+      stableCount = 0;
+      previousSize = s.size;
+    }
+
+    if (stableCount < RELAY_MIN_STABLE_CHECKS) {
+      await sleep(RELAY_STABLE_INTERVAL_MS);
+    }
+  }
+
+  const finalStat = await stat(filePath);
+  const ageMs = Date.now() - finalStat.mtimeMs;
+  if (ageMs < RELAY_MTIME_COOLDOWN_MS) {
+    await sleep(RELAY_MTIME_COOLDOWN_MS - ageMs);
+  }
 }
 
 function toTelegramMessageLink(
@@ -56,22 +120,29 @@ type TelegramError = {
 
 async function sendTelegramRequest(args: {
   botToken: string;
-  method: 'sendVideo' | 'sendMessage' | 'pinChatMessage';
-  payload: Record<string, unknown>;
-}): Promise<{ messageId?: number }> {
+  method: 'sendVideo' | 'sendDocument' | 'sendMessage' | 'pinChatMessage';
+  payload: Record<string, unknown> | FormData;
+}): Promise<{ messageId?: number; videoFileId?: string; videoFileUniqueId?: string }> {
   const endpoint = `${normalizeTelegramApiBase(telegramApiBase)}/bot${args.botToken}/${args.method}`;
 
+  const isFormData = args.payload instanceof FormData;
   const response = await fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify(args.payload),
+    headers: isFormData
+      ? undefined
+      : {
+          'content-type': 'application/json',
+        },
+    body: isFormData ? args.payload : JSON.stringify(args.payload),
   });
 
   const json = (await response.json()) as {
     ok: boolean;
-    result?: { message_id?: number } | true;
+    result?: {
+      message_id?: number;
+      video?: { file_id?: string; file_unique_id?: string };
+      document?: { file_id?: string; file_unique_id?: string };
+    } | true;
     error_code?: number;
     description?: string;
     parameters?: { retry_after?: number };
@@ -94,6 +165,14 @@ async function sendTelegramRequest(args: {
     messageId:
       json.result && typeof json.result === 'object'
         ? json.result.message_id
+        : undefined,
+    videoFileId:
+      json.result && typeof json.result === 'object'
+        ? (json.result.video?.file_id ?? json.result.document?.file_id)
+        : undefined,
+    videoFileUniqueId:
+      json.result && typeof json.result === 'object'
+        ? (json.result.video?.file_unique_id ?? json.result.document?.file_unique_id)
         : undefined,
   };
 }
@@ -170,6 +249,296 @@ async function pinMessageByTelegram(args: {
   });
 }
 
+async function updateTaskDefinitionRunStatus(args: {
+  taskDefinitionId: bigint;
+  status: 'success' | 'failed';
+  summary: Record<string, unknown>;
+}) {
+  await getTaskDefinitionModel().update({
+    where: { id: args.taskDefinitionId },
+    data: {
+      lastRunAt: new Date(),
+      lastRunStatus: args.status,
+      lastRunSummary: args.summary,
+    },
+  });
+}
+
+async function hashFile(filePath: string): Promise<string> {
+  return new Promise((resolveHash, reject) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(filePath);
+
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolveHash(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+
+async function scanChannelVideos(folderPath: string) {
+  const absolute = resolve(folderPath);
+  const entries = await readdir(absolute, { withFileTypes: true });
+
+  const files = entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => resolve(absolute, entry.name))
+    .filter((filePath) => SUPPORTED_VIDEO_EXT.has(extname(filePath).toLowerCase()));
+
+  return files;
+}
+
+async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
+  const definition = await getTaskDefinitionModel().findUnique({
+    where: { id: taskDefinitionId },
+    select: {
+      id: true,
+      relayChannelId: true,
+      priority: true,
+      maxRetries: true,
+      payload: true,
+    },
+  });
+
+  if (!definition || !definition.relayChannelId) {
+    return {
+      scannedFiles: 0,
+      createdAssets: 0,
+      enqueuedTasks: 0,
+      skipped: true,
+      reason: 'relayChannelId is missing',
+    };
+  }
+
+  const payload = (definition.payload ?? {}) as Record<string, unknown>;
+  const payloadChannelIds = Array.isArray(payload.channelIds)
+    ? payload.channelIds.map((v) => String(v))
+    : [];
+
+  const channels = await prisma.channel.findMany({
+    where: {
+      status: 'active',
+      ...(payloadChannelIds.length > 0
+        ? { id: { in: payloadChannelIds.map((id) => BigInt(id)) } }
+        : {}),
+    },
+    select: { id: true, folderPath: true },
+  });
+
+  let scannedFiles = 0;
+  let createdAssets = 0;
+  let enqueuedTasks = 0;
+
+  for (const channel of channels) {
+    let files: string[] = [];
+    try {
+      files = await scanChannelVideos(channel.folderPath);
+    } catch {
+      continue;
+    }
+
+    for (const filePath of files) {
+      scannedFiles += 1;
+
+      const s = await stat(filePath);
+      const fileHash = await hashFile(filePath);
+
+      let asset = await prisma.mediaAsset.findUnique({
+        where: {
+          fileHash_fileSize: {
+            fileHash,
+            fileSize: s.size,
+          },
+        },
+        select: { id: true, status: true },
+      });
+
+      if (!asset) {
+        asset = await prisma.mediaAsset.create({
+          data: {
+            channelId: channel.id,
+            originalName: basename(filePath),
+            localPath: filePath,
+            fileSize: BigInt(s.size),
+            fileHash,
+            status: MediaStatus.ready,
+            sourceMeta: {
+              relayChannelId: definition.relayChannelId.toString(),
+              taskDefinitionId: definition.id.toString(),
+              relayEnqueueAt: new Date().toISOString(),
+              relayPriority: definition.priority,
+              relayMaxRetries: definition.maxRetries,
+            },
+          },
+          select: { id: true, status: true },
+        });
+        createdAssets += 1;
+      }
+
+      if (asset.status === MediaStatus.relay_uploaded) {
+        continue;
+      }
+
+      await prisma.mediaAsset.update({
+        where: { id: asset.id },
+        data: {
+          status: MediaStatus.ready,
+          sourceMeta: {
+            relayChannelId: definition.relayChannelId.toString(),
+            taskDefinitionId: definition.id.toString(),
+            relayEnqueueAt: new Date().toISOString(),
+            relayPriority: definition.priority,
+            relayMaxRetries: definition.maxRetries,
+          },
+        },
+      });
+
+      enqueuedTasks += 1;
+    }
+  }
+
+  return {
+    scannedFiles,
+    createdAssets,
+    enqueuedTasks,
+    relayChannelId: definition.relayChannelId.toString(),
+  };
+}
+
+async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
+  try {
+    await scheduleDueDispatchTasks();
+    await updateTaskDefinitionRunStatus({
+      taskDefinitionId,
+      status: 'success',
+      summary: {
+        executor: 'dispatch_send',
+        message: 'dispatch scheduler tick completed',
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'unknown error';
+    await updateTaskDefinitionRunStatus({
+      taskDefinitionId,
+      status: 'failed',
+      summary: {
+        executor: 'dispatch_send',
+        error: message,
+      },
+    });
+
+    throw error;
+  }
+}
+
+async function scheduleRelayForDefinition(taskDefinitionId: bigint) {
+  try {
+    const enqueueSummary = await enqueueRelayAssetsFromTaskDefinition(taskDefinitionId);
+    await scheduleDueRelayUploadTasks();
+    await updateTaskDefinitionRunStatus({
+      taskDefinitionId,
+      status: 'success',
+      summary: {
+        executor: 'relay_upload',
+        ...enqueueSummary,
+        message: 'relay upload scan + scheduler tick completed',
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'unknown error';
+    await updateTaskDefinitionRunStatus({
+      taskDefinitionId,
+      status: 'failed',
+      summary: {
+        executor: 'relay_upload',
+        error: message,
+      },
+    });
+
+    throw error;
+  }
+}
+
+async function scheduleCatalogForDefinition(taskDefinitionId: bigint) {
+  try {
+    await scheduleDueCatalogTasks();
+    await updateTaskDefinitionRunStatus({
+      taskDefinitionId,
+      status: 'success',
+      summary: {
+        executor: 'catalog_publish',
+        message: 'catalog scheduler tick completed',
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'unknown error';
+    await updateTaskDefinitionRunStatus({
+      taskDefinitionId,
+      status: 'failed',
+      summary: {
+        executor: 'catalog_publish',
+        error: message,
+      },
+    });
+
+    throw error;
+  }
+}
+
+async function scheduleEnabledTaskDefinitions() {
+  let definitions: Array<{ id: bigint; taskType: TaskDefinitionType }> = [];
+
+  try {
+    definitions = await getTaskDefinitionModel().findMany({
+      where: { isEnabled: true },
+      orderBy: [{ priority: 'asc' }, { updatedAt: 'asc' }],
+      take: MAX_SCHEDULE_BATCH,
+      select: {
+        id: true,
+        taskType: true,
+      },
+    });
+  } catch (error) {
+    const isTableMissing =
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      (error as { code?: string }).code === 'P2021';
+
+    if (isTableMissing) {
+      if (!hasWarnedMissingTaskDefinitionsTable) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[scheduler:task-definitions] table task_definitions not found, fallback to legacy schedulers. Run prisma migrate to enable task definitions.',
+        );
+        hasWarnedMissingTaskDefinitionsTable = true;
+      }
+
+      await scheduleDueDispatchTasks();
+      await scheduleDueRelayUploadTasks();
+      await scheduleDueCatalogTasks();
+      return;
+    }
+
+    throw error;
+  }
+
+  for (const definition of definitions) {
+    if (definition.taskType === TaskDefinitionType.relay_upload) {
+      await scheduleRelayForDefinition(definition.id);
+      continue;
+    }
+
+    if (definition.taskType === TaskDefinitionType.dispatch_send) {
+      await scheduleDispatchForDefinition(definition.id);
+      continue;
+    }
+
+    if (definition.taskType === TaskDefinitionType.catalog_publish) {
+      await scheduleCatalogForDefinition(definition.id);
+    }
+  }
+}
+
 async function scheduleDueDispatchTasks() {
   const now = new Date();
 
@@ -213,7 +582,7 @@ async function scheduleDueDispatchTasks() {
         retryCount: task.retryCount,
       },
       {
-        jobId: `dispatch:${task.id.toString()}`,
+        jobId: `dispatch-${task.id.toString()}`,
         removeOnComplete: true,
         removeOnFail: 200,
       },
@@ -223,6 +592,82 @@ async function scheduleDueDispatchTasks() {
   if (dueTasks.length > 0) {
     // eslint-disable-next-line no-console
     console.log(`[scheduler] queued ${dueTasks.length} dispatch task(s)`);
+  }
+}
+
+async function scheduleDueRelayUploadTasks() {
+  const staleIngestingBefore = new Date(Date.now() - 5 * 60 * 1000);
+
+  const dueAssets = await prisma.mediaAsset.findMany({
+    where: {
+      telegramFileId: null,
+      OR: [
+        { status: MediaStatus.ready },
+        {
+          status: MediaStatus.ingesting,
+          updatedAt: { lte: staleIngestingBefore },
+        },
+      ],
+    },
+    orderBy: { createdAt: 'asc' },
+    take: MAX_SCHEDULE_BATCH,
+    select: {
+      id: true,
+      channelId: true,
+      status: true,
+      sourceMeta: true,
+      updatedAt: true,
+    },
+  });
+
+  let queuedCount = 0;
+
+  for (const asset of dueAssets) {
+    const sourceMeta = (asset.sourceMeta ?? {}) as Record<string, unknown>;
+    const relayChannelId = sourceMeta.relayChannelId;
+    if (typeof relayChannelId !== 'string' || !relayChannelId.trim()) continue;
+
+    const whereReady = {
+      id: asset.id,
+      status: MediaStatus.ready,
+      telegramFileId: null,
+    };
+
+    const whereStaleIngesting = {
+      id: asset.id,
+      status: MediaStatus.ingesting,
+      telegramFileId: null,
+      updatedAt: { lte: staleIngestingBefore },
+    };
+
+    const updated = await prisma.mediaAsset.updateMany({
+      where: asset.status === MediaStatus.ready ? whereReady : whereStaleIngesting,
+      data: {
+        status: MediaStatus.ingesting,
+      },
+    });
+
+    if (updated.count === 0) continue;
+
+    await relayUploadQueue.add(
+      'relay-upload',
+      {
+        mediaAssetId: asset.id.toString(),
+        relayChannelId,
+      },
+      {
+        jobId: `relay-upload-${asset.id.toString()}`,
+        removeOnComplete: true,
+        removeOnFail: 200,
+      },
+    );
+
+    queuedCount += 1;
+  }
+
+  if (queuedCount > 0) {
+    // eslint-disable-next-line no-console
+    console.log(`[scheduler] queued ${queuedCount} relay upload task(s)`);
   }
 }
 
@@ -264,7 +709,7 @@ async function scheduleDueCatalogTasks() {
         channelId: task.channelId.toString(),
       },
       {
-        jobId: `catalog:${task.id.toString()}`,
+        jobId: `catalog-${task.id.toString()}`,
         removeOnComplete: true,
         removeOnFail: 200,
       },
@@ -280,6 +725,10 @@ async function scheduleDueCatalogTasks() {
 const dispatchWorker = new Worker(
   'q_dispatch',
   async (job) => {
+    if (job.name === 'bootstrap-check') {
+      return { ok: true, skipped: true, reason: 'bootstrap-check' };
+    }
+
     const dispatchTaskIdRaw = job.data.dispatchTaskId as string | undefined;
     if (!dispatchTaskIdRaw) {
       throw new Error('Missing dispatchTaskId in job payload');
@@ -361,7 +810,6 @@ const dispatchWorker = new Worker(
         botToken: bot.tokenEncrypted,
         chatId: task.channel.tgChatId,
         fileId: task.mediaAsset.telegramFileId,
-        caption: task.captionText,
         parseMode: task.parseMode,
         replyMarkup: task.replyMarkup,
       });
@@ -465,9 +913,114 @@ const dispatchWorker = new Worker(
   { connection, concurrency: 5 },
 );
 
+const relayUploadWorker = new Worker(
+  'q_relay_upload',
+  async (job) => {
+    if (job.name === 'bootstrap-check') {
+      return { ok: true, skipped: true, reason: 'bootstrap-check' };
+    }
+
+    const mediaAssetIdRaw = job.data.mediaAssetId as string | undefined;
+    const relayChannelIdRaw = job.data.relayChannelId as string | undefined;
+
+    if (!mediaAssetIdRaw || !relayChannelIdRaw) {
+      throw new Error('Missing mediaAssetId or relayChannelId in relay upload job payload');
+    }
+
+    const mediaAssetId = BigInt(mediaAssetIdRaw);
+
+    const mediaAsset = await prisma.mediaAsset.findUnique({
+      where: { id: mediaAssetId },
+      include: {
+        channel: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+      },
+    });
+
+    if (!mediaAsset) {
+      throw new Error(`Media asset not found: ${mediaAssetIdRaw}`);
+    }
+
+    const relayChannel = await prisma.relayChannel.findUnique({
+      where: { id: BigInt(relayChannelIdRaw) },
+      include: {
+        bot: {
+          select: {
+            id: true,
+            status: true,
+            tokenEncrypted: true,
+          },
+        },
+      },
+    });
+
+    if (!relayChannel) {
+      throw new Error(`Relay channel not found: ${relayChannelIdRaw}`);
+    }
+
+    if (!relayChannel.isActive) {
+      throw new Error(`Relay channel is inactive: ${relayChannelIdRaw}`);
+    }
+
+    if (!relayChannel.bot || relayChannel.bot.status !== 'active') {
+      throw new Error('Relay channel bot is missing or inactive');
+    }
+
+    await waitForFileStable(mediaAsset.localPath);
+
+    const formData = new FormData();
+    formData.append('chat_id', relayChannel.tgChatId.toString());
+    formData.append('caption', mediaAsset.originalName);
+    formData.append('video', await openAsBlob(mediaAsset.localPath), basename(mediaAsset.localPath));
+    formData.append('supports_streaming', 'true');
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[q_relay_upload] uploading mediaAsset=${mediaAssetIdRaw} to relayChannel=${relayChannelIdRaw}`,
+    );
+
+    const sendResult = await sendTelegramRequest({
+      botToken: relayChannel.bot.tokenEncrypted,
+      method: 'sendVideo',
+      payload: formData,
+    });
+
+    if (!sendResult.messageId || !sendResult.videoFileId) {
+      throw new Error('Relay upload succeeded but missing telegram video file_id');
+    }
+
+    await prisma.mediaAsset.update({
+      where: { id: mediaAssetId },
+      data: {
+        status: MediaStatus.relay_uploaded,
+        relayMessageId: BigInt(sendResult.messageId),
+        telegramFileId: sendResult.videoFileId,
+        telegramFileUniqueId: sendResult.videoFileUniqueId ?? null,
+        ingestError: null,
+      },
+    });
+
+    return {
+      ok: true,
+      mediaAssetId: mediaAssetIdRaw,
+      relayChannelId: relayChannelIdRaw,
+      messageId: sendResult.messageId,
+    };
+  },
+  { connection, concurrency: 2 },
+);
+
 const catalogWorker = new Worker(
   'q_catalog',
   async (job) => {
+    if (job.name === 'bootstrap-check') {
+      return { ok: true, skipped: true, reason: 'bootstrap-check' };
+    }
+
     const catalogTaskIdRaw = job.data.catalogTaskId as string | undefined;
     if (!catalogTaskIdRaw) {
       throw new Error('Missing catalogTaskId in job payload');
@@ -594,6 +1147,32 @@ dispatchWorker.on('failed', (job, err) => {
   console.error(`[q_dispatch] failed job ${job?.id}:`, err.message);
 });
 
+relayUploadWorker.on('completed', (job) => {
+  // eslint-disable-next-line no-console
+  console.log(`[q_relay_upload] completed job ${job.id}`);
+});
+
+relayUploadWorker.on('failed', async (job, err) => {
+  const mediaAssetIdRaw = job?.data?.mediaAssetId as string | undefined;
+  if (mediaAssetIdRaw) {
+    await prisma.mediaAsset.update({
+      where: { id: BigInt(mediaAssetIdRaw) },
+      data: {
+        status: MediaStatus.failed,
+        ingestError: err.message,
+      },
+    });
+  }
+
+  // eslint-disable-next-line no-console
+  console.error(`[q_relay_upload] failed job ${job?.id}:`, err.message);
+});
+
+relayUploadWorker.on('error', (err) => {
+  // eslint-disable-next-line no-console
+  console.error('[q_relay_upload] worker error:', err);
+});
+
 catalogWorker.on('completed', (job) => {
   // eslint-disable-next-line no-console
   console.log(`[q_catalog] completed job ${job.id}`);
@@ -617,20 +1196,21 @@ async function bootstrap() {
     { removeOnComplete: true, removeOnFail: 100 },
   );
 
-  setInterval(() => {
-    void scheduleDueDispatchTasks().catch((err) => {
-      // eslint-disable-next-line no-console
-      console.error('[scheduler:dispatch] error:', err);
-    });
+  await relayUploadQueue.add(
+    'bootstrap-check',
+    { source: 'worker_startup', timestamp: new Date().toISOString() },
+    { removeOnComplete: true, removeOnFail: 100 },
+  );
 
-    void scheduleDueCatalogTasks().catch((err) => {
+  setInterval(() => {
+    void scheduleEnabledTaskDefinitions().catch((err) => {
       // eslint-disable-next-line no-console
-      console.error('[scheduler:catalog] error:', err);
+      console.error('[scheduler:task-definitions] error:', err);
     });
   }, SCHEDULER_POLL_MS);
 
   // eslint-disable-next-line no-console
-  console.log('Worker started. Queues: q_dispatch + q_catalog, scheduler enabled');
+  console.log('Worker started. Queues: q_dispatch + q_relay_upload + q_catalog, task-definitions scheduler enabled');
 }
 
 bootstrap().catch((err) => {

@@ -21,10 +21,6 @@ export class CreateDispatchTaskDto {
   nextRunAt!: string;
 
   @IsOptional()
-  @IsString()
-  captionText?: string;
-
-  @IsOptional()
   @IsInt()
   @Min(1)
   @Max(1000)

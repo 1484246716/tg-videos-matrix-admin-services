@@ -1,7 +1,8 @@
-import { IsEnum } from 'class-validator';
-import { ChannelStatus } from '@prisma/client';
+import { IsIn } from 'class-validator';
+
+const CHANNEL_STATUS_VALUES = ['active', 'paused', 'archived'] as const;
 
 export class UpdateChannelStatusDto {
-  @IsEnum(ChannelStatus)
-  status!: ChannelStatus;
+  @IsIn(CHANNEL_STATUS_VALUES)
+  status!: 'active' | 'paused' | 'archived';
 }
