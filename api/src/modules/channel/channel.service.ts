@@ -15,7 +15,7 @@ import { UpdateChannelStatusDto } from './dto/update-channel-status.dto';
 
 @Injectable()
 export class ChannelService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly prisma: PrismaService) { }
 
   private serializeBigInt<T>(value: T): T {
     return JSON.parse(
@@ -126,6 +126,7 @@ export class ChannelService {
           folderPath: dto.folderPath,
           postIntervalSec: dto.postIntervalSec ?? 120,
           defaultBotId: dto.defaultBotId ? BigInt(dto.defaultBotId) : undefined,
+          navEnabled: dto.navEnabled ?? false,
           navIntervalSec: dto.navIntervalSec ?? 604800,
           aiSystemPromptTemplate: dto.aiSystemPromptTemplate,
           navTemplateText: dto.navTemplateText,
@@ -210,6 +211,7 @@ export class ChannelService {
       adPinEnabled: dto.adPinEnabled,
       alistTargetPath: dto.alistTargetPath,
       autoImportEnabled: dto.autoImportEnabled,
+      navEnabled: dto.navEnabled,
       defaultBotId: dto.defaultBotId ? BigInt(dto.defaultBotId) : undefined,
       relayChannelId: dto.relayChannelId ? BigInt(dto.relayChannelId) : undefined,
       aiModelProfileId: dto.aiModelProfileId

@@ -173,12 +173,15 @@ model Channel {
 
   navIntervalSec     Int             @default(604800) @map("nav_interval_sec")
   navRecentLimit     Int             @default(60) @map("nav_recent_limit")
+  navEnabled         Boolean         @default(false) @map("nav_enabled")
 
   adEnabled          Boolean         @default(false) @map("ad_enabled")
   adPinEnabled       Boolean         @default(false) @map("ad_pin_enabled")
 
   alistTargetPath    String?         @map("alist_target_path") @db.VarChar(255)
   autoImportEnabled  Boolean         @default(true) @map("auto_import_enabled")
+
+  navMessageId       BigInt?         @map("nav_message_id")
 
   lastPostAt         DateTime?       @map("last_post_at") @db.Timestamptz(6)
   lastNavUpdateAt    DateTime?       @map("last_nav_update_at") @db.Timestamptz(6)
@@ -369,6 +372,9 @@ model TaskDefinition {
   catalogTemplateId  BigInt?             @map("catalog_template_id")
   priority           Int                 @default(100)
   maxRetries         Int                 @default(6) @map("max_retries")
+  runIntervalSec     Int                 @default(1800) @map("run_interval_sec")
+  nextRunAt          DateTime?           @map("next_run_at") @db.Timestamptz(6)
+  lastStartedAt      DateTime?           @map("last_started_at") @db.Timestamptz(6)
   payload            Json?
   lastRunAt          DateTime?           @map("last_run_at") @db.Timestamptz(6)
   lastRunStatus      String?             @map("last_run_status") @db.VarChar(32)
@@ -380,5 +386,6 @@ model TaskDefinition {
   catalogTemplate    CatalogTemplate?    @relation(fields: [catalogTemplateId], references: [id], onDelete: SetNull)
 
   @@index([taskType, isEnabled])
+  @@index([isEnabled, nextRunAt])
   @@map("task_definitions")
 }

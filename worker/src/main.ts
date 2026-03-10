@@ -1,10 +1,15 @@
-import { Queue, Worker } from 'bullmq';
+import { Job, Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import dotenv from 'dotenv';
 import { createReadStream, openAsBlob } from 'node:fs';
 import { mkdir, readdir, rename, stat } from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import {
+  getTaskDefinitionLockKey as getLockKey,
+  safeRunInterval,
+} from './schedule-utils';
+import { generateTextWithAiProfile } from './ai-provider';
 import {
   CatalogTaskStatus,
   MediaStatus,
@@ -22,12 +27,18 @@ const telegramApiBase = process.env.TELEGRAM_BOT_API_BASE || 'https://api.telegr
 const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
 const prisma = new PrismaClient();
 
-const dispatchQueue = new Queue('q_dispatch', { connection });
-const catalogQueue = new Queue('q_catalog', { connection });
-const relayUploadQueue = new Queue('q_relay_upload', { connection });
+const dispatchQueue = new Queue('q_dispatch', { connection: connection as any });
+const catalogQueue = new Queue('q_catalog', { connection: connection as any });
+const relayUploadQueue = new Queue('q_relay_upload', { connection: connection as any });
 
 const SCHEDULER_POLL_MS = 5000;
 const MAX_SCHEDULE_BATCH = 100;
+const TASK_DEFINITION_LOCK_TTL_MS = Number(
+  process.env.TASK_DEFINITION_LOCK_TTL_MS || '3600000',
+);
+const TASK_DEFINITION_ERROR_RETRY_SEC = Number(
+  process.env.TASK_DEFINITION_ERROR_RETRY_SEC || '300',
+);
 const RELAY_MIN_STABLE_CHECKS = Number(process.env.RELAY_MIN_STABLE_CHECKS || '3');
 const RELAY_STABLE_INTERVAL_MS = Number(process.env.RELAY_STABLE_INTERVAL_MS || '10000');
 const RELAY_MTIME_COOLDOWN_MS = Number(process.env.RELAY_MTIME_COOLDOWN_MS || '60000');
@@ -42,6 +53,17 @@ const SUPPORTED_VIDEO_EXT = new Set([
 ]);
 
 let hasWarnedMissingTaskDefinitionsTable = false;
+
+/* ── §12 Observability: in-process metric counters ────────────────── */
+const taskdefMetrics = {
+  tickTotal: 0,
+  dueTotal: 0,
+  lockSkipTotal: 0,
+  runSuccessTotal: 0,
+  runFailedTotal: 0,
+  runDurationMsTotal: 0,
+};
+const METRICS_LOG_INTERVAL_TICKS = 60; // ~5 min at 5s poll
 
 function getTaskDefinitionModel() {
   const model = prisma.taskDefinition;
@@ -141,7 +163,7 @@ type TelegramError = {
 
 async function sendTelegramRequest(args: {
   botToken: string;
-  method: 'sendVideo' | 'sendDocument' | 'sendMessage' | 'pinChatMessage';
+  method: 'sendVideo' | 'sendDocument' | 'sendMessage' | 'pinChatMessage' | 'editMessageText';
   payload: Record<string, unknown> | FormData;
 }): Promise<{ messageId?: number; videoFileId?: string; videoFileUniqueId?: string }> {
   const endpoint = `${normalizeTelegramApiBase(telegramApiBase)}/bot${args.botToken}/${args.method}`;
@@ -252,6 +274,30 @@ async function sendTextByTelegram(args: {
     messageId: result.messageId,
     messageLink: toTelegramMessageLink(args.chatId, result.messageId),
   };
+}
+
+async function editMessageTextByTelegram(args: {
+  botToken: string;
+  chatId: string;
+  messageId: number;
+  text: string;
+  parseMode?: string;
+}) {
+  const result = await sendTelegramRequest({
+    botToken: args.botToken,
+    method: 'editMessageText',
+    payload: {
+      chat_id: args.chatId,
+      message_id: args.messageId,
+      text: args.text,
+      parse_mode: args.parseMode ?? 'HTML',
+      disable_web_page_preview: true,
+    },
+  });
+
+  if (!result.messageId) {
+    throw new Error('editMessageText response missing message_id');
+  }
 }
 
 async function pinMessageByTelegram(args: {
@@ -430,27 +476,71 @@ async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
 
 async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
   try {
+    const definition = await getTaskDefinitionModel().findUnique({
+      where: { id: taskDefinitionId },
+      select: { priority: true },
+    });
+
+    if (!definition) {
+      throw new Error(`Task Definition ${taskDefinitionId} not found`);
+    }
+
+    // Auto-discover media assets that are ready for dispatch 
+    // but haven't been queued for dispatch yet.
+    const unscheduledAssets = await prisma.mediaAsset.findMany({
+      where: {
+        status: MediaStatus.relay_uploaded,
+        telegramFileId: { not: null },
+        dispatchTasks: {
+          none: {} // Only pick assets that don't have any DispatchTasks
+        }
+      },
+      select: {
+        id: true,
+        channelId: true,
+      },
+      take: 200, // Batch limit
+    });
+
+    let createdCount = 0;
+    const now = new Date();
+
+    for (const asset of unscheduledAssets) {
+      await prisma.dispatchTask.create({
+        data: {
+          channelId: asset.channelId,
+          mediaAssetId: asset.id,
+          status: TaskStatus.pending,
+          scheduleSlot: now,
+          plannedAt: now,
+          nextRunAt: now,
+          priority: definition.priority ?? 100,
+        }
+      });
+      createdCount++;
+    }
+
+    // Also call the base dispatch scheduler which actually queues them to BullMQ
     await scheduleDueDispatchTasks();
+
     await updateTaskDefinitionRunStatus({
       taskDefinitionId,
       status: 'success',
       summary: {
         executor: 'dispatch_send',
-        message: 'dispatch scheduler tick completed',
+        createdTasks: createdCount,
+        message: 'Auto-scanned and queued dispatch tasks',
       },
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'unknown error';
+    const message = error instanceof Error ? error.message : String(error);
+    // eslint-disable-next-line no-console
+    console.error(`[scheduler] dispatch_send taskDef=${taskDefinitionId} failed:`, error);
     await updateTaskDefinitionRunStatus({
       taskDefinitionId,
       status: 'failed',
-      summary: {
-        executor: 'dispatch_send',
-        error: message,
-      },
+      summary: { executor: 'dispatch_send', error: message },
     });
-
-    throw error;
   }
 }
 
@@ -508,31 +598,93 @@ async function scheduleCatalogForDefinition(taskDefinitionId: bigint) {
   }
 }
 
+function getTaskDefinitionLockKey(taskDefinitionId: bigint) {
+  return getLockKey(taskDefinitionId);
+}
+
+async function tryAcquireTaskDefinitionLock(taskDefinitionId: bigint) {
+  const lockToken = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const result = await connection.set(
+    getTaskDefinitionLockKey(taskDefinitionId),
+    lockToken,
+    'PX',
+    TASK_DEFINITION_LOCK_TTL_MS,
+    'NX',
+  );
+
+  if (result !== 'OK') return null;
+  return lockToken;
+}
+
+async function releaseTaskDefinitionLock(taskDefinitionId: bigint, lockToken: string) {
+  const lockKey = getTaskDefinitionLockKey(taskDefinitionId);
+  const lua = `
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+      return redis.call("DEL", KEYS[1])
+    end
+    return 0
+  `;
+
+  await connection.eval(lua, 1, lockKey, lockToken);
+}
+
+async function scheduleTaskDefinitionByType(definition: {
+  id: bigint;
+  taskType: TaskDefinitionType;
+}) {
+  if (definition.taskType === TaskDefinitionType.relay_upload) {
+    await scheduleRelayForDefinition(definition.id);
+    return;
+  }
+
+  if (definition.taskType === TaskDefinitionType.dispatch_send) {
+    await scheduleDispatchForDefinition(definition.id);
+    return;
+  }
+
+  if (definition.taskType === TaskDefinitionType.catalog_publish) {
+    await scheduleCatalogForDefinition(definition.id);
+  }
+}
+
 async function scheduleEnabledTaskDefinitions() {
-  let definitions: Array<{ id: bigint; taskType: TaskDefinitionType }> = [];
+  taskdefMetrics.tickTotal += 1;
+
+  let definitions: Array<{
+    id: bigint;
+    taskType: TaskDefinitionType;
+    runIntervalSec: number;
+    nextRunAt: Date | null;
+  }> = [];
 
   try {
     definitions = await getTaskDefinitionModel().findMany({
-      where: { isEnabled: true },
-      orderBy: [{ priority: 'asc' }, { updatedAt: 'asc' }],
+      where: {
+        isEnabled: true,
+        OR: [{ nextRunAt: null }, { nextRunAt: { lte: new Date() } }],
+      },
+      orderBy: [{ priority: 'asc' }, { nextRunAt: 'asc' }, { updatedAt: 'asc' }],
       take: MAX_SCHEDULE_BATCH,
       select: {
         id: true,
         taskType: true,
+        runIntervalSec: true,
+        nextRunAt: true,
       },
     });
   } catch (error) {
-    const isTableMissing =
-      typeof error === 'object' &&
-      error !== null &&
-      'code' in error &&
-      (error as { code?: string }).code === 'P2021';
+    const prismaCode =
+      typeof error === 'object' && error !== null && 'code' in error
+        ? (error as { code?: string }).code
+        : undefined;
 
-    if (isTableMissing) {
+    const isSchemaNotReady = prismaCode === 'P2021' || prismaCode === 'P2022';
+
+    if (isSchemaNotReady) {
       if (!hasWarnedMissingTaskDefinitionsTable) {
         // eslint-disable-next-line no-console
         console.warn(
-          '[scheduler:task-definitions] table task_definitions not found, fallback to legacy schedulers. Run prisma migrate to enable task definitions.',
+          '[scheduler:task-definitions] task_definitions schema is not ready, fallback to legacy schedulers. Run prisma migrate to enable task-definition scheduling.',
         );
         hasWarnedMissingTaskDefinitionsTable = true;
       }
@@ -546,20 +698,107 @@ async function scheduleEnabledTaskDefinitions() {
     throw error;
   }
 
+  taskdefMetrics.dueTotal += definitions.length;
+
   for (const definition of definitions) {
-    if (definition.taskType === TaskDefinitionType.relay_upload) {
-      await scheduleRelayForDefinition(definition.id);
+    const lockToken = await tryAcquireTaskDefinitionLock(definition.id);
+    if (!lockToken) {
+      taskdefMetrics.lockSkipTotal += 1;
+      // eslint-disable-next-line no-console
+      console.log(
+        `[scheduler:taskdef] lock_skip | id=${definition.id.toString()} type=${definition.taskType}`,
+      );
       continue;
     }
 
-    if (definition.taskType === TaskDefinitionType.dispatch_send) {
-      await scheduleDispatchForDefinition(definition.id);
-      continue;
-    }
+    const runStart = Date.now();
+    const now = new Date();
+    const safeRunIntervalSec = safeRunInterval(definition.runIntervalSec);
+    const nextRunAtBefore = definition.nextRunAt?.toISOString() ?? null;
+    let runStatus: 'success' | 'failed' = 'success';
+    let nextRunAtAfter: string | null = null;
 
-    if (definition.taskType === TaskDefinitionType.catalog_publish) {
-      await scheduleCatalogForDefinition(definition.id);
+    try {
+      await getTaskDefinitionModel().update({
+        where: { id: definition.id },
+        data: {
+          lastStartedAt: now,
+        },
+      });
+
+      await scheduleTaskDefinitionByType(definition);
+
+      const newNextRunAt = new Date(now.getTime() + safeRunIntervalSec * 1000);
+      nextRunAtAfter = newNextRunAt.toISOString();
+
+      await getTaskDefinitionModel().update({
+        where: { id: definition.id },
+        data: {
+          nextRunAt: newNextRunAt,
+        },
+      });
+
+      taskdefMetrics.runSuccessTotal += 1;
+    } catch (error) {
+      runStatus = 'failed';
+      taskdefMetrics.runFailedTotal += 1;
+
+      const errorNextRunAt = new Date(
+        now.getTime() +
+        Math.min(safeRunIntervalSec, TASK_DEFINITION_ERROR_RETRY_SEC) * 1000,
+      );
+      nextRunAtAfter = errorNextRunAt.toISOString();
+
+      await getTaskDefinitionModel().update({
+        where: { id: definition.id },
+        data: {
+          nextRunAt: errorNextRunAt,
+        },
+      });
+
+      // eslint-disable-next-line no-console
+      console.error(
+        `[scheduler:taskdef] run_failed | id=${definition.id.toString()} type=${definition.taskType} error=${error instanceof Error ? error.message : 'unknown'}`,
+      );
+    } finally {
+      const durationMs = Date.now() - runStart;
+      taskdefMetrics.runDurationMsTotal += durationMs;
+
+      // eslint-disable-next-line no-console
+      console.log(
+        JSON.stringify({
+          tag: 'taskdef_run',
+          taskDefinitionId: definition.id.toString(),
+          taskType: definition.taskType,
+          runIntervalSec: safeRunIntervalSec,
+          lockAcquired: true,
+          status: runStatus,
+          durationMs,
+          nextRunAtBefore,
+          nextRunAtAfter,
+        }),
+      );
+
+      await releaseTaskDefinitionLock(definition.id, lockToken);
     }
+  }
+
+  /* ── Periodic metrics dump (~every 5 min) ── */
+  if (taskdefMetrics.tickTotal % METRICS_LOG_INTERVAL_TICKS === 0) {
+    // eslint-disable-next-line no-console
+    console.log(
+      JSON.stringify({
+        tag: 'taskdef_metrics',
+        ...taskdefMetrics,
+        avgRunDurationMs:
+          taskdefMetrics.runSuccessTotal + taskdefMetrics.runFailedTotal > 0
+            ? Math.round(
+              taskdefMetrics.runDurationMsTotal /
+              (taskdefMetrics.runSuccessTotal + taskdefMetrics.runFailedTotal),
+            )
+            : 0,
+      }),
+    );
   }
 }
 
@@ -710,53 +949,61 @@ async function scheduleDueRelayUploadTasks() {
 async function scheduleDueCatalogTasks() {
   const now = new Date();
 
-  const dueTasks = await prisma.catalogTask.findMany({
+  const channels = await prisma.channel.findMany({
     where: {
-      status: CatalogTaskStatus.pending,
-      OR: [{ plannedAt: null }, { plannedAt: { lte: now } }],
+      status: 'active',
+      navEnabled: true,
     },
-    orderBy: [{ plannedAt: 'asc' }, { createdAt: 'asc' }],
-    take: MAX_SCHEDULE_BATCH,
     select: {
       id: true,
-      channelId: true,
-      catalogTemplateId: true,
+      lastNavUpdateAt: true,
+      navIntervalSec: true,
+      navTemplateText: true,
+      defaultBotId: true,
     },
   });
 
-  for (const task of dueTasks) {
-    const updated = await prisma.catalogTask.updateMany({
-      where: {
-        id: task.id,
-        status: CatalogTaskStatus.pending,
-      },
-      data: {
-        status: CatalogTaskStatus.running,
-        startedAt: new Date(),
-      },
-    });
+  let queuedCount = 0;
 
-    if (updated.count === 0) continue;
+  for (const channel of channels) {
+    if (!channel.navTemplateText || !channel.defaultBotId) continue;
+
+    if (channel.lastNavUpdateAt) {
+      const dueTime = channel.lastNavUpdateAt.getTime() + channel.navIntervalSec * 1000;
+      if (now.getTime() < dueTime) continue;
+    }
+
+    const jobId = `catalog-${channel.id.toString()}`;
+    const existingJob = await catalogQueue.getJob(jobId);
+    if (existingJob) {
+      const state = await existingJob.getState();
+      if (state === 'failed') {
+        await existingJob.remove();
+      } else {
+        continue;
+      }
+    }
 
     await catalogQueue.add(
       'catalog-publish',
+      { channelIdRaw: channel.id.toString() },
       {
-        catalogTaskId: task.id.toString(),
-        channelId: task.channelId.toString(),
-      },
-      {
-        jobId: `catalog-${task.id.toString()}`,
+        jobId,
         removeOnComplete: true,
         removeOnFail: 200,
       },
     );
+
+    queuedCount += 1;
   }
 
-  if (dueTasks.length > 0) {
+  if (queuedCount > 0) {
     // eslint-disable-next-line no-console
-    console.log(`[scheduler] queued ${dueTasks.length} catalog task(s)`);
+    console.log(`[scheduler] queued ${queuedCount} catalog task(s)`);
   }
 }
+
+
 
 const dispatchWorker = new Worker(
   'q_dispatch',
@@ -780,6 +1027,9 @@ const dispatchWorker = new Worker(
             id: true,
             tgChatId: true,
             defaultBotId: true,
+            aiModelProfileId: true,
+            aiSystemPromptTemplate: true,
+            aiReplyMarkup: true,
           },
         },
         mediaAsset: {
@@ -787,6 +1037,7 @@ const dispatchWorker = new Worker(
             id: true,
             telegramFileId: true,
             status: true,
+            originalName: true,
           },
         },
       },
@@ -820,6 +1071,60 @@ const dispatchWorker = new Worker(
         throw new Error('Media asset has no telegramFileId (relay not uploaded)');
       }
 
+      let finalCaption = task.caption;
+
+      if (!finalCaption && task.channel.aiSystemPromptTemplate) {
+        let profile = task.channel.aiModelProfileId ? await prisma.aiModelProfile.findUnique({
+          where: { id: task.channel.aiModelProfileId },
+        }) : null;
+
+        // Fallback to .env configuration if no database profile is bound to the channel, 
+        // but a system prompt template IS provided and ENV vars are present.
+        if (!profile && process.env.OPENAI_API_KEY) {
+          profile = {
+            id: BigInt(0),
+            name: 'ENV_FALLBACK',
+            provider: 'openai',
+            model: process.env.OPENAI_MODEL || 'gpt-3.5-turbo',
+            apiKeyEncrypted: process.env.OPENAI_API_KEY,
+            endpointUrl: process.env.OPENAI_BASE_URL || null,
+            systemPrompt: null,
+            captionPromptTemplate: null,
+            temperature: null,
+            topP: null,
+            maxTokens: null,
+            timeoutMs: 20000,
+            isActive: true,
+            fallbackProfileId: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+        }
+
+        if (profile && profile.isActive) {
+          try {
+            finalCaption = await generateTextWithAiProfile(
+              profile,
+              task.channel.aiSystemPromptTemplate,
+              `请为这个视频生成文案，原名：${task.mediaAsset.originalName}`
+            );
+
+            // Write generated caption back so we don't re-generate on retry
+            await prisma.dispatchTask.update({
+              where: { id: task.id },
+              data: { caption: finalCaption }
+            });
+          } catch (aiErr) {
+            console.error(`[q_dispatch] AI generation failed for dispatchTask=${task.id}`, aiErr);
+            finalCaption = task.mediaAsset.originalName;
+          }
+        } else {
+          finalCaption = task.mediaAsset.originalName;
+        }
+      } else if (!finalCaption) {
+        finalCaption = task.mediaAsset.originalName;
+      }
+
       const resolvedBotId = task.botId ?? task.channel.defaultBotId;
       if (!resolvedBotId) {
         throw new Error('No bot assigned to dispatch task or channel');
@@ -846,9 +1151,9 @@ const dispatchWorker = new Worker(
         botToken: bot.tokenEncrypted,
         chatId: task.channel.tgChatId,
         fileId: task.mediaAsset.telegramFileId,
-        caption: task.caption,
+        caption: finalCaption,
         parseMode: task.parseMode,
-        replyMarkup: task.replyMarkup,
+        replyMarkup: task.replyMarkup ?? task.channel.aiReplyMarkup ?? undefined,
       });
 
       await prisma.dispatchTask.update({
@@ -1057,7 +1362,7 @@ const relayUploadWorker = new Worker(
       messageId: sendResult.messageId,
     };
   },
-  { connection, concurrency: 2 },
+  { connection: connection as any, concurrency: 2 },
 );
 
 const catalogWorker = new Worker(
@@ -1067,120 +1372,135 @@ const catalogWorker = new Worker(
       return { ok: true, skipped: true, reason: 'bootstrap-check' };
     }
 
-    const catalogTaskIdRaw = job.data.catalogTaskId as string | undefined;
-    if (!catalogTaskIdRaw) {
-      throw new Error('Missing catalogTaskId in job payload');
+    const channelIdRaw = job.data.channelIdRaw as string | undefined;
+    if (!channelIdRaw) {
+      throw new Error('Missing channelIdRaw in job payload');
     }
 
-    const catalogTaskId = BigInt(catalogTaskIdRaw);
+    const channelId = BigInt(channelIdRaw);
 
-    const task = await prisma.catalogTask.findUnique({
-      where: { id: catalogTaskId },
+    const channel = await prisma.channel.findUnique({
+      where: { id: channelId },
       include: {
-        channel: {
-          select: {
-            id: true,
-            tgChatId: true,
-            defaultBotId: true,
-          },
+        defaultBot: {
+          select: { id: true, status: true, tokenEncrypted: true },
         },
       },
     });
 
-    if (!task) {
-      throw new Error(`Catalog task not found: ${catalogTaskIdRaw}`);
+    if (!channel) throw new Error(`Channel not found: ${channelIdRaw}`);
+    if (!channel.navEnabled || channel.status !== 'active') {
+      return { ok: true, skipped: true, reason: 'nav_disabled_or_not_active' };
+    }
+    if (!channel.navTemplateText || !channel.defaultBot) {
+      throw new Error(`Missing navTemplateText or defaultBot for channel ${channelIdRaw}`);
+    }
+    if (channel.defaultBot.status !== 'active') {
+      throw new Error(`Channel bot not active: ${channelIdRaw}`);
     }
 
+    const recentLimit = channel.navRecentLimit ?? 60;
+    const dispatchTasks = await prisma.dispatchTask.findMany({
+      where: { channelId, status: TaskStatus.success, telegramMessageId: { not: null } },
+      orderBy: { finishedAt: 'desc' },
+      take: recentLimit,
+      select: {
+        caption: true,
+        telegramMessageLink: true,
+      },
+    });
+
+    if (dispatchTasks.length === 0) {
+      return { ok: true, skipped: true, reason: 'no_successful_dispatch_tasks' };
+    }
+
+    // Assemble videos list
+    const videos = [...dispatchTasks].reverse().map((t) => {
+      const parts = (t.caption || '').split('\n').map((l) => l.trim()).filter(Boolean);
+      let shortTitle = '未命名视频';
+      if (parts.length >= 2) {
+        shortTitle = `${parts[0]} ${parts[1]}`;
+      } else if (parts.length === 1) {
+        shortTitle = parts[0];
+      }
+      return {
+        message_url: t.telegramMessageLink || '',
+        short_title: shortTitle,
+      };
+    });
+
+    // Replace template
+    let content = channel.navTemplateText;
+    content = content.replace(/{{channel_name}}/g, channel.name);
+    // basic html safe replacement for handlebars-like loop
+    const eachRegex = /{{#each\s+videos}}([\s\S]*?){{\/each}}/g;
+    content = content.replace(eachRegex, (match, body) => {
+      return videos.map((v) => {
+        let text = body.replace(/{{this\.message_url}}/g, v.message_url);
+        text = text.replace(/{{this\.short_title}}/g, v.short_title);
+        return text;
+      }).join('');
+    });
+
+    // Add time
+    const beijingTimeStr = new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+    content = content.replace(/{{update_time}}/g, beijingTimeStr);
+
+    const botToken = channel.defaultBot.tokenEncrypted;
+    let finalMessageId: number | null = null;
+
     try {
-      if (!task.contentPreview) {
-        throw new Error('Catalog contentPreview is empty');
-      }
-
-      const resolvedBotId = task.channel.defaultBotId;
-      if (!resolvedBotId) {
-        throw new Error('No default bot assigned to channel for catalog publish');
-      }
-
-      const bot = await prisma.bot.findUnique({
-        where: { id: resolvedBotId },
-        select: {
-          id: true,
-          status: true,
-          tokenEncrypted: true,
-        },
-      });
-
-      if (!bot) {
-        throw new Error(`Bot not found: ${resolvedBotId.toString()}`);
-      }
-
-      if (bot.status !== 'active') {
-        throw new Error(`Bot is not active: ${bot.status}`);
-      }
-
-      const sendResult = await sendTextByTelegram({
-        botToken: bot.tokenEncrypted,
-        chatId: task.channel.tgChatId,
-        text: task.contentPreview,
-      });
-
-      let pinSuccess: boolean | null = null;
-      let pinErrorMessage: string | null = null;
-
-      if (task.pinAfterPublish) {
+      if (channel.navMessageId) {
+        const oldMessageId = Number(channel.navMessageId);
         try {
-          await pinMessageByTelegram({
-            botToken: bot.tokenEncrypted,
-            chatId: task.channel.tgChatId,
-            messageId: sendResult.messageId,
+          await editMessageTextByTelegram({
+            botToken,
+            chatId: channel.tgChatId,
+            messageId: oldMessageId,
+            text: content,
           });
-          pinSuccess = true;
-        } catch (pinError) {
-          pinSuccess = false;
-          pinErrorMessage =
-            pinError instanceof Error
-              ? pinError.message
-              : 'Unknown pinChatMessage error';
+          finalMessageId = oldMessageId;
+        } catch (err) {
+          const errObj = err as any;
+          if (errObj.message && (errObj.message.includes('message to edit not found') || errObj.message.includes('message is not modified'))) {
+            // If it's just not modified, we can still use it. But if not found, we send new.
+            if (errObj.message.includes('not modified')) {
+              finalMessageId = oldMessageId;
+            } else {
+              const sendResult = await sendTextByTelegram({ botToken, chatId: channel.tgChatId, text: content });
+              finalMessageId = sendResult.messageId;
+              await pinMessageByTelegram({ botToken, chatId: channel.tgChatId, messageId: finalMessageId });
+            }
+          } else {
+            throw err;
+          }
         }
+      } else {
+        const sendResult = await sendTextByTelegram({ botToken, chatId: channel.tgChatId, text: content });
+        finalMessageId = sendResult.messageId;
+        await pinMessageByTelegram({ botToken, chatId: channel.tgChatId, messageId: finalMessageId });
       }
 
-      await prisma.catalogTask.update({
-        where: { id: catalogTaskId },
+      await prisma.channel.update({
+        where: { id: channelId },
         data: {
-          status: CatalogTaskStatus.success,
-          finishedAt: new Date(),
-          telegramMessageId: BigInt(sendResult.messageId),
-          telegramMessageLink: sendResult.messageLink,
-          pinSuccess,
-          pinErrorMessage,
-          errorMessage: null,
+          navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
+          lastNavUpdateAt: new Date(),
         },
       });
 
       return {
         ok: true,
-        catalogTaskId: catalogTaskIdRaw,
-        messageId: sendResult.messageId,
+        channelId: channelIdRaw,
+        messageId: finalMessageId,
       };
     } catch (error) {
-      const errorObj = error as TelegramError;
-      const message = errorObj.message || 'Unknown catalog publish error';
-
-      await prisma.catalogTask.update({
-        where: { id: catalogTaskId },
-        data: {
-          status: CatalogTaskStatus.failed,
-          finishedAt: new Date(),
-          pinSuccess: null,
-          pinErrorMessage: null,
-          errorMessage: message,
-        },
-      });
-
+      // eslint-disable-next-line no-console
+      console.error(`[q_catalog] publish error for channel=${channelIdRaw}:`, error);
       throw error;
     }
   },
-  { connection, concurrency: 3 },
+  { connection: connection as any, concurrency: 3 },
 );
 
 dispatchWorker.on('completed', (job) => {

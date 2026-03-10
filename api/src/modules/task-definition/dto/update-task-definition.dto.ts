@@ -1,6 +1,7 @@
 import { IsBoolean, IsIn, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 
 const TASK_TYPES = ['relay_upload', 'dispatch_send', 'catalog_publish'] as const;
+const RUN_INTERVAL_OPTIONS = [30, 120, 1800, 3600] as const;
 
 export class UpdateTaskDefinitionDto {
   @IsOptional()
@@ -38,6 +39,10 @@ export class UpdateTaskDefinitionDto {
   @Min(0)
   @Max(20)
   maxRetries?: number;
+
+  @IsOptional()
+  @IsIn(RUN_INTERVAL_OPTIONS)
+  runIntervalSec?: (typeof RUN_INTERVAL_OPTIONS)[number];
 
   @IsOptional()
   payload?: unknown;

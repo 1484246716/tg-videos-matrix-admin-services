@@ -96,6 +96,10 @@ export class UpdateChannelDto {
   aiSystemPromptTemplate?: string;
 
   @IsOptional()
+  @IsBoolean()
+  navEnabled?: boolean;
+
+  @IsOptional()
   @IsString()
   navTemplateText?: string;
 

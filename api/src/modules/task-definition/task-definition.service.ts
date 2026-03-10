@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Injectable,
   InternalServerErrorException,
   NotFoundException,
@@ -6,6 +7,8 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateTaskDefinitionDto } from './dto/create-task-definition.dto';
 import { UpdateTaskDefinitionDto } from './dto/update-task-definition.dto';
+
+const RUN_INTERVAL_OPTIONS = new Set([30, 120, 1800, 3600]);
 
 @Injectable()
 export class TaskDefinitionService {
@@ -28,6 +31,16 @@ export class TaskDefinitionService {
         typeof v === 'bigint' ? v.toString() : v,
       ),
     ) as T;
+  }
+
+  private validateRunIntervalSec(runIntervalSec: number | undefined) {
+    if (runIntervalSec === undefined) return;
+
+    if (!RUN_INTERVAL_OPTIONS.has(runIntervalSec)) {
+      throw new BadRequestException(
+        'runIntervalSec must be one of: 30, 120, 1800, 3600',
+      );
+    }
   }
 
   async list(params: {
@@ -55,11 +68,16 @@ export class TaskDefinitionService {
   }
 
   async create(dto: CreateTaskDefinitionDto) {
+    this.validateRunIntervalSec(dto.runIntervalSec);
+
+    const now = new Date();
+    const isEnabled = dto.isEnabled ?? true;
+
     const created = await this.taskDefinitionModel.create({
       data: {
         name: dto.name,
         taskType: dto.taskType,
-        isEnabled: dto.isEnabled ?? true,
+        isEnabled,
         scheduleCron: dto.scheduleCron,
         relayChannelId: dto.relayChannelId
           ? BigInt(dto.relayChannelId)
@@ -69,6 +87,8 @@ export class TaskDefinitionService {
           : undefined,
         priority: dto.priority ?? 100,
         maxRetries: dto.maxRetries ?? 6,
+        runIntervalSec: dto.runIntervalSec ?? 1800,
+        nextRunAt: isEnabled ? now : null,
         payload: dto.payload as object | undefined,
       },
       include: {
@@ -81,7 +101,11 @@ export class TaskDefinitionService {
   }
 
   async update(id: string, dto: UpdateTaskDefinitionDto) {
-    await this.getOne(id);
+    const existing = await this.getOne(id);
+    this.validateRunIntervalSec(dto.runIntervalSec);
+
+    const nextEnabled = dto.isEnabled ?? existing.isEnabled;
+    const shouldResetNextRunAt = dto.isEnabled === true && !existing.isEnabled;
 
     const updated = await this.taskDefinitionModel.update({
       where: { id: BigInt(id) },
@@ -96,6 +120,14 @@ export class TaskDefinitionService {
           : undefined,
         priority: dto.priority,
         maxRetries: dto.maxRetries,
+        runIntervalSec: dto.runIntervalSec,
+        nextRunAt: shouldResetNextRunAt
+          ? new Date()
+          : dto.isEnabled === false
+            ? null
+            : nextEnabled && existing.nextRunAt === null
+              ? new Date()
+              : undefined,
         payload: dto.payload as object | undefined,
       },
       include: {
@@ -108,16 +140,23 @@ export class TaskDefinitionService {
   }
 
   async toggle(id: string, isEnabled: boolean) {
-    await this.getOne(id);
+    const existing = await this.getOne(id);
 
     const updated = await this.taskDefinitionModel.update({
       where: { id: BigInt(id) },
-      data: { isEnabled },
+      data: {
+        isEnabled,
+        nextRunAt: isEnabled
+          ? existing.nextRunAt ?? new Date()
+          : null,
+      },
       select: {
         id: true,
         name: true,
         taskType: true,
         isEnabled: true,
+        runIntervalSec: true,
+        nextRunAt: true,
         updatedAt: true,
       },
     });
