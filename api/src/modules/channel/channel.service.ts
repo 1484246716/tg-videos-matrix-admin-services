@@ -196,7 +196,7 @@ export class ChannelService {
 
     const nextFolderPath = dto.folderPath ?? existing.folderPath;
 
-    const data: Prisma.ChannelUpdateInput = {
+    const data: Prisma.ChannelUncheckedUpdateInput = {
       name: dto.name,
       tgChatId: dto.tgChatId,
       tgUsername: dto.tgUsername,

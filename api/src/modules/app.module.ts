@@ -10,6 +10,8 @@ import { DispatchModule } from './dispatch/dispatch.module';
 import { RiskEventModule } from './risk-event/risk-event.module';
 import { CatalogModule } from './catalog/catalog.module';
 import { TaskDefinitionModule } from './task-definition/task-definition.module';
+import { AuthModule } from './auth/auth.module';
+import { UserModule } from './user/user.module';
 
 @Module({
   imports: [
@@ -27,6 +29,8 @@ import { TaskDefinitionModule } from './task-definition/task-definition.module';
     RiskEventModule,
     CatalogModule,
     TaskDefinitionModule,
+    AuthModule,
+    UserModule,
   ],
 })
-export class AppModule {}
+export class AppModule { }

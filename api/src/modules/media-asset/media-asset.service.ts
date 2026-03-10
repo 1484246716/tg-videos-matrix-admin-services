@@ -171,7 +171,7 @@ export class MediaAssetService {
               localPath: filePath,
               fileSize: BigInt(s.size),
               fileHash,
-              status: MediaStatus.downloaded,
+              status: MediaStatus.new,
             },
             select: { id: true, status: true },
           });
