@@ -300,6 +300,7 @@ model DispatchTask {
   nextRunAt             DateTime    @map("next_run_at") @db.Timestamptz(6)
 
   replyMarkup           Json?       @map("reply_markup")
+  caption               String?
   parseMode             String?     @default("HTML") @map("parse_mode") @db.VarChar(16)
 
   status                TaskStatus  @default(pending)

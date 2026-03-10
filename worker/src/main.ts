@@ -846,6 +846,7 @@ const dispatchWorker = new Worker(
         botToken: bot.tokenEncrypted,
         chatId: task.channel.tgChatId,
         fileId: task.mediaAsset.telegramFileId,
+        caption: task.caption,
         parseMode: task.parseMode,
         replyMarkup: task.replyMarkup,
       });
