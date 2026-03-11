@@ -71,26 +71,6 @@ enum TaskDefinitionType {
   catalog_publish
 }
 
-enum TaskRunStatus {
-  pending
-  running
-  success
-  failed
-}
-
-enum TaskRunStepStatus {
-  pending
-  running
-  success
-  failed
-}
-
-enum TaskRunEntityType {
-  media_asset
-  dispatch_task
-  catalog_task
-}
-
 enum UserRole {
   admin
   staff
@@ -412,51 +392,10 @@ model TaskDefinition {
 
   relayChannel    RelayChannel?    @relation(fields: [relayChannelId], references: [id], onDelete: SetNull)
   catalogTemplate CatalogTemplate? @relation(fields: [catalogTemplateId], references: [id], onDelete: SetNull)
-  taskRuns        TaskRun[]
 
   @@index([taskType, isEnabled])
   @@index([isEnabled, nextRunAt])
   @@map("task_definitions")
 }
 
-model TaskRun {
-  id               BigInt             @id @default(autoincrement())
-  taskDefinitionId BigInt             @map("task_definition_id")
-  taskType         TaskDefinitionType @map("task_type")
-  status           TaskRunStatus      @default(pending)
-  startedAt        DateTime?          @map("started_at") @db.Timestamptz(6)
-  finishedAt       DateTime?          @map("finished_at") @db.Timestamptz(6)
-  summary          Json?
-  errorMessage     String?            @map("error_message") @db.VarChar(255)
-  createdAt        DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt        DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  taskDefinition TaskDefinition @relation(fields: [taskDefinitionId], references: [id], onDelete: Cascade)
-  steps          TaskRunStep[]
-
-  @@index([taskDefinitionId, status])
-  @@index([taskType, status])
-  @@index([startedAt])
-  @@map("task_runs")
-}
-
-model TaskRunStep {
-  id         BigInt             @id @default(autoincrement())
-  taskRunId  BigInt             @map("task_run_id")
-  entityType TaskRunEntityType  @map("entity_type")
-  entityId   BigInt             @map("entity_id")
-  status     TaskRunStepStatus  @default(pending)
-  title      String             @db.VarChar(128)
-  payload    Json?
-  startedAt  DateTime?          @map("started_at") @db.Timestamptz(6)
-  finishedAt DateTime?          @map("finished_at") @db.Timestamptz(6)
-  createdAt  DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt  DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  taskRun TaskRun @relation(fields: [taskRunId], references: [id], onDelete: Cascade)
-
-  @@index([taskRunId, status])
-  @@index([entityType, entityId])
-  @@index([createdAt])
-  @@map("task_run_steps")
-}

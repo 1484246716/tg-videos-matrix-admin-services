@@ -10,7 +10,6 @@ import { DispatchModule } from './dispatch/dispatch.module';
 import { RiskEventModule } from './risk-event/risk-event.module';
 import { CatalogModule } from './catalog/catalog.module';
 import { TaskDefinitionModule } from './task-definition/task-definition.module';
-import { TaskRunModule } from './task-run/task-run.module';
 import { MediaLifecycleModule } from './media-lifecycle/media-lifecycle.module';
 import { AuthModule } from './auth/auth.module';
 import { UserModule } from './user/user.module';
@@ -31,7 +30,6 @@ import { UserModule } from './user/user.module';
     RiskEventModule,
     CatalogModule,
     TaskDefinitionModule,
-    TaskRunModule,
     MediaLifecycleModule,
     AuthModule,
     UserModule,

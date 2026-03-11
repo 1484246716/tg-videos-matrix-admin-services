@@ -331,95 +331,6 @@ async function updateTaskDefinitionRunStatus(args: {
   });
 }
 
-async function createTaskRun(args: { taskDefinitionId: bigint; taskType: TaskDefinitionType }) {
-  return prisma.taskRun.create({
-    data: {
-      taskDefinitionId: args.taskDefinitionId,
-      taskType: args.taskType,
-      status: 'running',
-      startedAt: new Date(),
-    },
-    select: { id: true },
-  });
-}
-
-async function finishTaskRun(args: {
-  taskRunId: bigint;
-  status: 'success' | 'failed';
-  summary?: Record<string, unknown>;
-  errorMessage?: string | null;
-}) {
-  await prisma.taskRun.update({
-    where: { id: args.taskRunId },
-    data: {
-      status: args.status,
-      finishedAt: new Date(),
-      summary: args.summary as any,
-      errorMessage: args.errorMessage ?? null,
-    },
-  });
-}
-
-async function createTaskRunStep(args: {
-  taskRunId: bigint;
-  entityType: 'media_asset' | 'dispatch_task' | 'catalog_task';
-  entityId: bigint;
-  title: string;
-  payload?: Record<string, unknown>;
-  status?: 'pending' | 'running' | 'success' | 'failed';
-}) {
-  return prisma.taskRunStep.create({
-    data: {
-      taskRunId: args.taskRunId,
-      entityType: args.entityType,
-      entityId: args.entityId,
-      title: args.title,
-      payload: args.payload as any,
-      status: args.status ?? 'running',
-      startedAt: (args.status === 'running' || !args.status) ? new Date() : null,
-      finishedAt: args.status === 'success' || args.status === 'failed' ? new Date() : null,
-    },
-    select: { id: true },
-  });
-}
-
-async function updateTaskRunStep(args: {
-  taskRunId: bigint;
-  entityType: 'media_asset' | 'dispatch_task' | 'catalog_task';
-  entityId: bigint;
-  status: 'running' | 'success' | 'failed';
-  payload?: Record<string, unknown>;
-}) {
-  await prisma.taskRunStep.updateMany({
-    where: {
-      taskRunId: args.taskRunId,
-      entityType: args.entityType,
-      entityId: args.entityId,
-    },
-    data: {
-      status: args.status,
-      payload: args.payload as any,
-      startedAt: args.status === 'running' ? new Date() : undefined,
-      finishedAt: args.status === 'success' || args.status === 'failed' ? new Date() : undefined,
-    },
-  });
-}
-
-async function finishTaskRunStep(args: {
-  taskRunStepId: bigint;
-  status: 'success' | 'failed';
-  payload?: Record<string, unknown>;
-}) {
-  await prisma.taskRunStep.update({
-    where: { id: args.taskRunStepId },
-    data: {
-      status: args.status,
-      payload: args.payload as any,
-      finishedAt: new Date(),
-    },
-  });
-}
-
 async function hashFile(filePath: string): Promise<string> {
   return new Promise((resolveHash, reject) => {
     const hash = createHash('sha256');
@@ -443,7 +354,7 @@ async function scanChannelVideos(folderPath: string) {
   return files;
 }
 
-async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint, taskRunId: bigint) {
+async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
   const definition = await getTaskDefinitionModel().findUnique({
     where: { id: taskDefinitionId },
     select: {
@@ -530,18 +441,6 @@ async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint, ta
         createdAssets += 1;
       }
 
-      await createTaskRunStep({
-        taskRunId,
-        entityType: 'media_asset',
-        entityId: asset.id,
-        title: 'enqueue relay upload',
-        payload: {
-          channelId: channel.id.toString(),
-          localPath: filePath,
-          originalName: basename(filePath),
-          status: asset.status,
-        },
-      });
 
       if (
         asset.status === MediaStatus.relay_uploaded ||
@@ -557,7 +456,6 @@ async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint, ta
           sourceMeta: {
             relayChannelId: definition.relayChannelId.toString(),
             taskDefinitionId: definition.id.toString(),
-            taskRunId: taskRunId.toString(),
             relayEnqueueAt: new Date().toISOString(),
             relayPriority: definition.priority,
             relayMaxRetries: definition.maxRetries,
@@ -577,7 +475,7 @@ async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint, ta
   };
 }
 
-async function scheduleDispatchForDefinition(taskDefinitionId: bigint, taskRunId: bigint) {
+async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
   try {
     const definition = await getTaskDefinitionModel().findUnique({
       where: { id: taskDefinitionId },
@@ -622,17 +520,7 @@ async function scheduleDispatchForDefinition(taskDefinitionId: bigint, taskRunId
         select: { id: true },
       });
 
-      await createTaskRunStep({
-        taskRunId,
-        entityType: 'dispatch_task',
-        entityId: dispatchTask.id,
-        title: 'enqueue dispatch task',
-        payload: {
-          channelId: asset.channelId.toString(),
-          mediaAssetId: asset.id.toString(),
-          status: 'pending',
-        },
-      });
+      
 
       createdCount++;
     }
@@ -650,14 +538,7 @@ async function scheduleDispatchForDefinition(taskDefinitionId: bigint, taskRunId
       },
     });
 
-    await finishTaskRun({
-      taskRunId,
-      status: 'success',
-      summary: {
-        executor: 'dispatch_send',
-        createdTasks: createdCount,
-      },
-    });
+    
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     // eslint-disable-next-line no-console
@@ -668,18 +549,13 @@ async function scheduleDispatchForDefinition(taskDefinitionId: bigint, taskRunId
       summary: { executor: 'dispatch_send', error: message },
     });
 
-    await finishTaskRun({
-      taskRunId,
-      status: 'failed',
-      errorMessage: message,
-      summary: { executor: 'dispatch_send', error: message },
-    });
+    
   }
 }
 
-async function scheduleRelayForDefinition(taskDefinitionId: bigint, taskRunId: bigint) {
+async function scheduleRelayForDefinition(taskDefinitionId: bigint) {
   try {
-    const enqueueSummary = await enqueueRelayAssetsFromTaskDefinition(taskDefinitionId, taskRunId);
+    const enqueueSummary = await enqueueRelayAssetsFromTaskDefinition(taskDefinitionId);
     await scheduleDueRelayUploadTasks();
     await updateTaskDefinitionRunStatus({
       taskDefinitionId,
@@ -691,14 +567,7 @@ async function scheduleRelayForDefinition(taskDefinitionId: bigint, taskRunId: b
       },
     });
 
-    await finishTaskRun({
-      taskRunId,
-      status: 'success',
-      summary: {
-        executor: 'relay_upload',
-        ...enqueueSummary,
-      },
-    });
+    
   } catch (error) {
     const message = error instanceof Error ? error.message : 'unknown error';
     await updateTaskDefinitionRunStatus({
@@ -710,20 +579,15 @@ async function scheduleRelayForDefinition(taskDefinitionId: bigint, taskRunId: b
       },
     });
 
-    await finishTaskRun({
-      taskRunId,
-      status: 'failed',
-      errorMessage: message,
-      summary: { executor: 'relay_upload', error: message },
-    });
+    
 
     throw error;
   }
 }
 
-async function scheduleCatalogForDefinition(taskDefinitionId: bigint, taskRunId: bigint) {
+async function scheduleCatalogForDefinition(taskDefinitionId: bigint) {
   try {
-    await scheduleDueCatalogTasks(taskRunId);
+    await scheduleDueCatalogTasks();
     await updateTaskDefinitionRunStatus({
       taskDefinitionId,
       status: 'success',
@@ -733,14 +597,7 @@ async function scheduleCatalogForDefinition(taskDefinitionId: bigint, taskRunId:
       },
     });
 
-    await finishTaskRun({
-      taskRunId,
-      status: 'success',
-      summary: {
-        executor: 'catalog_publish',
-        message: 'catalog scheduler tick completed',
-      },
-    });
+    
   } catch (error) {
     const message = error instanceof Error ? error.message : 'unknown error';
     await updateTaskDefinitionRunStatus({
@@ -752,12 +609,7 @@ async function scheduleCatalogForDefinition(taskDefinitionId: bigint, taskRunId:
       },
     });
 
-    await finishTaskRun({
-      taskRunId,
-      status: 'failed',
-      errorMessage: message,
-      summary: { executor: 'catalog_publish', error: message },
-    });
+    
 
     throw error;
   }
@@ -796,20 +648,19 @@ async function releaseTaskDefinitionLock(taskDefinitionId: bigint, lockToken: st
 async function scheduleTaskDefinitionByType(definition: {
   id: bigint;
   taskType: TaskDefinitionType;
-  taskRunId: bigint;
 }) {
   if (definition.taskType === TaskDefinitionType.relay_upload) {
-    await scheduleRelayForDefinition(definition.id, definition.taskRunId);
+    await scheduleRelayForDefinition(definition.id);
     return;
   }
 
   if (definition.taskType === TaskDefinitionType.dispatch_send) {
-    await scheduleDispatchForDefinition(definition.id, definition.taskRunId);
+    await scheduleDispatchForDefinition(definition.id);
     return;
   }
 
   if (definition.taskType === TaskDefinitionType.catalog_publish) {
-    await scheduleCatalogForDefinition(definition.id, definition.taskRunId);
+    await scheduleCatalogForDefinition(definition.id);
   }
 }
 
@@ -880,7 +731,7 @@ async function scheduleEnabledTaskDefinitions() {
     const nextRunAtBefore = definition.nextRunAt?.toISOString() ?? null;
     let runStatus: 'success' | 'failed' = 'success';
     let nextRunAtAfter: string | null = null;
-    let taskRunId: bigint | null = null;
+    
 
     try {
       await getTaskDefinitionModel().update({
@@ -890,15 +741,12 @@ async function scheduleEnabledTaskDefinitions() {
         },
       });
 
-      const taskRun = await createTaskRun({
-        taskDefinitionId: definition.id,
-        taskType: definition.taskType,
-      });
-      taskRunId = taskRun.id;
+      
+      
 
       await scheduleTaskDefinitionByType({
         ...definition,
-        taskRunId: taskRun.id,
+        
       });
 
       const newNextRunAt = new Date(now.getTime() + safeRunIntervalSec * 1000);
@@ -929,15 +777,7 @@ async function scheduleEnabledTaskDefinitions() {
         },
       });
 
-      if (taskRunId) {
-        const message = error instanceof Error ? error.message : 'unknown error';
-        await finishTaskRun({
-          taskRunId,
-          status: 'failed',
-          errorMessage: message,
-          summary: { executor: definition.taskType, error: message },
-        });
-      }
+
 
       logError('[scheduler:taskdef] run_failed', {
         taskDefinitionId: definition.id.toString(),
@@ -1118,19 +958,7 @@ async function scheduleDueRelayUploadTasks() {
       },
     );
 
-    if (taskRunId) {
-      await updateTaskRunStep({
-        taskRunId,
-        entityType: 'media_asset',
-        entityId: asset.id,
-        status: 'running',
-        payload: {
-          channelId: asset.channelId.toString(),
-          relayChannelId,
-          mediaName: asset.originalName,
-        },
-      });
-    }
+    
 
     queuedCount += 1;
   }
@@ -1140,7 +968,7 @@ async function scheduleDueRelayUploadTasks() {
   }
 }
 
-async function scheduleDueCatalogTasks(taskRunId?: bigint) {
+async function scheduleDueCatalogTasks() {
   const now = new Date();
 
   const channels = await prisma.channel.findMany({
@@ -1183,7 +1011,7 @@ async function scheduleDueCatalogTasks(taskRunId?: bigint) {
       'catalog-publish',
       {
         channelIdRaw: channel.id.toString(),
-        taskRunId: taskRunId ? taskRunId.toString() : undefined,
+        
       },
       {
         jobId,
@@ -1192,18 +1020,7 @@ async function scheduleDueCatalogTasks(taskRunId?: bigint) {
       },
     );
 
-    if (taskRunId) {
-      await createTaskRunStep({
-        taskRunId,
-        entityType: 'catalog_task',
-        entityId: channel.id,
-        title: 'catalog publish',
-        payload: {
-          channelId: channel.id.toString(),
-          channelName: channel.name,
-        },
-      });
-    }
+    
 
     queuedCount += 1;
   }
@@ -1270,20 +1087,7 @@ const dispatchWorker = new Worker(
 
     const taskRunIdRaw = (task.mediaAsset.sourceMeta as Record<string, unknown> | null)?.taskRunId;
     const taskRunId = typeof taskRunIdRaw === 'string' ? BigInt(taskRunIdRaw) : null;
-    if (taskRunId) {
-      await updateTaskRunStep({
-        taskRunId,
-        entityType: 'dispatch_task',
-        entityId: dispatchTaskId,
-        status: 'running',
-        payload: {
-          channelId: task.channelId.toString(),
-          channelName: task.channel.name,
-          mediaAssetId: task.mediaAsset.id.toString(),
-          mediaName: task.mediaAsset.originalName,
-        },
-      });
-    }
+    
 
     await prisma.dispatchTaskLog.create({
       data: {
@@ -1411,22 +1215,7 @@ const dispatchWorker = new Worker(
         },
       });
 
-      if (taskRunId) {
-        await updateTaskRunStep({
-          taskRunId,
-          entityType: 'dispatch_task',
-          entityId: dispatchTaskId,
-          status: 'success',
-          payload: {
-            channelId: task.channelId.toString(),
-            channelName: task.channel.name,
-            mediaAssetId: task.mediaAsset.id.toString(),
-            mediaName: task.mediaAsset.originalName,
-            messageId: sendResult.messageId,
-            messageLink: sendResult.messageLink,
-          },
-        });
-      }
+      
 
       await prisma.dispatchTaskLog.create({
         data: {
@@ -1474,23 +1263,7 @@ const dispatchWorker = new Worker(
         },
       });
 
-      if (taskRunId) {
-        await updateTaskRunStep({
-          taskRunId,
-          entityType: 'dispatch_task',
-          entityId: dispatchTaskId,
-          status: 'failed',
-          payload: {
-            channelId: task.channelId.toString(),
-            channelName: task.channel.name,
-            mediaAssetId: task.mediaAsset.id.toString(),
-            mediaName: task.mediaAsset.originalName,
-            errorCode: code,
-            errorMessage: message,
-            retryCount: nextRetryCount,
-          },
-        });
-      }
+      
 
       await prisma.dispatchTaskLog.create({
         data: {
@@ -1635,20 +1408,7 @@ const relayUploadWorker = new Worker(
     const sourceMeta = (mediaAsset.sourceMeta ?? {}) as Record<string, unknown>;
     const taskRunIdRaw = sourceMeta.taskRunId;
     const taskRunId = typeof taskRunIdRaw === 'string' ? BigInt(taskRunIdRaw) : null;
-    if (taskRunId) {
-      await updateTaskRunStep({
-        taskRunId,
-        entityType: 'media_asset',
-        entityId: mediaAssetId,
-        status: 'success',
-        payload: {
-          channelId: mediaAsset.channelId.toString(),
-          relayChannelId: relayChannelIdRaw,
-          messageId: sendResult.messageId,
-          mediaName: mediaAsset.originalName,
-        },
-      });
-    }
+    
 
     return {
       ok: true,
@@ -1894,20 +1654,7 @@ const catalogWorker = new Worker(
         });
       }
 
-      if (taskRunId) {
-        await updateTaskRunStep({
-          taskRunId,
-          entityType: 'catalog_task',
-          entityId: channelId,
-          status: 'success',
-          payload: {
-            channelId: channelIdRaw,
-            channelName: channel.name,
-            messageId: finalMessageId,
-            status: 'success',
-          },
-        });
-      }
+      
 
       return {
         ok: true,
@@ -1930,19 +1677,7 @@ const catalogWorker = new Worker(
         });
       }
 
-      if (taskRunId) {
-        await updateTaskRunStep({
-          taskRunId,
-          entityType: 'catalog_task',
-          entityId: channelId,
-          status: 'failed',
-          payload: {
-            channelId: channelIdRaw,
-            channelName: channel.name,
-            errorMessage: error instanceof Error ? error.message : 'catalog publish failed',
-          },
-        });
-      }
+      
 
       logError('[q_catalog] publish error', {
         channelId: channelIdRaw,
@@ -1990,18 +1725,7 @@ relayUploadWorker.on('failed', async (job, err) => {
   const taskRunIdRaw = (mediaAsset?.sourceMeta as Record<string, unknown> | null)?.taskRunId;
   const taskRunId = typeof taskRunIdRaw === 'string' ? BigInt(taskRunIdRaw) : null;
   if (taskRunId && mediaAssetIdRaw) {
-    await updateTaskRunStep({
-      taskRunId,
-      entityType: 'media_asset',
-      entityId: BigInt(mediaAssetIdRaw),
-      status: 'failed',
-      payload: {
-        channelId: mediaAsset?.channelId?.toString() ?? null,
-        mediaName: mediaAsset?.originalName ?? null,
-        relayChannelId: job?.data?.relayChannelId ?? null,
-        errorMessage: err?.message ?? 'relay upload failed',
-      },
-    });
+    
   }
 
   logError('[q_relay_upload] failed job', {
