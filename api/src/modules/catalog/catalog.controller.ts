@@ -6,10 +6,8 @@ import {
   Param,
   Patch,
   Post,
-  Query,
   UseGuards,
 } from '@nestjs/common';
-import { CatalogTaskStatus } from '@prisma/client';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { Permissions } from '../auth/permissions.decorator';
 import { PermissionsGuard } from '../auth/permissions.guard';
@@ -66,31 +64,4 @@ export class CatalogController {
     return this.catalogService.publish(dto);
   }
 
-  @Permissions('tasks:view')
-  @Get('tasks')
-  listTasks(
-    @Query('channelId') channelId?: string,
-    @Query('status') status?: CatalogTaskStatus,
-    @Query('limit') limit?: string,
-  ) {
-    return this.catalogService.listTasks(
-      channelId,
-      status,
-      limit ? Number(limit) : undefined,
-    );
-  }
-
-  @Permissions('tasks:view')
-  @Get('histories')
-  listHistories(
-    @Query('channelId') channelId?: string,
-    @Query('catalogTemplateId') catalogTemplateId?: string,
-    @Query('limit') limit?: string,
-  ) {
-    return this.catalogService.listHistories({
-      channelId,
-      catalogTemplateId,
-      limit: limit ? Number(limit) : undefined,
-    });
-  }
 }

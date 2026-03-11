@@ -1,5 +1,4 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { CatalogTaskStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateCatalogTemplateDto } from './dto/create-catalog-template.dto';
 import { UpdateCatalogTemplateDto } from './dto/update-catalog-template.dto';
@@ -139,60 +138,4 @@ export class CatalogService {
     return task;
   }
 
-  async listTasks(channelId?: string, status?: CatalogTaskStatus, limit?: number) {
-    return this.prisma.catalogTask.findMany({
-      where: {
-        channelId: channelId ? BigInt(channelId) : undefined,
-        status,
-      },
-      orderBy: { createdAt: 'desc' },
-      take: limit ?? 100,
-      include: {
-        channel: {
-          select: {
-            id: true,
-            name: true,
-            tgChatId: true,
-          },
-        },
-        catalogTemplate: {
-          select: {
-            id: true,
-            name: true,
-          },
-        },
-      },
-    });
-  }
-
-  async listHistories(params: {
-    channelId?: string;
-    catalogTemplateId?: string;
-    limit?: number;
-  }) {
-    return this.prisma.catalogHistory.findMany({
-      where: {
-        channelId: params.channelId ? BigInt(params.channelId) : undefined,
-        catalogTemplateId: params.catalogTemplateId
-          ? BigInt(params.catalogTemplateId)
-          : undefined,
-      },
-      orderBy: { publishedAt: 'desc' },
-      take: params.limit ?? 100,
-      include: {
-        channel: {
-          select: {
-            id: true,
-            name: true,
-          },
-        },
-        catalogTemplate: {
-          select: {
-            id: true,
-            name: true,
-          },
-        },
-      },
-    });
-  }
 }

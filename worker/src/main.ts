@@ -908,8 +908,6 @@ async function scheduleDueRelayUploadTasks() {
     const relayChannelId = sourceMeta.relayChannelId;
     if (typeof relayChannelId !== 'string' || !relayChannelId.trim()) continue;
 
-    const taskRunIdRaw = sourceMeta.taskRunId;
-    const taskRunId = typeof taskRunIdRaw === 'string' ? BigInt(taskRunIdRaw) : null;
 
     const whereReady = {
       id: asset.id,
@@ -1085,9 +1083,6 @@ const dispatchWorker = new Worker(
       },
     });
 
-    const taskRunIdRaw = (task.mediaAsset.sourceMeta as Record<string, unknown> | null)?.taskRunId;
-    const taskRunId = typeof taskRunIdRaw === 'string' ? BigInt(taskRunIdRaw) : null;
-    
 
     await prisma.dispatchTaskLog.create({
       data: {
@@ -1406,8 +1401,6 @@ const relayUploadWorker = new Worker(
     });
 
     const sourceMeta = (mediaAsset.sourceMeta ?? {}) as Record<string, unknown>;
-    const taskRunIdRaw = sourceMeta.taskRunId;
-    const taskRunId = typeof taskRunIdRaw === 'string' ? BigInt(taskRunIdRaw) : null;
     
 
     return {
@@ -1428,8 +1421,6 @@ const catalogWorker = new Worker(
     }
 
     const channelIdRaw = job.data.channelIdRaw as string | undefined;
-    const taskRunIdRaw = job.data.taskRunId as string | undefined;
-    const taskRunId = taskRunIdRaw ? BigInt(taskRunIdRaw) : null;
     if (!channelIdRaw) {
       throw new Error('Missing channelIdRaw in job payload');
     }
@@ -1722,11 +1713,6 @@ relayUploadWorker.on('failed', async (job, err) => {
       select: { sourceMeta: true, channelId: true, originalName: true },
     })
     : null;
-  const taskRunIdRaw = (mediaAsset?.sourceMeta as Record<string, unknown> | null)?.taskRunId;
-  const taskRunId = typeof taskRunIdRaw === 'string' ? BigInt(taskRunIdRaw) : null;
-  if (taskRunId && mediaAssetIdRaw) {
-    
-  }
 
   logError('[q_relay_upload] failed job', {
     jobId: job?.id ? String(job.id) : null,
