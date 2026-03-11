@@ -10,6 +10,7 @@ import {
   safeRunInterval,
 } from './schedule-utils';
 import { generateTextWithAiProfile } from './ai-provider';
+import { logger, logError } from './logger';
 import {
   CatalogTaskStatus,
   MediaStatus,
@@ -103,23 +104,22 @@ async function moveToArchive(localPath: string): Promise<string> {
   await mkdir(archiveDir, { recursive: true });
   const archivePath = join(archiveDir, fileName);
   await rename(localPath, archivePath);
-  // eslint-disable-next-line no-console
-  console.log(`[archive] moved ${localPath} -> ${archivePath}`);
+  logger.info('[archive] moved file', { from: localPath, to: archivePath });
   return archivePath;
 }
 
 async function waitForFileStable(filePath: string) {
-  let previousSize: bigint | null = null;
+  let previousSize: number | null = null;
   let stableCount = 0;
 
   while (stableCount < RELAY_MIN_STABLE_CHECKS) {
     const s = await stat(filePath);
 
-    if (previousSize !== null && s.size === previousSize) {
+    if (previousSize !== null && Number(s.size) === previousSize) {
       stableCount += 1;
     } else {
       stableCount = 0;
-      previousSize = s.size;
+      previousSize = Number(s.size);
     }
 
     if (stableCount < RELAY_MIN_STABLE_CHECKS) {
@@ -176,7 +176,7 @@ async function sendTelegramRequest(args: {
       : {
         'content-type': 'application/json',
       },
-    body: isFormData ? args.payload : JSON.stringify(args.payload),
+    body: (isFormData ? args.payload : JSON.stringify(args.payload)) as any,
   });
 
   const json = (await response.json()) as {
@@ -244,8 +244,8 @@ async function sendVideoByTelegram(args: {
   });
 
   return {
-    messageId: result.messageId,
-    messageLink: toTelegramMessageLink(args.chatId, result.messageId),
+    messageId: result.messageId!,
+    messageLink: result.messageId ? toTelegramMessageLink(args.chatId, result.messageId) : null,
   };
 }
 
@@ -326,7 +326,96 @@ async function updateTaskDefinitionRunStatus(args: {
     data: {
       lastRunAt: new Date(),
       lastRunStatus: args.status,
-      lastRunSummary: args.summary,
+      lastRunSummary: args.summary as any,
+    },
+  });
+}
+
+async function createTaskRun(args: { taskDefinitionId: bigint; taskType: TaskDefinitionType }) {
+  return prisma.taskRun.create({
+    data: {
+      taskDefinitionId: args.taskDefinitionId,
+      taskType: args.taskType,
+      status: 'running',
+      startedAt: new Date(),
+    },
+    select: { id: true },
+  });
+}
+
+async function finishTaskRun(args: {
+  taskRunId: bigint;
+  status: 'success' | 'failed';
+  summary?: Record<string, unknown>;
+  errorMessage?: string | null;
+}) {
+  await prisma.taskRun.update({
+    where: { id: args.taskRunId },
+    data: {
+      status: args.status,
+      finishedAt: new Date(),
+      summary: args.summary as any,
+      errorMessage: args.errorMessage ?? null,
+    },
+  });
+}
+
+async function createTaskRunStep(args: {
+  taskRunId: bigint;
+  entityType: 'media_asset' | 'dispatch_task' | 'catalog_task';
+  entityId: bigint;
+  title: string;
+  payload?: Record<string, unknown>;
+  status?: 'pending' | 'running' | 'success' | 'failed';
+}) {
+  return prisma.taskRunStep.create({
+    data: {
+      taskRunId: args.taskRunId,
+      entityType: args.entityType,
+      entityId: args.entityId,
+      title: args.title,
+      payload: args.payload as any,
+      status: args.status ?? 'running',
+      startedAt: (args.status === 'running' || !args.status) ? new Date() : null,
+      finishedAt: args.status === 'success' || args.status === 'failed' ? new Date() : null,
+    },
+    select: { id: true },
+  });
+}
+
+async function updateTaskRunStep(args: {
+  taskRunId: bigint;
+  entityType: 'media_asset' | 'dispatch_task' | 'catalog_task';
+  entityId: bigint;
+  status: 'running' | 'success' | 'failed';
+  payload?: Record<string, unknown>;
+}) {
+  await prisma.taskRunStep.updateMany({
+    where: {
+      taskRunId: args.taskRunId,
+      entityType: args.entityType,
+      entityId: args.entityId,
+    },
+    data: {
+      status: args.status,
+      payload: args.payload as any,
+      startedAt: args.status === 'running' ? new Date() : undefined,
+      finishedAt: args.status === 'success' || args.status === 'failed' ? new Date() : undefined,
+    },
+  });
+}
+
+async function finishTaskRunStep(args: {
+  taskRunStepId: bigint;
+  status: 'success' | 'failed';
+  payload?: Record<string, unknown>;
+}) {
+  await prisma.taskRunStep.update({
+    where: { id: args.taskRunStepId },
+    data: {
+      status: args.status,
+      payload: args.payload as any,
+      finishedAt: new Date(),
     },
   });
 }
@@ -354,7 +443,7 @@ async function scanChannelVideos(folderPath: string) {
   return files;
 }
 
-async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
+async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint, taskRunId: bigint) {
   const definition = await getTaskDefinitionModel().findUnique({
     where: { id: taskDefinitionId },
     select: {
@@ -441,6 +530,19 @@ async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
         createdAssets += 1;
       }
 
+      await createTaskRunStep({
+        taskRunId,
+        entityType: 'media_asset',
+        entityId: asset.id,
+        title: 'enqueue relay upload',
+        payload: {
+          channelId: channel.id.toString(),
+          localPath: filePath,
+          originalName: basename(filePath),
+          status: asset.status,
+        },
+      });
+
       if (
         asset.status === MediaStatus.relay_uploaded ||
         asset.status === MediaStatus.ingesting
@@ -455,6 +557,7 @@ async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
           sourceMeta: {
             relayChannelId: definition.relayChannelId.toString(),
             taskDefinitionId: definition.id.toString(),
+            taskRunId: taskRunId.toString(),
             relayEnqueueAt: new Date().toISOString(),
             relayPriority: definition.priority,
             relayMaxRetries: definition.maxRetries,
@@ -474,7 +577,7 @@ async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
   };
 }
 
-async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
+async function scheduleDispatchForDefinition(taskDefinitionId: bigint, taskRunId: bigint) {
   try {
     const definition = await getTaskDefinitionModel().findUnique({
       where: { id: taskDefinitionId },
@@ -485,15 +588,15 @@ async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
       throw new Error(`Task Definition ${taskDefinitionId} not found`);
     }
 
-    // Auto-discover media assets that are ready for dispatch 
+    // Auto-discover media assets that are ready for dispatch
     // but haven't been queued for dispatch yet.
     const unscheduledAssets = await prisma.mediaAsset.findMany({
       where: {
         status: MediaStatus.relay_uploaded,
         telegramFileId: { not: null },
         dispatchTasks: {
-          none: {} // Only pick assets that don't have any DispatchTasks
-        }
+          none: {}, // Only pick assets that don't have any DispatchTasks
+        },
       },
       select: {
         id: true,
@@ -506,7 +609,7 @@ async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
     const now = new Date();
 
     for (const asset of unscheduledAssets) {
-      await prisma.dispatchTask.create({
+      const dispatchTask = await prisma.dispatchTask.create({
         data: {
           channelId: asset.channelId,
           mediaAssetId: asset.id,
@@ -515,8 +618,22 @@ async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
           plannedAt: now,
           nextRunAt: now,
           priority: definition.priority ?? 100,
-        }
+        },
+        select: { id: true },
       });
+
+      await createTaskRunStep({
+        taskRunId,
+        entityType: 'dispatch_task',
+        entityId: dispatchTask.id,
+        title: 'enqueue dispatch task',
+        payload: {
+          channelId: asset.channelId.toString(),
+          mediaAssetId: asset.id.toString(),
+          status: 'pending',
+        },
+      });
+
       createdCount++;
     }
 
@@ -532,6 +649,15 @@ async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
         message: 'Auto-scanned and queued dispatch tasks',
       },
     });
+
+    await finishTaskRun({
+      taskRunId,
+      status: 'success',
+      summary: {
+        executor: 'dispatch_send',
+        createdTasks: createdCount,
+      },
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     // eslint-disable-next-line no-console
@@ -541,12 +667,19 @@ async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
       status: 'failed',
       summary: { executor: 'dispatch_send', error: message },
     });
+
+    await finishTaskRun({
+      taskRunId,
+      status: 'failed',
+      errorMessage: message,
+      summary: { executor: 'dispatch_send', error: message },
+    });
   }
 }
 
-async function scheduleRelayForDefinition(taskDefinitionId: bigint) {
+async function scheduleRelayForDefinition(taskDefinitionId: bigint, taskRunId: bigint) {
   try {
-    const enqueueSummary = await enqueueRelayAssetsFromTaskDefinition(taskDefinitionId);
+    const enqueueSummary = await enqueueRelayAssetsFromTaskDefinition(taskDefinitionId, taskRunId);
     await scheduleDueRelayUploadTasks();
     await updateTaskDefinitionRunStatus({
       taskDefinitionId,
@@ -555,6 +688,15 @@ async function scheduleRelayForDefinition(taskDefinitionId: bigint) {
         executor: 'relay_upload',
         ...enqueueSummary,
         message: 'relay upload scan + scheduler tick completed',
+      },
+    });
+
+    await finishTaskRun({
+      taskRunId,
+      status: 'success',
+      summary: {
+        executor: 'relay_upload',
+        ...enqueueSummary,
       },
     });
   } catch (error) {
@@ -568,15 +710,31 @@ async function scheduleRelayForDefinition(taskDefinitionId: bigint) {
       },
     });
 
+    await finishTaskRun({
+      taskRunId,
+      status: 'failed',
+      errorMessage: message,
+      summary: { executor: 'relay_upload', error: message },
+    });
+
     throw error;
   }
 }
 
-async function scheduleCatalogForDefinition(taskDefinitionId: bigint) {
+async function scheduleCatalogForDefinition(taskDefinitionId: bigint, taskRunId: bigint) {
   try {
-    await scheduleDueCatalogTasks();
+    await scheduleDueCatalogTasks(taskRunId);
     await updateTaskDefinitionRunStatus({
       taskDefinitionId,
+      status: 'success',
+      summary: {
+        executor: 'catalog_publish',
+        message: 'catalog scheduler tick completed',
+      },
+    });
+
+    await finishTaskRun({
+      taskRunId,
       status: 'success',
       summary: {
         executor: 'catalog_publish',
@@ -592,6 +750,13 @@ async function scheduleCatalogForDefinition(taskDefinitionId: bigint) {
         executor: 'catalog_publish',
         error: message,
       },
+    });
+
+    await finishTaskRun({
+      taskRunId,
+      status: 'failed',
+      errorMessage: message,
+      summary: { executor: 'catalog_publish', error: message },
     });
 
     throw error;
@@ -631,19 +796,20 @@ async function releaseTaskDefinitionLock(taskDefinitionId: bigint, lockToken: st
 async function scheduleTaskDefinitionByType(definition: {
   id: bigint;
   taskType: TaskDefinitionType;
+  taskRunId: bigint;
 }) {
   if (definition.taskType === TaskDefinitionType.relay_upload) {
-    await scheduleRelayForDefinition(definition.id);
+    await scheduleRelayForDefinition(definition.id, definition.taskRunId);
     return;
   }
 
   if (definition.taskType === TaskDefinitionType.dispatch_send) {
-    await scheduleDispatchForDefinition(definition.id);
+    await scheduleDispatchForDefinition(definition.id, definition.taskRunId);
     return;
   }
 
   if (definition.taskType === TaskDefinitionType.catalog_publish) {
-    await scheduleCatalogForDefinition(definition.id);
+    await scheduleCatalogForDefinition(definition.id, definition.taskRunId);
   }
 }
 
@@ -682,10 +848,7 @@ async function scheduleEnabledTaskDefinitions() {
 
     if (isSchemaNotReady) {
       if (!hasWarnedMissingTaskDefinitionsTable) {
-        // eslint-disable-next-line no-console
-        console.warn(
-          '[scheduler:task-definitions] task_definitions schema is not ready, fallback to legacy schedulers. Run prisma migrate to enable task-definition scheduling.',
-        );
+        logger.warn('[scheduler:task-definitions] task_definitions schema is not ready, fallback to legacy schedulers. Run prisma migrate to enable task-definition scheduling.');
         hasWarnedMissingTaskDefinitionsTable = true;
       }
 
@@ -704,10 +867,10 @@ async function scheduleEnabledTaskDefinitions() {
     const lockToken = await tryAcquireTaskDefinitionLock(definition.id);
     if (!lockToken) {
       taskdefMetrics.lockSkipTotal += 1;
-      // eslint-disable-next-line no-console
-      console.log(
-        `[scheduler:taskdef] lock_skip | id=${definition.id.toString()} type=${definition.taskType}`,
-      );
+      logger.info('[scheduler:taskdef] lock_skip', {
+        taskDefinitionId: definition.id.toString(),
+        taskType: definition.taskType,
+      });
       continue;
     }
 
@@ -717,6 +880,7 @@ async function scheduleEnabledTaskDefinitions() {
     const nextRunAtBefore = definition.nextRunAt?.toISOString() ?? null;
     let runStatus: 'success' | 'failed' = 'success';
     let nextRunAtAfter: string | null = null;
+    let taskRunId: bigint | null = null;
 
     try {
       await getTaskDefinitionModel().update({
@@ -726,7 +890,16 @@ async function scheduleEnabledTaskDefinitions() {
         },
       });
 
-      await scheduleTaskDefinitionByType(definition);
+      const taskRun = await createTaskRun({
+        taskDefinitionId: definition.id,
+        taskType: definition.taskType,
+      });
+      taskRunId = taskRun.id;
+
+      await scheduleTaskDefinitionByType({
+        ...definition,
+        taskRunId: taskRun.id,
+      });
 
       const newNextRunAt = new Date(now.getTime() + safeRunIntervalSec * 1000);
       nextRunAtAfter = newNextRunAt.toISOString();
@@ -756,28 +929,36 @@ async function scheduleEnabledTaskDefinitions() {
         },
       });
 
-      // eslint-disable-next-line no-console
-      console.error(
-        `[scheduler:taskdef] run_failed | id=${definition.id.toString()} type=${definition.taskType} error=${error instanceof Error ? error.message : 'unknown'}`,
-      );
+      if (taskRunId) {
+        const message = error instanceof Error ? error.message : 'unknown error';
+        await finishTaskRun({
+          taskRunId,
+          status: 'failed',
+          errorMessage: message,
+          summary: { executor: definition.taskType, error: message },
+        });
+      }
+
+      logError('[scheduler:taskdef] run_failed', {
+        taskDefinitionId: definition.id.toString(),
+        taskType: definition.taskType,
+        error: error instanceof Error ? error.message : 'unknown',
+      });
     } finally {
       const durationMs = Date.now() - runStart;
       taskdefMetrics.runDurationMsTotal += durationMs;
 
-      // eslint-disable-next-line no-console
-      console.log(
-        JSON.stringify({
-          tag: 'taskdef_run',
-          taskDefinitionId: definition.id.toString(),
-          taskType: definition.taskType,
-          runIntervalSec: safeRunIntervalSec,
-          lockAcquired: true,
-          status: runStatus,
-          durationMs,
-          nextRunAtBefore,
-          nextRunAtAfter,
-        }),
-      );
+      logger.info('taskdef_run', {
+        tag: 'taskdef_run',
+        taskDefinitionId: definition.id.toString(),
+        taskType: definition.taskType,
+        runIntervalSec: safeRunIntervalSec,
+        lockAcquired: true,
+        status: runStatus,
+        durationMs,
+        nextRunAtBefore,
+        nextRunAtAfter,
+      });
 
       await releaseTaskDefinitionLock(definition.id, lockToken);
     }
@@ -785,20 +966,17 @@ async function scheduleEnabledTaskDefinitions() {
 
   /* ── Periodic metrics dump (~every 5 min) ── */
   if (taskdefMetrics.tickTotal % METRICS_LOG_INTERVAL_TICKS === 0) {
-    // eslint-disable-next-line no-console
-    console.log(
-      JSON.stringify({
-        tag: 'taskdef_metrics',
-        ...taskdefMetrics,
-        avgRunDurationMs:
-          taskdefMetrics.runSuccessTotal + taskdefMetrics.runFailedTotal > 0
-            ? Math.round(
-              taskdefMetrics.runDurationMsTotal /
-              (taskdefMetrics.runSuccessTotal + taskdefMetrics.runFailedTotal),
-            )
-            : 0,
-      }),
-    );
+    logger.info('taskdef_metrics', {
+      tag: 'taskdef_metrics',
+      ...taskdefMetrics,
+      avgRunDurationMs:
+        taskdefMetrics.runSuccessTotal + taskdefMetrics.runFailedTotal > 0
+          ? Math.round(
+            taskdefMetrics.runDurationMsTotal /
+            (taskdefMetrics.runSuccessTotal + taskdefMetrics.runFailedTotal),
+          )
+          : 0,
+    });
   }
 }
 
@@ -853,8 +1031,7 @@ async function scheduleDueDispatchTasks() {
   }
 
   if (dueTasks.length > 0) {
-    // eslint-disable-next-line no-console
-    console.log(`[scheduler] queued ${dueTasks.length} dispatch task(s)`);
+    logger.info('[scheduler] queued dispatch tasks', { count: dueTasks.length });
   }
 }
 
@@ -877,6 +1054,7 @@ async function scheduleDueRelayUploadTasks() {
     select: {
       id: true,
       channelId: true,
+      originalName: true,
       status: true,
       sourceMeta: true,
       updatedAt: true,
@@ -889,6 +1067,9 @@ async function scheduleDueRelayUploadTasks() {
     const sourceMeta = (asset.sourceMeta ?? {}) as Record<string, unknown>;
     const relayChannelId = sourceMeta.relayChannelId;
     if (typeof relayChannelId !== 'string' || !relayChannelId.trim()) continue;
+
+    const taskRunIdRaw = sourceMeta.taskRunId;
+    const taskRunId = typeof taskRunIdRaw === 'string' ? BigInt(taskRunIdRaw) : null;
 
     const whereReady = {
       id: asset.id,
@@ -937,16 +1118,29 @@ async function scheduleDueRelayUploadTasks() {
       },
     );
 
+    if (taskRunId) {
+      await updateTaskRunStep({
+        taskRunId,
+        entityType: 'media_asset',
+        entityId: asset.id,
+        status: 'running',
+        payload: {
+          channelId: asset.channelId.toString(),
+          relayChannelId,
+          mediaName: asset.originalName,
+        },
+      });
+    }
+
     queuedCount += 1;
   }
 
   if (queuedCount > 0) {
-    // eslint-disable-next-line no-console
-    console.log(`[scheduler] queued ${queuedCount} relay upload task(s)`);
+    logger.info('[scheduler] queued relay upload tasks', { count: queuedCount });
   }
 }
 
-async function scheduleDueCatalogTasks() {
+async function scheduleDueCatalogTasks(taskRunId?: bigint) {
   const now = new Date();
 
   const channels = await prisma.channel.findMany({
@@ -956,6 +1150,7 @@ async function scheduleDueCatalogTasks() {
     },
     select: {
       id: true,
+      name: true,
       lastNavUpdateAt: true,
       navIntervalSec: true,
       navTemplateText: true,
@@ -986,7 +1181,10 @@ async function scheduleDueCatalogTasks() {
 
     await catalogQueue.add(
       'catalog-publish',
-      { channelIdRaw: channel.id.toString() },
+      {
+        channelIdRaw: channel.id.toString(),
+        taskRunId: taskRunId ? taskRunId.toString() : undefined,
+      },
       {
         jobId,
         removeOnComplete: true,
@@ -994,12 +1192,24 @@ async function scheduleDueCatalogTasks() {
       },
     );
 
+    if (taskRunId) {
+      await createTaskRunStep({
+        taskRunId,
+        entityType: 'catalog_task',
+        entityId: channel.id,
+        title: 'catalog publish',
+        payload: {
+          channelId: channel.id.toString(),
+          channelName: channel.name,
+        },
+      });
+    }
+
     queuedCount += 1;
   }
 
   if (queuedCount > 0) {
-    // eslint-disable-next-line no-console
-    console.log(`[scheduler] queued ${queuedCount} catalog task(s)`);
+    logger.info('[scheduler] queued catalog tasks', { count: queuedCount });
   }
 }
 
@@ -1025,6 +1235,7 @@ const dispatchWorker = new Worker(
         channel: {
           select: {
             id: true,
+            name: true,
             tgChatId: true,
             defaultBotId: true,
             aiModelProfileId: true,
@@ -1038,6 +1249,8 @@ const dispatchWorker = new Worker(
             telegramFileId: true,
             status: true,
             originalName: true,
+            aiGeneratedCaption: true,
+            sourceMeta: true,
           },
         },
       },
@@ -1055,6 +1268,23 @@ const dispatchWorker = new Worker(
       },
     });
 
+    const taskRunIdRaw = (task.mediaAsset.sourceMeta as Record<string, unknown> | null)?.taskRunId;
+    const taskRunId = typeof taskRunIdRaw === 'string' ? BigInt(taskRunIdRaw) : null;
+    if (taskRunId) {
+      await updateTaskRunStep({
+        taskRunId,
+        entityType: 'dispatch_task',
+        entityId: dispatchTaskId,
+        status: 'running',
+        payload: {
+          channelId: task.channelId.toString(),
+          channelName: task.channel.name,
+          mediaAssetId: task.mediaAsset.id.toString(),
+          mediaName: task.mediaAsset.originalName,
+        },
+      });
+    }
+
     await prisma.dispatchTaskLog.create({
       data: {
         dispatchTaskId,
@@ -1071,7 +1301,7 @@ const dispatchWorker = new Worker(
         throw new Error('Media asset has no telegramFileId (relay not uploaded)');
       }
 
-      let finalCaption = task.caption;
+      let finalCaption = task.caption || task.mediaAsset.aiGeneratedCaption;
 
       if (!finalCaption && task.channel.aiSystemPromptTemplate) {
         let profile = task.channel.aiModelProfileId ? await prisma.aiModelProfile.findUnique({
@@ -1114,8 +1344,13 @@ const dispatchWorker = new Worker(
               where: { id: task.id },
               data: { caption: finalCaption }
             });
+            // Also write back to mediaAsset so other tasks can use it
+            await prisma.mediaAsset.update({
+              where: { id: task.mediaAsset.id },
+              data: { aiGeneratedCaption: finalCaption }
+            });
           } catch (aiErr) {
-            console.error(`[q_dispatch] AI generation failed for dispatchTask=${task.id}`, aiErr);
+                    logError('[q_dispatch] AI generation failed', { dispatchTaskId: task.id.toString(), error: aiErr });
             finalCaption = task.mediaAsset.originalName;
           }
         } else {
@@ -1123,6 +1358,13 @@ const dispatchWorker = new Worker(
         }
       } else if (!finalCaption) {
         finalCaption = task.mediaAsset.originalName;
+      }
+
+      if (!task.mediaAsset.aiGeneratedCaption && finalCaption) {
+        await prisma.mediaAsset.update({
+          where: { id: task.mediaAsset.id },
+          data: { aiGeneratedCaption: finalCaption },
+        });
       }
 
       const resolvedBotId = task.botId ?? task.channel.defaultBotId;
@@ -1168,6 +1410,23 @@ const dispatchWorker = new Worker(
           telegramErrorMessage: null,
         },
       });
+
+      if (taskRunId) {
+        await updateTaskRunStep({
+          taskRunId,
+          entityType: 'dispatch_task',
+          entityId: dispatchTaskId,
+          status: 'success',
+          payload: {
+            channelId: task.channelId.toString(),
+            channelName: task.channel.name,
+            mediaAssetId: task.mediaAsset.id.toString(),
+            mediaName: task.mediaAsset.originalName,
+            messageId: sendResult.messageId,
+            messageLink: sendResult.messageLink,
+          },
+        });
+      }
 
       await prisma.dispatchTaskLog.create({
         data: {
@@ -1215,6 +1474,24 @@ const dispatchWorker = new Worker(
         },
       });
 
+      if (taskRunId) {
+        await updateTaskRunStep({
+          taskRunId,
+          entityType: 'dispatch_task',
+          entityId: dispatchTaskId,
+          status: 'failed',
+          payload: {
+            channelId: task.channelId.toString(),
+            channelName: task.channel.name,
+            mediaAssetId: task.mediaAsset.id.toString(),
+            mediaName: task.mediaAsset.originalName,
+            errorCode: code,
+            errorMessage: message,
+            retryCount: nextRetryCount,
+          },
+        });
+      }
+
       await prisma.dispatchTaskLog.create({
         data: {
           dispatchTaskId,
@@ -1252,7 +1529,7 @@ const dispatchWorker = new Worker(
       throw error;
     }
   },
-  { connection, concurrency: 5 },
+  { connection: connection as any, concurrency: 5 },
 );
 
 const relayUploadWorker = new Worker(
@@ -1321,9 +1598,10 @@ const relayUploadWorker = new Worker(
     formData.append('supports_streaming', 'true');
 
     // eslint-disable-next-line no-console
-    console.log(
-      `[q_relay_upload] uploading mediaAsset=${mediaAssetIdRaw} to relayChannel=${relayChannelIdRaw}`,
-    );
+    logger.info('[q_relay_upload] uploading media asset', {
+      mediaAssetId: mediaAssetIdRaw,
+      relayChannelId: relayChannelIdRaw,
+    });
 
     const sendResult = await sendTelegramRequest({
       botToken: relayChannel.bot.tokenEncrypted,
@@ -1339,8 +1617,7 @@ const relayUploadWorker = new Worker(
     try {
       archivePath = await moveToArchive(mediaAsset.localPath);
     } catch (moveErr) {
-      // eslint-disable-next-line no-console
-      console.warn(`[q_relay_upload] failed to move file to archive:`, moveErr);
+      logError('[q_relay_upload] failed to move file to archive', moveErr);
     }
 
     await prisma.mediaAsset.update({
@@ -1354,6 +1631,24 @@ const relayUploadWorker = new Worker(
         ...(archivePath ? { archivePath, localPath: archivePath } : {}),
       },
     });
+
+    const sourceMeta = (mediaAsset.sourceMeta ?? {}) as Record<string, unknown>;
+    const taskRunIdRaw = sourceMeta.taskRunId;
+    const taskRunId = typeof taskRunIdRaw === 'string' ? BigInt(taskRunIdRaw) : null;
+    if (taskRunId) {
+      await updateTaskRunStep({
+        taskRunId,
+        entityType: 'media_asset',
+        entityId: mediaAssetId,
+        status: 'success',
+        payload: {
+          channelId: mediaAsset.channelId.toString(),
+          relayChannelId: relayChannelIdRaw,
+          messageId: sendResult.messageId,
+          mediaName: mediaAsset.originalName,
+        },
+      });
+    }
 
     return {
       ok: true,
@@ -1373,9 +1668,13 @@ const catalogWorker = new Worker(
     }
 
     const channelIdRaw = job.data.channelIdRaw as string | undefined;
+    const taskRunIdRaw = job.data.taskRunId as string | undefined;
+    const taskRunId = taskRunIdRaw ? BigInt(taskRunIdRaw) : null;
     if (!channelIdRaw) {
       throw new Error('Missing channelIdRaw in job payload');
     }
+
+    let catalogTaskId: bigint | null = null;
 
     const channelId = BigInt(channelIdRaw);
 
@@ -1399,6 +1698,58 @@ const catalogWorker = new Worker(
       throw new Error(`Channel bot not active: ${channelIdRaw}`);
     }
 
+    let catalogTemplate = await prisma.catalogTemplate.findFirst({
+      where: { isActive: true },
+      select: { id: true },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (!catalogTemplate) {
+      catalogTemplate = await prisma.catalogTemplate.create({
+        data: {
+          name: '默认模板',
+          bodyTemplate: '{{#each videos}}\\n{{this.short_title}}\\n{{this.message_url}}\\n{{/each}}',
+          recentLimit: 60,
+          isActive: true,
+        },
+        select: { id: true },
+      });
+    }
+
+    // Scheme #1: create catalog_tasks record (pending -> running -> success/failed/cancelled)
+    const now = new Date();
+    const reuseWindowMs = 2 * 60 * 1000;
+    const recentExisting = await prisma.catalogTask.findFirst({
+      where: {
+        channelId,
+        status: { in: [CatalogTaskStatus.pending, CatalogTaskStatus.running] },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, createdAt: true },
+    });
+
+    if (recentExisting && now.getTime() - recentExisting.createdAt.getTime() <= reuseWindowMs) {
+      // Avoid duplicate inserts on job retries/bursts.
+      catalogTaskId = recentExisting.id;
+    } else {
+      const created = await prisma.catalogTask.create({
+        data: {
+          channelId,
+          catalogTemplateId: catalogTemplate.id,
+          status: CatalogTaskStatus.pending,
+          plannedAt: now,
+          pinAfterPublish: false,
+        },
+        select: { id: true },
+      });
+      catalogTaskId = created.id;
+    }
+
+    await prisma.catalogTask.update({
+      where: { id: catalogTaskId },
+      data: { status: CatalogTaskStatus.running, startedAt: now },
+    });
+
     const recentLimit = channel.navRecentLimit ?? 60;
     const dispatchTasks = await prisma.dispatchTask.findMany({
       where: { channelId, status: TaskStatus.success, telegramMessageId: { not: null } },
@@ -1411,6 +1762,16 @@ const catalogWorker = new Worker(
     });
 
     if (dispatchTasks.length === 0) {
+      if (catalogTaskId) {
+        await prisma.catalogTask.update({
+          where: { id: catalogTaskId },
+          data: {
+            status: CatalogTaskStatus.cancelled,
+            finishedAt: new Date(),
+            errorMessage: 'no_successful_dispatch_tasks',
+          },
+        });
+      }
       return { ok: true, skipped: true, reason: 'no_successful_dispatch_tasks' };
     }
 
@@ -1448,6 +1809,10 @@ const catalogWorker = new Worker(
 
     const botToken = channel.defaultBot.tokenEncrypted;
     let finalMessageId: number | null = null;
+    const contentPreview = content.slice(0, 4000);
+    let pinAttempted = false;
+    let pinSuccess: boolean | null = null;
+    let pinErrorMessage: string | null = null;
 
     try {
       if (channel.navMessageId) {
@@ -1469,7 +1834,14 @@ const catalogWorker = new Worker(
             } else {
               const sendResult = await sendTextByTelegram({ botToken, chatId: channel.tgChatId, text: content });
               finalMessageId = sendResult.messageId;
-              await pinMessageByTelegram({ botToken, chatId: channel.tgChatId, messageId: finalMessageId });
+              pinAttempted = true;
+              try {
+                await pinMessageByTelegram({ botToken, chatId: channel.tgChatId, messageId: finalMessageId });
+                pinSuccess = true;
+              } catch (pinErr) {
+                pinSuccess = false;
+                pinErrorMessage = pinErr instanceof Error ? pinErr.message : 'pin failed';
+              }
             }
           } else {
             throw err;
@@ -1478,7 +1850,14 @@ const catalogWorker = new Worker(
       } else {
         const sendResult = await sendTextByTelegram({ botToken, chatId: channel.tgChatId, text: content });
         finalMessageId = sendResult.messageId;
-        await pinMessageByTelegram({ botToken, chatId: channel.tgChatId, messageId: finalMessageId });
+        pinAttempted = true;
+        try {
+          await pinMessageByTelegram({ botToken, chatId: channel.tgChatId, messageId: finalMessageId });
+          pinSuccess = true;
+        } catch (pinErr) {
+          pinSuccess = false;
+          pinErrorMessage = pinErr instanceof Error ? pinErr.message : 'pin failed';
+        }
       }
 
       await prisma.channel.update({
@@ -1489,14 +1868,86 @@ const catalogWorker = new Worker(
         },
       });
 
+      await prisma.catalogHistory.create({
+        data: {
+          channelId,
+          catalogTemplateId: catalogTemplate.id,
+          content,
+          renderedCount: videos.length,
+          publishedAt: new Date(),
+        },
+      });
+
+      if (catalogTaskId) {
+        await prisma.catalogTask.update({
+          where: { id: catalogTaskId },
+          data: {
+            status: CatalogTaskStatus.success,
+            finishedAt: new Date(),
+            telegramMessageId: finalMessageId ? BigInt(finalMessageId) : null,
+            contentPreview,
+            errorMessage: null,
+            pinAfterPublish: pinAttempted,
+            pinSuccess,
+            pinErrorMessage,
+          },
+        });
+      }
+
+      if (taskRunId) {
+        await updateTaskRunStep({
+          taskRunId,
+          entityType: 'catalog_task',
+          entityId: channelId,
+          status: 'success',
+          payload: {
+            channelId: channelIdRaw,
+            channelName: channel.name,
+            messageId: finalMessageId,
+            status: 'success',
+          },
+        });
+      }
+
       return {
         ok: true,
         channelId: channelIdRaw,
         messageId: finalMessageId,
       };
     } catch (error) {
-      // eslint-disable-next-line no-console
-      console.error(`[q_catalog] publish error for channel=${channelIdRaw}:`, error);
+      if (catalogTaskId) {
+        await prisma.catalogTask.update({
+          where: { id: catalogTaskId },
+          data: {
+            status: CatalogTaskStatus.failed,
+            finishedAt: new Date(),
+            contentPreview,
+            errorMessage: error instanceof Error ? error.message : 'catalog publish failed',
+            pinAfterPublish: pinAttempted,
+            pinSuccess,
+            pinErrorMessage: pinErrorMessage ?? (error instanceof Error ? error.message : 'catalog publish failed'),
+          },
+        });
+      }
+
+      if (taskRunId) {
+        await updateTaskRunStep({
+          taskRunId,
+          entityType: 'catalog_task',
+          entityId: channelId,
+          status: 'failed',
+          payload: {
+            channelId: channelIdRaw,
+            channelName: channel.name,
+            errorMessage: error instanceof Error ? error.message : 'catalog publish failed',
+          },
+        });
+      }
+
+      logError('[q_catalog] publish error', {
+        channelId: channelIdRaw,
+        error,
+      });
       throw error;
     }
   },
@@ -1504,18 +1955,18 @@ const catalogWorker = new Worker(
 );
 
 dispatchWorker.on('completed', (job) => {
-  // eslint-disable-next-line no-console
-  console.log(`[q_dispatch] completed job ${job.id}`);
+  logger.info('[q_dispatch] completed job', { jobId: String(job.id) });
 });
 
 dispatchWorker.on('failed', (job, err) => {
-  // eslint-disable-next-line no-console
-  console.error(`[q_dispatch] failed job ${job?.id}:`, err.message);
+  logError('[q_dispatch] failed job', {
+    jobId: job?.id ? String(job.id) : null,
+    error: err,
+  });
 });
 
 relayUploadWorker.on('completed', (job) => {
-  // eslint-disable-next-line no-console
-  console.log(`[q_relay_upload] completed job ${job.id}`);
+  logger.info('[q_relay_upload] completed job', { jobId: String(job.id) });
 });
 
 relayUploadWorker.on('failed', async (job, err) => {
@@ -1530,28 +1981,53 @@ relayUploadWorker.on('failed', async (job, err) => {
     });
   }
 
-  // eslint-disable-next-line no-console
-  console.error(`[q_relay_upload] failed job ${job?.id}:`, err.message);
+  const mediaAsset = mediaAssetIdRaw
+    ? await prisma.mediaAsset.findUnique({
+      where: { id: BigInt(mediaAssetIdRaw) },
+      select: { sourceMeta: true, channelId: true, originalName: true },
+    })
+    : null;
+  const taskRunIdRaw = (mediaAsset?.sourceMeta as Record<string, unknown> | null)?.taskRunId;
+  const taskRunId = typeof taskRunIdRaw === 'string' ? BigInt(taskRunIdRaw) : null;
+  if (taskRunId && mediaAssetIdRaw) {
+    await updateTaskRunStep({
+      taskRunId,
+      entityType: 'media_asset',
+      entityId: BigInt(mediaAssetIdRaw),
+      status: 'failed',
+      payload: {
+        channelId: mediaAsset?.channelId?.toString() ?? null,
+        mediaName: mediaAsset?.originalName ?? null,
+        relayChannelId: job?.data?.relayChannelId ?? null,
+        errorMessage: err?.message ?? 'relay upload failed',
+      },
+    });
+  }
+
+  logError('[q_relay_upload] failed job', {
+    jobId: job?.id ? String(job.id) : null,
+    mediaAssetId: mediaAssetIdRaw ?? null,
+    error: err,
+  });
 });
 
 relayUploadWorker.on('error', (err) => {
-  // eslint-disable-next-line no-console
-  console.error('[q_relay_upload] worker error:', err);
+  logError('[q_relay_upload] worker error', err);
 });
 
 catalogWorker.on('completed', (job) => {
-  // eslint-disable-next-line no-console
-  console.log(`[q_catalog] completed job ${job.id}`);
+  logger.info('[q_catalog] completed job', { jobId: String(job.id) });
 });
 
 catalogWorker.on('failed', (job, err) => {
-  // eslint-disable-next-line no-console
-  console.error(`[q_catalog] failed job ${job?.id}:`, err.message);
+  logError('[q_catalog] failed job', {
+    jobId: job?.id ? String(job.id) : null,
+    error: err,
+  });
 });
 
 async function drainStaleRelayJobs() {
-  // eslint-disable-next-line no-console
-  console.log('[bootstrap] draining stale relay upload jobs...');
+  logger.info('[bootstrap] draining stale relay upload jobs...');
   let removed = 0;
 
   const failedJobs = await relayUploadQueue.getFailed(0, 500);
@@ -1575,8 +2051,7 @@ async function drainStaleRelayJobs() {
   }
 
   if (removed > 0) {
-    // eslint-disable-next-line no-console
-    console.log(`[bootstrap] removed ${removed} stale relay upload job(s)`);
+    logger.info('[bootstrap] removed stale relay upload jobs', { count: removed });
   }
 }
 
@@ -1603,17 +2078,14 @@ async function bootstrap() {
 
   setInterval(() => {
     void scheduleEnabledTaskDefinitions().catch((err) => {
-      // eslint-disable-next-line no-console
-      console.error('[scheduler:task-definitions] error:', err);
+      logError('[scheduler:task-definitions] error', err);
     });
   }, SCHEDULER_POLL_MS);
 
-  // eslint-disable-next-line no-console
-  console.log('Worker started. Queues: q_dispatch + q_relay_upload + q_catalog, task-definitions scheduler enabled');
+  logger.info('Worker started. Queues: q_dispatch + q_relay_upload + q_catalog, task-definitions scheduler enabled');
 }
 
 bootstrap().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error('Worker bootstrap error:', err);
+  logError('Worker bootstrap error', err);
   process.exit(1);
 });

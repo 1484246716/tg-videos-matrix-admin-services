@@ -1,0 +1,9 @@
+﻿src/modules/media-lifecycle/media-lifecycle.service.ts(25,9): error TS2322: Type 'string | undefined' is not assignable to type 'MediaStatus | EnumMediaStatusFilter<"MediaAsset"> | undefined'.
+  Type 'string' is not assignable to type 'MediaStatus | EnumMediaStatusFilter<"MediaAsset"> | undefined'.
+src/modules/media-lifecycle/media-lifecycle.service.ts(38,9): error TS2322: Type '{ status?: string | undefined; mediaAssetId: { in: bigint[]; }; }' is not assignable to type 'DispatchTaskWhereInput'.
+  Types of property 'status' are incompatible.
+    Type 'string | undefined' is not assignable to type 'TaskStatus | EnumTaskStatusFilter<"DispatchTask"> | undefined'.
+      Type 'string' is not assignable to type 'TaskStatus | EnumTaskStatusFilter<"DispatchTask"> | undefined'.
+src/modules/media-lifecycle/media-lifecycle.service.ts(50,11): error TS2322: Type 'string' is not assignable to type 'CatalogTaskStatus | EnumCatalogTaskStatusFilter<"CatalogTask"> | undefined'.
+src/modules/media-lifecycle/media-lifecycle.service.ts(73,28): error TS2551: Property 'channel' does not exist on type '{ status: MediaStatus; id: bigint; createdAt: Date; updatedAt: Date; channelId: bigint; originalName: string; localPath: string; fileSize: bigint; fileHash: string; ... 7 more ...; sourceMeta: JsonValue; }'. Did you mean 'channelId'?
+src/modules/media-lifecycle/media-lifecycle.service.ts(85,41): error TS2551: Property 'channel' does not exist on type '{ status: TaskStatus; id: bigint; createdAt: Date; updatedAt: Date; botId: bigint | null; channelId: bigint; priority: number; maxRetries: number; mediaAssetId: bigint; ... 12 more ...; finishedAt: Date | null; }'. Did you mean 'channelId'?

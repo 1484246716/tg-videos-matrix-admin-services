@@ -28,7 +28,7 @@ export class MediaAssetService {
   constructor(private readonly prisma: PrismaService) {}
 
   async list(params: { channelId?: string; status?: MediaStatus; limit?: number }) {
-    return this.prisma.mediaAsset.findMany({
+    const items = await this.prisma.mediaAsset.findMany({
       where: {
         channelId: params.channelId ? BigInt(params.channelId) : undefined,
         status: params.status,
@@ -45,6 +45,20 @@ export class MediaAssetService {
         },
       },
     });
+
+    return items.map((item) => ({
+      ...item,
+      id: item.id.toString(),
+      channelId: item.channelId.toString(),
+      fileSize: item.fileSize.toString(),
+      relayMessageId: item.relayMessageId ? item.relayMessageId.toString() : null,
+      channel: item.channel
+        ? {
+          ...item.channel,
+          id: item.channel.id.toString(),
+        }
+        : null,
+    }));
   }
 
   async create(dto: CreateMediaAssetDto) {

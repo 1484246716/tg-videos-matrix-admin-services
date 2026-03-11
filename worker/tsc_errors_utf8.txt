@@ -1,0 +1,52 @@
+﻿src/main.ts(118,34): error TS2367: This comparison appears to be unintentional because the types 'number' and 'bigint' have no overlap.
+src/main.ts(122,7): error TS2322: Type 'number' is not assignable to type 'bigint'.
+src/main.ts(179,5): error TS2769: No overload matches this call.
+  Overload 1 of 2, '(input: string | URL | Request, init?: RequestInit | undefined): Promise<Response>', gave the following error.
+    Type 'string | Record<string, unknown> | FormData' is not assignable to type 'BodyInit | null | undefined'.
+      Type 'Record<string, unknown>' is not assignable to type 'BodyInit | null | undefined'.
+        Type 'Record<string, unknown>' is missing the following properties from type 'URLSearchParams': size, append, delete, get, and 9 more.
+  Overload 2 of 2, '(input: URL | RequestInfo, init?: RequestInit | undefined): Promise<Response>', gave the following error.
+    Type 'string | Record<string, unknown> | FormData' is not assignable to type 'BodyInit | null | undefined'.
+      Type 'Record<string, unknown>' is not assignable to type 'BodyInit | null | undefined'.
+        Type 'Record<string, unknown>' is missing the following properties from type 'URLSearchParams': size, append, delete, get, and 9 more.
+src/main.ts(247,5): error TS2322: Type 'number | undefined' is not assignable to type 'number'.
+  Type 'undefined' is not assignable to type 'number'.
+src/main.ts(248,53): error TS2345: Argument of type 'number | undefined' is not assignable to parameter of type 'number'.
+  Type 'undefined' is not assignable to type 'number'.
+src/main.ts(329,7): error TS2322: Type 'Record<string, unknown>' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+  Type 'Record<string, unknown>' is missing the following properties from type 'readonly (InputJsonValue | null)[]': length, concat, join, slice, and 19 more.
+src/main.ts(334,16): error TS2393: Duplicate function implementation.
+src/main.ts(346,16): error TS2393: Duplicate function implementation.
+src/main.ts(357,7): error TS2322: Type 'Record<string, unknown> | undefined' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+  Type 'Record<string, unknown>' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+    Type 'Record<string, unknown>' is missing the following properties from type 'readonly (InputJsonValue | null)[]': length, concat, join, slice, and 19 more.
+src/main.ts(363,16): error TS2393: Duplicate function implementation.
+src/main.ts(377,7): error TS2322: Type 'Record<string, unknown> | undefined' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+  Type 'Record<string, unknown>' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+    Type 'Record<string, unknown>' is missing the following properties from type 'readonly (InputJsonValue | null)[]': length, concat, join, slice, and 19 more.
+src/main.ts(400,7): error TS2322: Type 'Record<string, unknown> | undefined' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+  Type 'Record<string, unknown>' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+    Type 'Record<string, unknown>' is missing the following properties from type 'readonly (InputJsonValue | null)[]': length, concat, join, slice, and 19 more.
+src/main.ts(407,16): error TS2393: Duplicate function implementation.
+src/main.ts(419,16): error TS2393: Duplicate function implementation.
+src/main.ts(430,7): error TS2322: Type 'Record<string, unknown> | undefined' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+  Type 'Record<string, unknown>' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+    Type 'Record<string, unknown>' is missing the following properties from type 'readonly (InputJsonValue | null)[]': length, concat, join, slice, and 19 more.
+src/main.ts(436,16): error TS2393: Duplicate function implementation.
+src/main.ts(450,7): error TS2322: Type 'Record<string, unknown> | undefined' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+  Type 'Record<string, unknown>' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+    Type 'Record<string, unknown>' is missing the following properties from type 'readonly (InputJsonValue | null)[]': length, concat, join, slice, and 19 more.
+src/main.ts(466,7): error TS2322: Type 'Record<string, unknown> | undefined' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+  Type 'Record<string, unknown>' is not assignable to type 'NullableJsonNullValueInput | InputJsonValue | undefined'.
+    Type 'Record<string, unknown>' is missing the following properties from type 'readonly (InputJsonValue | null)[]': length, concat, join, slice, and 19 more.
+src/main.ts(1581,5): error TS2322: Type 'Redis' is not assignable to type 'ConnectionOptions'.
+  Type 'Redis' is not assignable to type 'ClusterOptions | Redis | Cluster'.
+    Type 'import("D:/Project/tg-videos-matrix/apps/node_modules/.pnpm/ioredis@5.10.0/node_modules/ioredis/built/Redis").default' is not assignable to type 'import("D:/Project/tg-videos-matrix/apps/node_modules/.pnpm/ioredis@5.9.3/node_modules/ioredis/built/Redis").default'.
+      Types of property 'options' are incompatible.
+        Type 'import("D:/Project/tg-videos-matrix/apps/node_modules/.pnpm/ioredis@5.10.0/node_modules/ioredis/built/redis/RedisOptions").RedisOptions' is not assignable to type 'import("D:/Project/tg-videos-matrix/apps/node_modules/.pnpm/ioredis@5.9.3/node_modules/ioredis/built/redis/RedisOptions").RedisOptions'.
+          Type 'RedisOptions' is not assignable to type 'CommonRedisOptions'.
+            Types of property 'Connector' are incompatible.
+              Type 'import("D:/Project/tg-videos-matrix/apps/node_modules/.pnpm/ioredis@5.10.0/node_modules/ioredis/built/connectors/ConnectorConstructor").default | undefined' is not assignable to type 'import("D:/Project/tg-videos-matrix/apps/node_modules/.pnpm/ioredis@5.9.3/node_modules/ioredis/built/connectors/ConnectorConstructor").default | undefined'.
+                Type 'import("D:/Project/tg-videos-matrix/apps/node_modules/.pnpm/ioredis@5.10.0/node_modules/ioredis/built/connectors/ConnectorConstructor").default' is not assignable to type 'import("D:/Project/tg-videos-matrix/apps/node_modules/.pnpm/ioredis@5.9.3/node_modules/ioredis/built/connectors/ConnectorConstructor").default'.
+                  Type 'import("D:/Project/tg-videos-matrix/apps/node_modules/.pnpm/ioredis@5.10.0/node_modules/ioredis/built/connectors/AbstractConnector").default' is not assignable to type 'import("D:/Project/tg-videos-matrix/apps/node_modules/.pnpm/ioredis@5.9.3/node_modules/ioredis/built/connectors/AbstractConnector").default'.
+                    Property 'connecting' is protected but type 'AbstractConnector' is not a class derived from 'AbstractConnector'.

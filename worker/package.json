@@ -16,7 +16,9 @@
     "bullmq": "^5.8.4",
     "dotenv": "^16.4.5",
     "ioredis": "^5.4.1",
-    "openai": "^6.27.0"
+    "openai": "^6.27.0",
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0"
   },
   "devDependencies": {
     "@types/node": "^25.4.0",
