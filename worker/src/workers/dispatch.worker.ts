@@ -1,0 +1,32 @@
+import { Worker } from 'bullmq';
+import { connection } from '../infra/redis';
+import { logger, logError } from '../logger';
+import { handleDispatchJob } from '../services/dispatch.service';
+
+export const dispatchWorker = new Worker(
+  'q_dispatch',
+  async (job) => {
+    if (job.name === 'bootstrap-check') {
+      return { ok: true, skipped: true, reason: 'bootstrap-check' };
+    }
+
+    const dispatchTaskIdRaw = job.data.dispatchTaskId as string | undefined;
+    if (!dispatchTaskIdRaw) {
+      throw new Error('Missing dispatchTaskId in job payload');
+    }
+
+    return handleDispatchJob(dispatchTaskIdRaw, String(job.id), job.attemptsMade);
+  },
+  { connection: connection as any, concurrency: 5 },
+);
+
+dispatchWorker.on('completed', (job) => {
+  logger.info('[q_dispatch] completed job', { jobId: String(job.id) });
+});
+
+dispatchWorker.on('failed', (job, err) => {
+  logError('[q_dispatch] failed job', {
+    jobId: job?.id ? String(job.id) : null,
+    error: err,
+  });
+});

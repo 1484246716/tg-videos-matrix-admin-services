@@ -1,0 +1,33 @@
+import { Worker } from 'bullmq';
+import { connection } from '../infra/redis';
+import { logger, logError } from '../logger';
+import { handleMassMessageItem } from '../services/mass-message.service';
+
+export const massMessageWorker = new Worker(
+  'q_mass_message',
+  async (job) => {
+    if (job.name === 'bootstrap-check') {
+      return { ok: true, skipped: true, reason: 'bootstrap-check' };
+    }
+
+    const itemId = job.data.itemId as string | undefined;
+    if (!itemId) {
+      throw new Error('Missing itemId in job payload');
+    }
+
+    return handleMassMessageItem(itemId);
+  },
+  { connection: connection as any, concurrency: 3 },
+);
+
+massMessageWorker.on('completed', (job) => {
+  logger.info('[q_mass_message] completed job', { jobId: String(job.id) });
+});
+
+massMessageWorker.on('failed', (job, err) => {
+  logError('[q_mass_message] failed job', {
+    jobId: job?.id ? String(job.id) : null,
+    error: err,
+  });
+});
+

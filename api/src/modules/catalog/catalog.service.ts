@@ -4,6 +4,7 @@ import { CreateCatalogTemplateDto } from './dto/create-catalog-template.dto';
 import { UpdateCatalogTemplateDto } from './dto/update-catalog-template.dto';
 import { RenderCatalogPreviewDto } from './dto/render-catalog-preview.dto';
 import { PublishCatalogDto } from './dto/publish-catalog.dto';
+import { CatalogTaskStatus } from '@prisma/client';
 
 @Injectable()
 export class CatalogService {

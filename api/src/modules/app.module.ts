@@ -13,6 +13,9 @@ import { TaskDefinitionModule } from './task-definition/task-definition.module';
 import { MediaLifecycleModule } from './media-lifecycle/media-lifecycle.module';
 import { AuthModule } from './auth/auth.module';
 import { UserModule } from './user/user.module';
+import { MessageTemplateModule } from './message-template/message-template.module';
+import { MassMessageCampaignModule } from './mass-message-campaign/mass-message-campaign.module';
+import { MassMessageItemModule } from './mass-message-item/mass-message-item.module';
 
 @Module({
   imports: [
@@ -33,6 +36,9 @@ import { UserModule } from './user/user.module';
     MediaLifecycleModule,
     AuthModule,
     UserModule,
+    MessageTemplateModule,
+    MassMessageCampaignModule,
+    MassMessageItemModule,
   ],
 })
 export class AppModule { }

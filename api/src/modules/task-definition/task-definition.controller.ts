@@ -24,7 +24,11 @@ export class TaskDefinitionController {
   @Permissions('tasks:view')
   @Get()
   list(
-    @Query('taskType') taskType?: 'relay_upload' | 'dispatch_send' | 'catalog_publish',
+    @Query('taskType') taskType?:
+      | 'relay_upload'
+      | 'dispatch_send'
+      | 'catalog_publish'
+      | 'mass_message',
     @Query('isEnabled') isEnabled?: string,
     @Query('limit') limit?: string,
   ) {

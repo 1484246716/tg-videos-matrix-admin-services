@@ -13,3 +13,7 @@ export const catalogQueue = new Queue('q_catalog', {
 export const relayUploadQueue = new Queue('q_relay_upload', {
   connection: connection as any,
 });
+
+export const massMessageQueue = new Queue('q_mass_message', {
+  connection: connection as any,
+});

@@ -1,6 +1,6 @@
 import { IsBoolean, IsIn, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 
-const TASK_TYPES = ['relay_upload', 'dispatch_send', 'catalog_publish'] as const;
+const TASK_TYPES = ['relay_upload', 'dispatch_send', 'catalog_publish', 'mass_message'] as const;
 const RUN_INTERVAL_OPTIONS = [30, 120, 1800, 3600] as const;
 
 export class CreateTaskDefinitionDto {

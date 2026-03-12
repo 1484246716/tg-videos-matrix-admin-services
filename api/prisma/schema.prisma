@@ -69,11 +69,50 @@ enum TaskDefinitionType {
   relay_upload
   dispatch_send
   catalog_publish
+  mass_message
 }
 
 enum UserRole {
   admin
   staff
+}
+
+enum MassMessageCampaignStatus {
+  draft
+  queued
+  running
+  completed
+  failed
+  paused
+  canceled
+}
+
+enum MassMessageScheduleType {
+  immediate
+  scheduled
+  recurring
+}
+
+enum MassMessagePinMode {
+  none
+  pin_after_send
+  replace_pin
+}
+
+enum MassMessageContentFormat {
+  markdown
+  html
+  plain
+}
+
+enum MassMessageItemStatus {
+  pending
+  scheduled
+  running
+  success
+  failed
+  cancelled
+  dead
 }
 
 model User {
@@ -185,6 +224,10 @@ model Channel {
   adEnabled    Boolean @default(false) @map("ad_enabled")
   adPinEnabled Boolean @default(false) @map("ad_pin_enabled")
 
+  /// TypeD: bot-maintained pinned ad message id (replace_pin only touches this message)
+  adMessageId     BigInt?   @map("ad_message_id")
+  lastAdUpdateAt  DateTime? @map("last_ad_update_at") @db.Timestamptz(6)
+
   alistTargetPath   String? @map("alist_target_path") @db.VarChar(255)
   autoImportEnabled Boolean @default(true) @map("auto_import_enabled")
 
@@ -210,6 +253,104 @@ model Channel {
   @@index([defaultBotId, status])
   @@index([catalogTemplateId])
   @@map("channels")
+}
+
+model MessageTemplate {
+  id        BigInt                  @id @default(autoincrement())
+  name      String                  @db.VarChar(128)
+  format    MassMessageContentFormat
+  content   String
+  imageUrl  String?                 @map("image_url") @db.VarChar(512)
+  buttons   Json?                   // inline keyboard layout
+  variables String[]                @default([])
+  isActive  Boolean                 @default(true) @map("is_active")
+
+  createdBy BigInt?  @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([isActive])
+  @@index([createdBy, updatedAt(sort: Desc)])
+  @@map("message_templates")
+}
+
+model MassMessageCampaign {
+  id BigInt @id @default(autoincrement())
+
+  name        String                  @db.VarChar(128)
+  status      MassMessageCampaignStatus @default(draft)
+
+  templateId BigInt? @map("template_id")
+
+  contentOverride  String?                 @map("content_override")
+  formatOverride   MassMessageContentFormat? @map("format_override")
+  imageUrlOverride String?                 @map("image_url_override") @db.VarChar(512)
+  buttonsOverride  Json?                   @map("buttons_override")
+
+  targetType String   @map("target_type") @db.VarChar(16) // channel|group|mixed (string for v1)
+  targetIds  String[] @map("target_ids")  // store tgChatId or internal ids as strings
+
+  scheduleType    MassMessageScheduleType @map("schedule_type")
+  timezone        String                  @default("Asia/Shanghai") @db.VarChar(64)
+  scheduledAt     DateTime?               @map("scheduled_at") @db.Timestamptz(6)
+  recurringPattern Json?                  @map("recurring_pattern")
+
+  rateLimitPerMin Int @default(10) @map("rate_limit_per_min")
+  retryCount      Int @default(3)  @map("retry_count")
+  retryIntervalSec Int @default(30) @map("retry_interval_sec")
+
+  pinMode MassMessagePinMode @default(none) @map("pin_mode")
+
+  progressTotal  Int @default(0) @map("progress_total")
+  progressSent   Int @default(0) @map("progress_sent")
+  progressSuccess Int @default(0) @map("progress_success")
+  progressFailed  Int @default(0) @map("progress_failed")
+  lastError      String? @map("last_error")
+
+  createdBy BigInt?  @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  items MassMessageItem[]
+
+  @@index([status, createdAt(sort: Desc)])
+  @@index([scheduleType, scheduledAt])
+  @@index([createdBy, createdAt(sort: Desc)])
+  @@map("mass_message_campaigns")
+}
+
+model MassMessageItem {
+  id BigInt @id @default(autoincrement())
+
+  campaignId BigInt @map("campaign_id")
+  targetId   String @map("target_id") @db.VarChar(64)
+  targetType String @map("target_type") @db.VarChar(16) // channel|group
+
+  status    MassMessageItemStatus @default(pending)
+  nextRunAt DateTime             @map("next_run_at") @db.Timestamptz(6)
+  retryCount Int @default(0) @map("retry_count")
+  maxRetries Int @default(3) @map("max_retries")
+
+  telegramMessageId    BigInt? @map("telegram_message_id")
+  telegramMessageLink  String? @map("telegram_message_link")
+  telegramErrorCode    String? @map("telegram_error_code") @db.VarChar(32)
+  telegramErrorMessage String? @map("telegram_error_message")
+
+  pinSuccess      Boolean? @map("pin_success")
+  pinErrorMessage String?  @map("pin_error_message")
+
+  plannedAt  DateTime? @map("planned_at") @db.Timestamptz(6)
+  startedAt  DateTime? @map("started_at") @db.Timestamptz(6)
+  finishedAt DateTime? @map("finished_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  campaign MassMessageCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextRunAt])
+  @@index([campaignId, createdAt(sort: Desc)])
+  @@index([targetId, status])
+  @@map("mass_message_items")
 }
 
 model MediaAsset {

@@ -30,7 +30,13 @@ function toTelegramMessageLink(chatIdRaw: string, messageId: number): string | n
 
 export async function sendTelegramRequest(args: {
   botToken: string;
-  method: 'sendVideo' | 'sendDocument' | 'sendMessage' | 'pinChatMessage' | 'editMessageText';
+  method:
+    | 'sendVideo'
+    | 'sendDocument'
+    | 'sendMessage'
+    | 'pinChatMessage'
+    | 'unpinChatMessage'
+    | 'editMessageText';
   payload: Record<string, unknown> | FormData;
 }): Promise<{ messageId?: number; videoFileId?: string; videoFileUniqueId?: string }> {
   const endpoint = `${normalizeTelegramApiBase(telegramApiBase)}/bot${args.botToken}/${args.method}`;
@@ -41,8 +47,8 @@ export async function sendTelegramRequest(args: {
     headers: isFormData
       ? undefined
       : {
-        'content-type': 'application/json',
-      },
+          'content-type': 'application/json',
+        },
     body: (isFormData ? args.payload : JSON.stringify(args.payload)) as any,
   });
 
@@ -121,6 +127,7 @@ export async function sendTextByTelegram(args: {
   chatId: string;
   text: string;
   parseMode?: string;
+  replyMarkup?: unknown;
 }): Promise<TelegramSendResult> {
   const result = await sendTelegramRequest({
     botToken: args.botToken,
@@ -130,6 +137,7 @@ export async function sendTextByTelegram(args: {
       text: args.text,
       parse_mode: args.parseMode ?? 'HTML',
       disable_web_page_preview: true,
+      ...(args.replyMarkup ? { reply_markup: args.replyMarkup } : {}),
     },
   });
 
@@ -179,6 +187,21 @@ export async function pinMessageByTelegram(args: {
       chat_id: args.chatId,
       message_id: args.messageId,
       disable_notification: true,
+    },
+  });
+}
+
+export async function unpinMessageByTelegram(args: {
+  botToken: string;
+  chatId: string;
+  messageId: number;
+}) {
+  await sendTelegramRequest({
+    botToken: args.botToken,
+    method: 'unpinChatMessage',
+    payload: {
+      chat_id: args.chatId,
+      message_id: args.messageId,
     },
   });
 }

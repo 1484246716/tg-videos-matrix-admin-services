@@ -44,7 +44,7 @@ export class TaskDefinitionService {
   }
 
   async list(params: {
-    taskType?: 'relay_upload' | 'dispatch_send' | 'catalog_publish';
+    taskType?: 'relay_upload' | 'dispatch_send' | 'catalog_publish' | 'mass_message';
     isEnabled?: string;
     limit?: number;
   }) {

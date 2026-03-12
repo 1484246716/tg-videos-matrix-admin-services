@@ -5,9 +5,11 @@ import { logger, logError } from '../logger';
 import { safeRunInterval } from '../schedule-utils';
 import { taskdefMetrics, METRICS_LOG_INTERVAL_TICKS } from '../shared/metrics';
 import { releaseTaskDefinitionLock, tryAcquireTaskDefinitionLock } from '../shared/taskdef-lock';
+import { updateTaskDefinitionRunStatus } from '../services/task-definition.service';
 import { scheduleDispatchForDefinition } from './dispatch-scheduler';
 import { scheduleRelayForDefinition } from './relay-scheduler';
 import { scheduleCatalogForDefinition } from './catalog-scheduler';
+import { scheduleDueMassMessageItems } from './mass-message-scheduler';
 
 let hasWarnedMissingTaskDefinitionsTable = false;
 
@@ -27,6 +29,20 @@ export async function scheduleTaskDefinitionByType(definition: {
 
   if (definition.taskType === TaskDefinitionType.catalog_publish) {
     await scheduleCatalogForDefinition(definition.id);
+    return;
+  }
+
+  if (definition.taskType === TaskDefinitionType.mass_message) {
+    await scheduleDueMassMessageItems();
+
+    await updateTaskDefinitionRunStatus({
+      taskDefinitionId: definition.id,
+      status: 'success',
+      summary: {
+        executor: 'mass_message',
+        message: 'mass message scheduler tick completed',
+      },
+    });
   }
 }
 
@@ -72,6 +88,7 @@ export async function scheduleEnabledTaskDefinitions() {
       await scheduleDispatchForDefinition(BigInt(0));
       await scheduleRelayForDefinition(BigInt(0));
       await scheduleCatalogForDefinition(BigInt(0));
+      await scheduleDueMassMessageItems();
       return;
     }
 
