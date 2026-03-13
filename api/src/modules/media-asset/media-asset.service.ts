@@ -27,11 +27,23 @@ const SUPPORTED_VIDEO_EXT = new Set([
 export class MediaAssetService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async list(params: { channelId?: string; status?: MediaStatus; limit?: number }) {
+  async list(params: {
+    channelId?: string;
+    status?: MediaStatus;
+    limit?: number;
+    userId?: string;
+    role?: string;
+  }) {
     const items = await this.prisma.mediaAsset.findMany({
       where: {
         channelId: params.channelId ? BigInt(params.channelId) : undefined,
         status: params.status,
+        channel:
+          params.role === 'admin'
+            ? undefined
+            : {
+                createdBy: params.userId ? BigInt(params.userId) : undefined,
+              },
       },
       orderBy: { createdAt: 'desc' },
       take: params.limit ?? 50,

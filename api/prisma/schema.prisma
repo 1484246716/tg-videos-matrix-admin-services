@@ -128,6 +128,8 @@ model User {
   createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt    DateTime   @updatedAt @map("updated_at") @db.Timestamptz(6)
 
+  createdChannels Channel[]
+
   @@map("users")
 }
 
@@ -233,6 +235,10 @@ model Channel {
 
   navMessageId BigInt? @map("nav_message_id")
 
+  tags String[] @default([])
+
+  createdBy BigInt? @map("created_by")
+
   lastPostAt      DateTime? @map("last_post_at") @db.Timestamptz(6)
   lastNavUpdateAt DateTime? @map("last_nav_update_at") @db.Timestamptz(6)
 
@@ -242,6 +248,7 @@ model Channel {
   defaultBot      Bot?             @relation("ChannelDefaultBot", fields: [defaultBotId], references: [id])
   relayChannel    RelayChannel?    @relation(fields: [relayChannelId], references: [id])
   aiModelProfile  AiModelProfile?  @relation(fields: [aiModelProfileId], references: [id])
+  createdByUser   User?            @relation(fields: [createdBy], references: [id])
   catalogTemplate CatalogTemplate? @relation(fields: [catalogTemplateId], references: [id])
 
   mediaAssets      MediaAsset[]
@@ -252,6 +259,7 @@ model Channel {
   @@index([status])
   @@index([defaultBotId, status])
   @@index([catalogTemplateId])
+  @@index([createdBy, updatedAt(sort: Desc)])
   @@map("channels")
 }
 

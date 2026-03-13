@@ -28,11 +28,17 @@ export class MessageTemplateService {
     ) as T;
   }
 
-  async list(params: { isActive?: string; limit?: number }) {
+  async list(params: { isActive?: string; limit?: number; userId?: string; role?: string }) {
     const rows = await this.model.findMany({
       where: {
         isActive:
           params.isActive === undefined ? undefined : params.isActive === 'true',
+        createdBy:
+          params.role === 'admin'
+            ? undefined
+            : params.userId
+              ? BigInt(params.userId)
+              : undefined,
       },
       orderBy: { updatedAt: 'desc' },
       take: params.limit ?? 200,
@@ -40,13 +46,18 @@ export class MessageTemplateService {
     return this.serializeBigInt(rows);
   }
 
-  async getOne(id: string) {
-    const row = await this.model.findUnique({ where: { id: BigInt(id) } });
+  async getOne(id: string, userId?: string, role?: string) {
+    const row = await this.model.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
+    });
     if (!row) throw new NotFoundException('message template not found');
     return row;
   }
 
-  async create(dto: CreateMessageTemplateDto, createdBy?: bigint) {
+  async create(dto: CreateMessageTemplateDto, userId?: string, role?: string) {
     if (!dto.name.trim()) {
       throw new BadRequestException('name is required');
     }
@@ -59,14 +70,14 @@ export class MessageTemplateService {
         buttons: dto.buttons as object | undefined,
         variables: dto.variables ?? [],
         isActive: dto.isActive ?? true,
-        createdBy,
+        createdBy: role === 'admin' ? null : userId ? BigInt(userId) : null,
       },
     });
     return this.serializeBigInt(created);
   }
 
-  async update(id: string, dto: UpdateMessageTemplateDto) {
-    await this.getOne(id);
+  async update(id: string, dto: UpdateMessageTemplateDto, userId?: string, role?: string) {
+    await this.getOne(id, userId, role);
     const updated = await this.model.update({
       where: { id: BigInt(id) },
       data: {
@@ -82,8 +93,8 @@ export class MessageTemplateService {
     return this.serializeBigInt(updated);
   }
 
-  async remove(id: string) {
-    await this.getOne(id);
+  async remove(id: string, userId?: string, role?: string) {
+    await this.getOne(id, userId, role);
     // soft delete for safety
     const updated = await this.model.update({
       where: { id: BigInt(id) },

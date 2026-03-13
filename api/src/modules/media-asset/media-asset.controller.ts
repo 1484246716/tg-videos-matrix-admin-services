@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Query, Request, UseGuards } from '@nestjs/common';
 import { MediaStatus } from '@prisma/client';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { Permissions } from '../auth/permissions.decorator';
@@ -8,6 +8,10 @@ import { CreateMediaAssetDto } from './dto/create-media-asset.dto';
 import { UpdateMediaAssetStatusDto } from './dto/update-media-asset-status.dto';
 import { MarkRelayUploadedDto } from './dto/mark-relay-uploaded.dto';
 import { BatchEnqueueRelayUploadDto } from './dto/batch-enqueue-relay-upload.dto';
+
+interface AuthRequest {
+  user: { userId: string; username: string; role: string };
+}
 
 @UseGuards(JwtAuthGuard, PermissionsGuard)
 @Controller('media-assets')
@@ -20,11 +24,14 @@ export class MediaAssetController {
     @Query('channelId') channelId?: string,
     @Query('status') status?: MediaStatus,
     @Query('limit') limit?: string,
+    @Request() req?: AuthRequest,
   ) {
     return this.mediaAssetService.list({
       channelId,
       status,
       limit: limit ? Number(limit) : undefined,
+      userId: req?.user.userId,
+      role: req?.user.role,
     });
   }
 

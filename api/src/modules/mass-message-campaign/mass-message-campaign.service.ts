@@ -52,10 +52,16 @@ export class MassMessageCampaignService {
     ) as T;
   }
 
-  async list(params: { status?: string; limit?: number }) {
+  async list(params: { status?: string; limit?: number; userId?: string; role?: string }) {
     const rows = await this.campaignModel.findMany({
       where: {
         status: params.status as MassMessageCampaignStatus | undefined,
+        createdBy:
+          params.role === 'admin'
+            ? undefined
+            : params.userId
+              ? BigInt(params.userId)
+              : undefined,
       },
       orderBy: { createdAt: 'desc' },
       take: params.limit ?? 100,
@@ -63,16 +69,19 @@ export class MassMessageCampaignService {
     return this.serializeBigInt(rows);
   }
 
-  async getOne(id: string) {
-    const row = await this.campaignModel.findUnique({
-      where: { id: BigInt(id) },
+  async getOne(id: string, userId?: string, role?: string) {
+    const row = await this.campaignModel.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
       include: { items: { orderBy: { createdAt: 'desc' }, take: 200 } },
     });
     if (!row) throw new NotFoundException('mass message campaign not found');
     return this.serializeBigInt(row);
   }
 
-  async create(dto: CreateMassMessageCampaignDto, createdBy?: bigint) {
+  async create(dto: CreateMassMessageCampaignDto, userId?: string, role?: string) {
     if (!dto.name.trim()) throw new BadRequestException('name is required');
     if (!dto.targetIds || dto.targetIds.length === 0) {
       throw new BadRequestException('targetIds is required');
@@ -123,7 +132,7 @@ export class MassMessageCampaignService {
         retryIntervalSec,
         pinMode: pinMode as any,
         progressTotal: dto.targetIds.length,
-        createdBy,
+        createdBy: role === 'admin' ? null : userId ? BigInt(userId) : null,
         items: {
           create: dto.targetIds.map((targetId) => ({
             targetId,

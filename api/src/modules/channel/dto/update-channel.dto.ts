@@ -108,4 +108,7 @@ export class UpdateChannelDto {
 
   @IsOptional()
   navReplyMarkup?: unknown;
+
+  @IsOptional()
+  tags?: string[];
 }

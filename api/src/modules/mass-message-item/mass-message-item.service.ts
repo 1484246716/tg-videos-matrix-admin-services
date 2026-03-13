@@ -21,11 +21,22 @@ export class MassMessageItemService {
     ) as T;
   }
 
-  async list(params: { campaignId?: string; status?: string; limit?: number; offset?: number }) {
+  async list(params: {
+    campaignId?: string;
+    status?: string;
+    limit?: number;
+    offset?: number;
+    userId?: string;
+    role?: string;
+  }) {
     const rows = await this.model.findMany({
       where: {
         campaignId: params.campaignId ? BigInt(params.campaignId) : undefined,
         status: params.status as any,
+        campaign:
+          params.role === 'admin'
+            ? undefined
+            : { createdBy: params.userId ? BigInt(params.userId) : undefined },
       },
       orderBy: [{ createdAt: 'desc' }],
       take: params.limit ?? 200,

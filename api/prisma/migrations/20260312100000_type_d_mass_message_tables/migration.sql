@@ -137,4 +137,3 @@ CREATE INDEX IF NOT EXISTS "mass_message_items_campaign_id_created_at_idx"
   ON "mass_message_items" ("campaign_id", "created_at" DESC);
 CREATE INDEX IF NOT EXISTS "mass_message_items_target_id_status_idx"
   ON "mass_message_items" ("target_id", "status");
-

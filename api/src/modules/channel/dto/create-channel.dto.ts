@@ -47,4 +47,7 @@ export class CreateChannelDto {
 
   @IsOptional()
   navReplyMarkup?: unknown;
+
+  @IsOptional()
+  tags?: string[];
 }

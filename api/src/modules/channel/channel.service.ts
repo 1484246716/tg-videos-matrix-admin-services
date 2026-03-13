@@ -92,8 +92,14 @@ export class ChannelService {
     await rm(target, { recursive: true, force: true });
   }
 
-  async list() {
+  async list(userId?: string, role?: string) {
     const rows = await this.prisma.channel.findMany({
+      where:
+        role === 'admin'
+          ? undefined
+          : {
+              createdBy: userId ? BigInt(userId) : undefined,
+            },
       orderBy: { createdAt: 'desc' },
       include: {
         defaultBot: {
@@ -114,7 +120,7 @@ export class ChannelService {
     return this.serializeBigInt(rows);
   }
 
-  async create(dto: CreateChannelDto) {
+  async create(dto: CreateChannelDto, userId?: string, role?: string) {
     try {
       await this.ensureFolderCreated(dto.folderPath);
 
@@ -132,6 +138,8 @@ export class ChannelService {
           navTemplateText: dto.navTemplateText,
           aiReplyMarkup: dto.aiReplyMarkup as Prisma.InputJsonValue,
           navReplyMarkup: dto.navReplyMarkup as Prisma.InputJsonValue,
+          tags: dto.tags ?? [],
+          createdBy: role === 'admin' ? null : userId ? BigInt(userId) : null,
         },
       });
 
@@ -152,9 +160,15 @@ export class ChannelService {
     }
   }
 
-  async getOne(id: string) {
-    const item = await this.prisma.channel.findUnique({
-      where: { id: BigInt(id) },
+  async getOne(id: string, userId?: string, role?: string) {
+    const item = await this.prisma.channel.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : {
+              id: BigInt(id),
+              createdBy: userId ? BigInt(userId) : undefined,
+            },
       include: {
         defaultBot: {
           select: { id: true, name: true, status: true },
@@ -184,9 +198,72 @@ export class ChannelService {
     return this.serializeBigInt(item);
   }
 
-  async update(id: string, dto: UpdateChannelDto) {
-    const existing = await this.prisma.channel.findUnique({
-      where: { id: BigInt(id) },
+  async batchUpdate(
+    ids: string[],
+    data: {
+      postIntervalSec?: number;
+      navIntervalSec?: number;
+      navEnabled?: boolean;
+      defaultBotId?: string | null;
+      aiSystemPromptTemplate?: string;
+      navTemplateText?: string;
+      aiReplyMarkup?: Prisma.InputJsonValue;
+      navReplyMarkup?: Prisma.InputJsonValue;
+      tags?: string[];
+    },
+    userId?: string,
+    role?: string,
+  ) {
+    if (!Array.isArray(ids) || ids.length === 0) {
+      throw new ConflictException('请选择需要批量更新的频道');
+    }
+
+    const validIds = ids.filter((id) => id && id.trim());
+    if (validIds.length === 0) {
+      throw new ConflictException('请选择需要批量更新的频道');
+    }
+
+    if (role !== 'admin') {
+      const allowed = await this.prisma.channel.count({
+        where: {
+          id: { in: validIds.map((id) => BigInt(id)) },
+          createdBy: userId ? BigInt(userId) : undefined,
+        },
+      });
+      if (allowed !== validIds.length) {
+        throw new ConflictException('存在无权限的频道');
+      }
+    }
+
+    await this.prisma.channel.updateMany({
+      where: { id: { in: validIds.map((id) => BigInt(id)) } },
+      data: {
+        postIntervalSec: data.postIntervalSec,
+        navIntervalSec: data.navIntervalSec,
+        navEnabled: data.navEnabled,
+        defaultBotId:
+          data.defaultBotId === null
+            ? null
+            : data.defaultBotId
+              ? BigInt(data.defaultBotId)
+              : undefined,
+        aiSystemPromptTemplate: data.aiSystemPromptTemplate,
+        navTemplateText: data.navTemplateText,
+        aiReplyMarkup: data.aiReplyMarkup,
+        navReplyMarkup: data.navReplyMarkup,
+        tags: data.tags,
+      },
+    });
+
+    return { updated: validIds.length };
+  }
+
+  async update(id: string, dto: UpdateChannelDto, userId?: string, role?: string) {
+    const existing = await this.prisma.channel.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
       select: { id: true, folderPath: true },
     });
 
@@ -224,6 +301,7 @@ export class ChannelService {
       navTemplateText: dto.navTemplateText,
       aiReplyMarkup: dto.aiReplyMarkup as Prisma.InputJsonValue,
       navReplyMarkup: dto.navReplyMarkup as Prisma.InputJsonValue,
+      tags: dto.tags,
     };
 
     try {
@@ -250,8 +328,13 @@ export class ChannelService {
     }
   }
 
-  async updateStatus(id: string, dto: UpdateChannelStatusDto) {
-    await this.getOne(id);
+  async updateStatus(
+    id: string,
+    dto: UpdateChannelStatusDto,
+    userId?: string,
+    role?: string,
+  ) {
+    await this.getOne(id, userId, role);
 
     const updated = await this.prisma.channel.update({
       where: { id: BigInt(id) },
@@ -263,9 +346,12 @@ export class ChannelService {
     return this.serializeBigInt(updated);
   }
 
-  async remove(id: string) {
-    const existing = await this.prisma.channel.findUnique({
-      where: { id: BigInt(id) },
+  async remove(id: string, userId?: string, role?: string) {
+    const existing = await this.prisma.channel.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
       select: { id: true, folderPath: true },
     });
 

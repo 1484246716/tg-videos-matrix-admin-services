@@ -5,6 +5,7 @@ import {
   Param,
   Post,
   Query,
+  Request,
   UseGuards,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -13,6 +14,10 @@ import { PermissionsGuard } from '../auth/permissions.guard';
 import { CreateMassMessageCampaignDto } from './dto/create-mass-message-campaign.dto';
 import { MassMessageCampaignService } from './mass-message-campaign.service';
 
+interface AuthRequest {
+  user: { userId: string; username: string; role: string };
+}
+
 @UseGuards(JwtAuthGuard, PermissionsGuard)
 @Controller('mass-message-campaigns')
 export class MassMessageCampaignController {
@@ -20,20 +25,29 @@ export class MassMessageCampaignController {
 
   @Permissions('tasks:view')
   @Get()
-  list(@Query('status') status?: string, @Query('limit') limit?: string) {
-    return this.service.list({ status, limit: limit ? Number(limit) : undefined });
+  list(
+    @Query('status') status?: string,
+    @Query('limit') limit?: string,
+    @Request() req?: AuthRequest,
+  ) {
+    return this.service.list({
+      status,
+      limit: limit ? Number(limit) : undefined,
+      userId: req?.user.userId,
+      role: req?.user.role,
+    });
   }
 
   @Permissions('tasks:view')
   @Get(':id')
-  getOne(@Param('id') id: string) {
-    return this.service.getOne(id);
+  getOne(@Param('id') id: string, @Request() req?: AuthRequest) {
+    return this.service.getOne(id, req?.user.userId, req?.user.role);
   }
 
   @Permissions('tasks:create')
   @Post()
-  create(@Body() dto: CreateMassMessageCampaignDto) {
-    return this.service.create(dto);
+  create(@Body() dto: CreateMassMessageCampaignDto, @Request() req?: AuthRequest) {
+    return this.service.create(dto, req?.user.userId, req?.user.role);
   }
 }
 
