@@ -1,4 +1,5 @@
 import { telegramApiBase } from '../config/env';
+import { logger, logError } from '../logger';
 
 export type TelegramSendResult = {
   messageId: number;
@@ -74,8 +75,25 @@ export async function sendTelegramRequest(args: {
       retryAfterSec: json.parameters?.retry_after,
     };
 
+    logError('[telegram] request failed', {
+      method: args.method,
+      status: response.status,
+      payloadType: isFormData ? 'form-data' : 'json',
+      errorCode,
+      description,
+      parameters: json.parameters ?? null,
+      response: json,
+    });
+
     throw err;
   }
+
+  logger.info('[telegram] request ok', {
+    method: args.method,
+    status: response.status,
+    payloadType: isFormData ? 'form-data' : 'json',
+    response: json,
+  });
 
   return {
     messageId:
