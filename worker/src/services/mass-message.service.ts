@@ -109,7 +109,7 @@ export async function handleMassMessageItem(itemIdRaw: string) {
   });
 
   if (!item) {
-    throw new Error(`MassMessageItem not found: ${itemIdRaw}`);
+    throw new Error(`未找到群发条目: ${itemIdRaw}`);
   }
 
   // mark running (best-effort)
@@ -131,7 +131,7 @@ export async function handleMassMessageItem(itemIdRaw: string) {
       campaign.contentOverride ??
       template?.content ??
       (() => {
-        throw new Error('campaign missing content (template/contentOverride)');
+        throw new Error('群发活动缺少内容（template/contentOverride）');
       })();
 
     const format =
@@ -144,7 +144,7 @@ export async function handleMassMessageItem(itemIdRaw: string) {
 
     if (item.targetType !== 'channel') {
       // v1: group pin not supported; sending to group may also be unsupported depending on targetId semantics
-      throw new Error(`Unsupported targetType=${item.targetType} (v1 supports channel only)`);
+      throw new Error(`不支持的 targetType=${item.targetType}（v1 仅支持频道）`);
     }
 
     // targetId is channelId (BigInt as string) in v1
@@ -161,21 +161,21 @@ export async function handleMassMessageItem(itemIdRaw: string) {
     });
 
     if (!channel) {
-      throw new Error(`Channel not found for targetId=${item.targetId}`);
+      throw new Error(`未找到目标频道: ${item.targetId}`);
     }
     if (channel.status !== 'active') {
-      throw new Error(`Channel is not active: ${channel.status}`);
+      throw new Error(`频道未启用: ${channel.status}`);
     }
     if (!channel.defaultBotId) {
-      throw new Error('Channel has no defaultBotId');
+      throw new Error('频道未配置默认机器人');
     }
 
     const bot = await prisma.bot.findUnique({
       where: { id: channel.defaultBotId },
       select: { id: true, status: true, tokenEncrypted: true },
     });
-    if (!bot) throw new Error(`Bot not found: ${channel.defaultBotId.toString()}`);
-    if (bot.status !== 'active') throw new Error(`Bot is not active: ${bot.status}`);
+    if (!bot) throw new Error(`未找到机器人: ${channel.defaultBotId.toString()}`);
+    if (bot.status !== 'active') throw new Error(`机器人未启用: ${bot.status}`);
 
     const sendResult = await sendTextByTelegram({
       botToken: bot.tokenEncrypted,
@@ -211,7 +211,7 @@ export async function handleMassMessageItem(itemIdRaw: string) {
         pinSuccess = true;
       } catch (pinErr) {
         pinSuccess = false;
-        pinErrorMessage = pinErr instanceof Error ? pinErr.message : 'pin failed';
+        pinErrorMessage = pinErr instanceof Error ? pinErr.message : '置顶失败';
       }
     }
 
@@ -279,7 +279,7 @@ export async function handleMassMessageItem(itemIdRaw: string) {
       }
     }
 
-    logger.info('[q_mass_message] sent', {
+    logger.info('[q_mass_message] 已发送群发消息', {
       itemId: itemIdRaw,
       campaignId: campaign.id.toString(),
       messageId: sendResult.messageId,
@@ -288,7 +288,7 @@ export async function handleMassMessageItem(itemIdRaw: string) {
     return { ok: true, itemId: itemIdRaw, messageId: sendResult.messageId };
   } catch (error) {
     const err = error as TelegramError;
-    const message = (err as any)?.message ? String((err as any).message) : 'unknown error';
+    const message = (err as any)?.message ? String((err as any).message) : '未知错误';
     const code = (err as any)?.code ? String((err as any).code) : 'MASS_MESSAGE_ERROR';
     const retryAfterSec = (err as any)?.retryAfterSec as number | undefined;
 

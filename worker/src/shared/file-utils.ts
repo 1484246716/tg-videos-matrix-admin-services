@@ -34,7 +34,7 @@ export async function moveToArchive(localPath: string): Promise<string> {
   await mkdir(archiveDir, { recursive: true });
   const archivePath = join(archiveDir, fileName);
   await rename(localPath, archivePath);
-  logger.info('[archive] moved file', { from: localPath, to: archivePath });
+  logger.info('[archive] 文件已归档', { from: localPath, to: archivePath });
   return archivePath;
 }
 

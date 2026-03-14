@@ -12,7 +12,7 @@ export const dispatchWorker = new Worker(
 
     const dispatchTaskIdRaw = job.data.dispatchTaskId as string | undefined;
     if (!dispatchTaskIdRaw) {
-      throw new Error('Missing dispatchTaskId in job payload');
+      throw new Error('任务负载缺少 dispatchTaskId');
     }
 
     return handleDispatchJob(dispatchTaskIdRaw, String(job.id), job.attemptsMade);
@@ -21,11 +21,11 @@ export const dispatchWorker = new Worker(
 );
 
 dispatchWorker.on('completed', (job) => {
-  logger.info('[q_dispatch] completed job', { jobId: String(job.id) });
+  logger.info('[q_dispatch] 任务完成', { jobId: String(job.id) });
 });
 
 dispatchWorker.on('failed', (job, err) => {
-  logError('[q_dispatch] failed job', {
+  logError('[q_dispatch] 任务失败', {
     jobId: job?.id ? String(job.id) : null,
     error: err,
   });

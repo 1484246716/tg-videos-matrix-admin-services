@@ -43,7 +43,7 @@ export async function generateTextWithAiProfile(
 
     const content = response.choices[0]?.message?.content;
     if (!content) {
-        throw new Error('AI profile returned an empty response content');
+        throw new Error('AI 模型返回了空内容');
     }
 
     return content;

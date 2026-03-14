@@ -43,15 +43,41 @@ export async function sendTelegramRequest(args: {
   const endpoint = `${normalizeTelegramApiBase(telegramApiBase)}/bot${args.botToken}/${args.method}`;
 
   const isFormData = args.payload instanceof FormData;
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: isFormData
-      ? undefined
-      : {
-          'content-type': 'application/json',
-        },
-    body: (isFormData ? args.payload : JSON.stringify(args.payload)) as any,
-  });
+  const controller = new AbortController();
+  const timeoutMs = 15 * 60 * 1000;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: isFormData
+        ? undefined
+        : {
+            'content-type': 'application/json',
+          },
+      body: (isFormData ? args.payload : JSON.stringify(args.payload)) as any,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    clearTimeout(timeout);
+    const isTimeout = error instanceof Error && error.name === 'AbortError';
+    if (isTimeout) {
+      logError('[telegram] 请求超时', {
+        method: args.method,
+        timeoutMs,
+        payloadType: isFormData ? 'form-data' : 'json',
+      });
+      const err: TelegramError = {
+        code: 'TG_TIMEOUT',
+        message: `Telegram 请求超时（${timeoutMs}ms）`,
+      };
+      throw err;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   const json = (await response.json()) as {
     ok: boolean;
@@ -67,15 +93,15 @@ export async function sendTelegramRequest(args: {
 
   if (!response.ok || !json.ok) {
     const errorCode = json.error_code ?? response.status;
-    const description = json.description || `Telegram API HTTP ${response.status}`;
+    const description = json.description || `Telegram API 请求失败 (${response.status})`;
 
     const err: TelegramError = {
       code: `TG_${errorCode}`,
-      message: description,
+      message: `Telegram 请求失败：${description}`,
       retryAfterSec: json.parameters?.retry_after,
     };
 
-    logError('[telegram] request failed', {
+    logError('[telegram] 请求失败', {
       method: args.method,
       status: response.status,
       payloadType: isFormData ? 'form-data' : 'json',
@@ -88,7 +114,7 @@ export async function sendTelegramRequest(args: {
     throw err;
   }
 
-  logger.info('[telegram] request ok', {
+  logger.info('[telegram] 请求成功', {
     method: args.method,
     status: response.status,
     payloadType: isFormData ? 'form-data' : 'json',
@@ -160,7 +186,7 @@ export async function sendTextByTelegram(args: {
   });
 
   if (!result.messageId) {
-    throw new Error('sendMessage response missing message_id');
+    throw new Error('sendMessage 响应缺少 message_id');
   }
 
   return {
@@ -189,7 +215,7 @@ export async function editMessageTextByTelegram(args: {
   });
 
   if (!result.messageId) {
-    throw new Error('editMessageText response missing message_id');
+    throw new Error('editMessageText 响应缺少 message_id');
   }
 }
 

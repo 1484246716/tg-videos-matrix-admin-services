@@ -12,7 +12,7 @@ export const catalogWorker = new Worker(
 
     const channelIdRaw = job.data.channelIdRaw as string | undefined;
     if (!channelIdRaw) {
-      throw new Error('Missing channelIdRaw in job payload');
+      throw new Error('任务负载缺少 channelIdRaw');
     }
 
     return handleCatalogJob(channelIdRaw);
@@ -21,11 +21,11 @@ export const catalogWorker = new Worker(
 );
 
 catalogWorker.on('completed', (job) => {
-  logger.info('[q_catalog] completed job', { jobId: String(job.id) });
+  logger.info('[q_catalog] 任务完成', { jobId: String(job.id) });
 });
 
 catalogWorker.on('failed', (job, err) => {
-  logError('[q_catalog] failed job', {
+  logError('[q_catalog] 任务失败', {
     jobId: job?.id ? String(job.id) : null,
     error: err,
   });

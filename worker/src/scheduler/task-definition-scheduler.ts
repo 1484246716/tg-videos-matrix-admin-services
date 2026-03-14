@@ -40,7 +40,7 @@ export async function scheduleTaskDefinitionByType(definition: {
       status: 'success',
       summary: {
         executor: 'mass_message',
-        message: 'mass message scheduler tick completed',
+        message: '群发调度完成',
       },
     });
   }
@@ -81,7 +81,7 @@ export async function scheduleEnabledTaskDefinitions() {
 
     if (isSchemaNotReady) {
       if (!hasWarnedMissingTaskDefinitionsTable) {
-        logger.warn('[scheduler:task-definitions] task_definitions schema is not ready, fallback to legacy schedulers. Run prisma migrate to enable task-definition scheduling.');
+        logger.warn('[scheduler:task-definitions] task_definitions 表未就绪，已回退到旧调度器。请运行 prisma migrate 启用任务定义调度。');
         hasWarnedMissingTaskDefinitionsTable = true;
       }
 
@@ -101,7 +101,7 @@ export async function scheduleEnabledTaskDefinitions() {
     const lockToken = await tryAcquireTaskDefinitionLock(definition.id);
     if (!lockToken) {
       taskdefMetrics.lockSkipTotal += 1;
-      logger.info('[scheduler:taskdef] lock_skip', {
+      logger.info('[scheduler:taskdef] 跳过执行（锁未获取）', {
         taskDefinitionId: definition.id.toString(),
         taskType: definition.taskType,
       });
@@ -155,10 +155,10 @@ export async function scheduleEnabledTaskDefinitions() {
         },
       });
 
-      logError('[scheduler:taskdef] run_failed', {
+      logError('[scheduler:taskdef] 执行失败', {
         taskDefinitionId: definition.id.toString(),
         taskType: definition.taskType,
-        error: error instanceof Error ? error.message : 'unknown',
+        error: error instanceof Error ? error.message : '未知错误',
       });
     } finally {
       const durationMs = Date.now() - runStart;
@@ -166,6 +166,7 @@ export async function scheduleEnabledTaskDefinitions() {
 
       logger.info('taskdef_run', {
         tag: 'taskdef_run',
+        message: '任务定义调度运行记录',
         taskDefinitionId: definition.id.toString(),
         taskType: definition.taskType,
         runIntervalSec: safeRunIntervalSec,
@@ -183,6 +184,7 @@ export async function scheduleEnabledTaskDefinitions() {
   if (taskdefMetrics.tickTotal % METRICS_LOG_INTERVAL_TICKS === 0) {
     logger.info('taskdef_metrics', {
       tag: 'taskdef_metrics',
+      message: '任务定义调度指标',
       ...taskdefMetrics,
       avgRunDurationMs:
         taskdefMetrics.runSuccessTotal + taskdefMetrics.runFailedTotal > 0

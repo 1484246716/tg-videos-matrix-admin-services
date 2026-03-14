@@ -17,3 +17,6 @@ export const relayUploadQueue = new Queue('q_relay_upload', {
 export const massMessageQueue = new Queue('q_mass_message', {
   connection: connection as any,
 });
+export const backfillQueue = new Queue('q_relay_fileid_backfill', {
+  connection: connection as any,
+});

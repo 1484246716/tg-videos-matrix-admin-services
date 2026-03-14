@@ -12,6 +12,7 @@ export async function scheduleDueRelayUploadTasks() {
   const dueAssets = await prisma.mediaAsset.findMany({
     where: {
       telegramFileId: null,
+      relayMessageId: null, // 🔴 绝对防御：只要拿了流水凭证在等待提取的，绝对不抓取
       OR: [
         { status: MediaStatus.ready },
         {
@@ -43,12 +44,14 @@ export async function scheduleDueRelayUploadTasks() {
       id: asset.id,
       status: MediaStatus.ready,
       telegramFileId: null,
+      relayMessageId: null,
     };
 
     const whereStaleIngesting = {
       id: asset.id,
       status: MediaStatus.ingesting,
       telegramFileId: null,
+      relayMessageId: null,
       updatedAt: { lte: staleIngestingBefore },
     };
 
@@ -90,7 +93,7 @@ export async function scheduleDueRelayUploadTasks() {
   }
 
   if (queuedCount > 0) {
-    logger.info('[scheduler] queued relay upload tasks', { count: queuedCount });
+    logger.info('[scheduler] 已入队中转上传任务', { count: queuedCount });
   }
 }
 
@@ -104,17 +107,17 @@ export async function scheduleRelayForDefinition(taskDefinitionId: bigint) {
       summary: {
         executor: 'relay_upload',
         ...enqueueSummary,
-        message: 'relay upload scan + scheduler tick completed',
+        message: '中转上传扫描与调度完成',
       },
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'unknown error';
+    const message = error instanceof Error ? error.message : '未知错误';
     await updateTaskDefinitionRunStatus({
       taskDefinitionId,
       status: 'failed',
       summary: {
         executor: 'relay_upload',
-        error: message,
+        error: `中转上传调度失败: ${message}`,
       },
     });
 

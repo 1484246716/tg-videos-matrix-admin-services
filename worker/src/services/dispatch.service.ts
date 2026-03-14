@@ -40,7 +40,7 @@ export async function handleDispatchJob(
   });
 
   if (!task) {
-    throw new Error(`Dispatch task not found: ${dispatchTaskIdRaw}`);
+    throw new Error(`未找到分发任务: ${dispatchTaskIdRaw}`);
   }
 
   await prisma.dispatchTask.update({
@@ -64,7 +64,7 @@ export async function handleDispatchJob(
 
   try {
     if (!task.mediaAsset.telegramFileId) {
-      throw new Error('Media asset has no telegramFileId (relay not uploaded)');
+      throw new Error('媒体资源缺少 telegramFileId（中转尚未完成）');
     }
 
     let finalCaption = task.caption || task.mediaAsset.aiGeneratedCaption;
@@ -114,7 +114,7 @@ export async function handleDispatchJob(
             data: { aiGeneratedCaption: finalCaption },
           });
         } catch (aiErr) {
-          logError('[q_dispatch] AI generation failed', {
+          logError('[q_dispatch] AI 文案生成失败', {
             dispatchTaskId: task.id.toString(),
             error: aiErr,
           });
@@ -136,7 +136,7 @@ export async function handleDispatchJob(
 
     const resolvedBotId = task.botId ?? task.channel.defaultBotId;
     if (!resolvedBotId) {
-      throw new Error('No bot assigned to dispatch task or channel');
+      throw new Error('分发任务或频道未配置机器人');
     }
 
     const bot = await prisma.bot.findUnique({
@@ -149,11 +149,11 @@ export async function handleDispatchJob(
     });
 
     if (!bot) {
-      throw new Error(`Bot not found: ${resolvedBotId.toString()}`);
+      throw new Error(`未找到机器人: ${resolvedBotId.toString()}`);
     }
 
     if (bot.status !== 'active') {
-      throw new Error(`Bot is not active: ${bot.status}`);
+      throw new Error(`机器人未启用: ${bot.status}`);
     }
 
     const sendResult = await sendVideoByTelegram({
@@ -200,7 +200,7 @@ export async function handleDispatchJob(
     const now = new Date();
 
     const errorObj = error as TelegramError;
-    const message = errorObj.message || 'Unknown dispatch error';
+    const message = errorObj.message || '未知分发错误';
     const code = errorObj.code || 'DISPATCH_ERROR';
 
     const retryAfterSec = errorObj.retryAfterSec;

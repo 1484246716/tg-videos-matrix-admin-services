@@ -8,9 +8,10 @@ import '../workers/dispatch.worker';
 import '../workers/relay-upload.worker';
 import '../workers/catalog.worker';
 import '../workers/mass-message.worker';
+import '../workers/relay-fileid-backfill.worker'; // 🔴 核心修复：将回查Worker挂载到主进程
 
 async function drainStaleRelayJobs() {
-  logger.info('[bootstrap] draining stale relay upload jobs...');
+  logger.info('[bootstrap] 正在清理过期的中转上传任务...');
   let removed = 0;
 
   const failedJobs = await relayUploadQueue.getFailed(0, 500);
@@ -34,7 +35,7 @@ async function drainStaleRelayJobs() {
   }
 
   if (removed > 0) {
-    logger.info('[bootstrap] removed stale relay upload jobs', { count: removed });
+    logger.info('[bootstrap] 已清理过期的中转上传任务', { count: removed });
   }
 }
 
@@ -65,19 +66,19 @@ export async function bootstrapWorker() {
 
   await drainStaleRelayJobs();
 
-  logger.info('[bootstrap] telegram api base', { telegramApiBase });
+  logger.info('[bootstrap] Telegram API 地址', { telegramApiBase });
 
   setInterval(() => {
     void scheduleEnabledTaskDefinitions().catch((err) => {
-      logError('[scheduler:task-definitions] error', err);
+      logError('[scheduler:task-definitions] 调度异常', err);
     });
 
     void scheduleDueMassMessageItems().catch((err) => {
-      logError('[scheduler:mass-message-items] error', err);
+      logError('[scheduler:mass-message-items] 调度异常', err);
     });
   }, 5000);
 
   logger.info(
-    'Worker started. Queues: q_dispatch + q_relay_upload + q_catalog + q_mass_message, task-definitions scheduler enabled',
+    'Worker 已启动，队列：q_dispatch + q_relay_upload + q_catalog + q_mass_message + q_relay_fileid_backfill，任务调度已启用',
   );
 }

@@ -59,7 +59,7 @@ export async function scheduleDueCatalogTasks() {
   }
 
   if (queuedCount > 0) {
-    logger.info('[scheduler] queued catalog tasks', { count: queuedCount });
+    logger.info('[scheduler] 已入队频道导航任务', { count: queuedCount });
   }
 }
 
@@ -71,17 +71,17 @@ export async function scheduleCatalogForDefinition(taskDefinitionId: bigint) {
       status: 'success',
       summary: {
         executor: 'catalog_publish',
-        message: 'catalog scheduler tick completed',
+        message: '频道导航调度完成',
       },
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'unknown error';
+    const message = error instanceof Error ? error.message : '未知错误';
     await updateTaskDefinitionRunStatus({
       taskDefinitionId,
       status: 'failed',
       summary: {
         executor: 'catalog_publish',
-        error: message,
+        error: `频道导航调度失败: ${message}`,
       },
     });
 

@@ -49,7 +49,7 @@ export async function scheduleDueMassMessageItems() {
   }
 
   if (queued > 0) {
-    logger.info('[scheduler] queued mass message items', { count: queued });
+    logger.info('[scheduler] 已入队群发任务', { count: queued });
   }
 }
 

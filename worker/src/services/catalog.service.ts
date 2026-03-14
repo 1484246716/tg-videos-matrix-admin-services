@@ -20,15 +20,15 @@ export async function handleCatalogJob(channelIdRaw: string) {
     },
   });
 
-  if (!channel) throw new Error(`Channel not found: ${channelIdRaw}`);
+  if (!channel) throw new Error(`未找到频道: ${channelIdRaw}`);
   if (!channel.navEnabled || channel.status !== 'active') {
-    return { ok: true, skipped: true, reason: 'nav_disabled_or_not_active' };
+    return { ok: true, skipped: true, reason: '导航未启用或频道未激活' };
   }
   if (!channel.navTemplateText || !channel.defaultBot) {
-    throw new Error(`Missing navTemplateText or defaultBot for channel ${channelIdRaw}`);
+    throw new Error(`频道缺少导航模板或默认机器人: ${channelIdRaw}`);
   }
   if (channel.defaultBot.status !== 'active') {
-    throw new Error(`Channel bot not active: ${channelIdRaw}`);
+    throw new Error(`频道机器人未启用: ${channelIdRaw}`);
   }
 
   let catalogTemplate = await prisma.catalogTemplate.findFirst({
@@ -99,11 +99,11 @@ export async function handleCatalogJob(channelIdRaw: string) {
         data: {
           status: CatalogTaskStatus.cancelled,
           finishedAt: new Date(),
-          errorMessage: 'no_successful_dispatch_tasks',
+          errorMessage: '没有可用的成功分发记录',
         },
       });
     }
-    return { ok: true, skipped: true, reason: 'no_successful_dispatch_tasks' };
+    return { ok: true, skipped: true, reason: '没有可用的成功分发记录' };
   }
 
   const videos = [...dispatchTasks].reverse().map((t) => {
@@ -183,7 +183,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
               pinSuccess = true;
             } catch (pinErr) {
               pinSuccess = false;
-              pinErrorMessage = pinErr instanceof Error ? pinErr.message : 'pin failed';
+              pinErrorMessage = pinErr instanceof Error ? pinErr.message : '置顶失败';
             }
           }
         } else {
@@ -207,7 +207,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
         pinSuccess = true;
       } catch (pinErr) {
         pinSuccess = false;
-        pinErrorMessage = pinErr instanceof Error ? pinErr.message : 'pin failed';
+        pinErrorMessage = pinErr instanceof Error ? pinErr.message : '置顶失败';
       }
     }
 
@@ -258,16 +258,16 @@ export async function handleCatalogJob(channelIdRaw: string) {
           status: CatalogTaskStatus.failed,
           finishedAt: new Date(),
           contentPreview,
-          errorMessage: error instanceof Error ? error.message : 'catalog publish failed',
+          errorMessage: error instanceof Error ? error.message : '频道导航发布失败',
           pinAfterPublish: pinAttempted,
           pinSuccess,
           pinErrorMessage:
-            pinErrorMessage ?? (error instanceof Error ? error.message : 'catalog publish failed'),
+            pinErrorMessage ?? (error instanceof Error ? error.message : '频道导航发布失败'),
         },
       });
     }
 
-    logError('[q_catalog] publish error', {
+    logError('[q_catalog] 发布频道导航失败', {
       channelId: channelIdRaw,
       error,
     });

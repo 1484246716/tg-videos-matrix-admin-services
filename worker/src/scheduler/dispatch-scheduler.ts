@@ -56,7 +56,7 @@ export async function scheduleDueDispatchTasks() {
   }
 
   if (dueTasks.length > 0) {
-    logger.info('[scheduler] queued dispatch tasks', { count: dueTasks.length });
+    logger.info('[scheduler] 已入队分发任务', { count: dueTasks.length });
   }
 }
 
@@ -68,7 +68,7 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
     });
 
     if (!definition) {
-      throw new Error(`Task Definition ${taskDefinitionId} not found`);
+      throw new Error(`未找到任务定义: ${taskDefinitionId}`);
     }
 
     const unscheduledAssets = await prisma.mediaAsset.findMany({
@@ -114,17 +114,17 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
       summary: {
         executor: 'dispatch_send',
         createdTasks: createdCount,
-        message: 'Auto-scanned and queued dispatch tasks',
+        message: '自动扫描并入队分发任务',
       },
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     // eslint-disable-next-line no-console
-    console.error(`[scheduler] dispatch_send taskDef=${taskDefinitionId} failed:`, error);
+    console.error(`[scheduler] 分发调度失败，taskDef=${taskDefinitionId}:`, error);
     await updateTaskDefinitionRunStatus({
       taskDefinitionId,
       status: 'failed',
-      summary: { executor: 'dispatch_send', error: message },
+      summary: { executor: 'dispatch_send', error: `分发调度失败: ${message}` },
     });
   }
 }
