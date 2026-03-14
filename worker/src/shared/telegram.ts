@@ -1,3 +1,6 @@
+import axios from 'axios';
+import http from 'node:http';
+import https from 'node:https';
 import { telegramApiBase } from '../config/env';
 import { logger, logError } from '../logger';
 
@@ -29,40 +32,100 @@ function toTelegramMessageLink(chatIdRaw: string, messageId: number): string | n
   return null;
 }
 
-export async function sendTelegramRequest(args: {
-  botToken: string;
-  method:
+const keepAliveHttpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 10,
+});
+
+const keepAliveHttpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 10,
+});
+
+export type TelegramUpdate = {
+  update_id: number;
+  message?: {
+    message_id: number;
+    caption?: string;
+    chat?: { id: number | string };
+    document?: { file_name?: string };
+    video?: { file_name?: string };
+  };
+  channel_post?: {
+    message_id: number;
+    caption?: string;
+    chat?: { id: number | string };
+    document?: { file_name?: string };
+    video?: { file_name?: string };
+  };
+};
+
+export type TelegramRequestMethod =
     | 'sendVideo'
     | 'sendDocument'
     | 'sendMessage'
     | 'pinChatMessage'
     | 'unpinChatMessage'
-    | 'editMessageText';
+  | 'editMessageText'
+  | 'forwardMessage'
+  | 'deleteMessage'
+  | 'getUpdates';
+
+export type TelegramRequestArgs = {
+  botToken: string;
+  method: TelegramRequestMethod;
   payload: Record<string, unknown> | FormData;
-}): Promise<{ messageId?: number; videoFileId?: string; videoFileUniqueId?: string }> {
+};
+
+export type TelegramResponse = {
+  messageId?: number;
+  videoFileId?: string;
+  videoFileUniqueId?: string;
+  documentFileId?: string;
+  documentFileUniqueId?: string;
+  animationFileId?: string;
+  animationFileUniqueId?: string;
+  updates?: TelegramUpdate[];
+};
+
+export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<TelegramResponse> {
   const endpoint = `${normalizeTelegramApiBase(telegramApiBase)}/bot${args.botToken}/${args.method}`;
 
   const isFormData = args.payload instanceof FormData;
-  const controller = new AbortController();
-  const timeoutMs = 15 * 60 * 1000;
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeoutMs = 45 * 60 * 1000;
 
-  let response: Response;
+  let responseStatus = 0;
+  let json: {
+    ok: boolean;
+    result?: {
+      message_id?: number;
+      video?: { file_id?: string; file_unique_id?: string };
+      document?: { file_id?: string; file_unique_id?: string };
+      animation?: { file_id?: string; file_unique_id?: string };
+    } | true;
+    error_code?: number;
+    description?: string;
+    parameters?: { retry_after?: number };
+  };
+
   try {
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers: isFormData
-        ? undefined
-        : {
-            'content-type': 'application/json',
-          },
-      body: (isFormData ? args.payload : JSON.stringify(args.payload)) as any,
-      signal: controller.signal,
+    const response = await axios.post(endpoint, args.payload, {
+      headers: isFormData ? undefined : { 'content-type': 'application/json' },
+      timeout: timeoutMs,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      httpAgent: keepAliveHttpAgent,
+      httpsAgent: keepAliveHttpsAgent,
+      validateStatus: () => true,
     });
+
+    responseStatus = response.status;
+    json = response.data as typeof json;
   } catch (error) {
-    clearTimeout(timeout);
-    const isTimeout = error instanceof Error && error.name === 'AbortError';
-    if (isTimeout) {
+    if (axios.isAxiosError(error)) {
+      if (error.code === 'ECONNABORTED') {
       logError('[telegram] 请求超时', {
         method: args.method,
         timeoutMs,
@@ -73,27 +136,36 @@ export async function sendTelegramRequest(args: {
         message: `Telegram 请求超时（${timeoutMs}ms）`,
       };
       throw err;
+      }
+
+      const isSocketHangUp =
+        error.code === 'ECONNRESET' ||
+        error.code === 'EPIPE' ||
+        (typeof error.message === 'string' && error.message.toLowerCase().includes('socket hang up'));
+
+      if (isSocketHangUp) {
+        logError('[telegram] 连接被中断', {
+          method: args.method,
+          timeoutMs,
+          payloadType: isFormData ? 'form-data' : 'json',
+          code: error.code ?? null,
+          message: error.message,
+        });
+
+        const err: TelegramError = {
+          code: 'TG_SOCKET_HANG_UP',
+          message: 'Telegram 连接中断（socket hang up）',
+        };
+
+        throw err;
+      }
     }
     throw error;
-  } finally {
-    clearTimeout(timeout);
   }
 
-  const json = (await response.json()) as {
-    ok: boolean;
-    result?: {
-      message_id?: number;
-      video?: { file_id?: string; file_unique_id?: string };
-      document?: { file_id?: string; file_unique_id?: string };
-    } | true;
-    error_code?: number;
-    description?: string;
-    parameters?: { retry_after?: number };
-  };
-
-  if (!response.ok || !json.ok) {
-    const errorCode = json.error_code ?? response.status;
-    const description = json.description || `Telegram API 请求失败 (${response.status})`;
+  if (!json || !json.ok || responseStatus < 200 || responseStatus >= 300) {
+    const errorCode = json?.error_code ?? responseStatus;
+    const description = json?.description || `Telegram API 请求失败 (${responseStatus})`;
 
     const err: TelegramError = {
       code: `TG_${errorCode}`,
@@ -103,11 +175,11 @@ export async function sendTelegramRequest(args: {
 
     logError('[telegram] 请求失败', {
       method: args.method,
-      status: response.status,
+      status: responseStatus,
       payloadType: isFormData ? 'form-data' : 'json',
       errorCode,
       description,
-      parameters: json.parameters ?? null,
+      parameters: json?.parameters ?? null,
       response: json,
     });
 
@@ -116,24 +188,22 @@ export async function sendTelegramRequest(args: {
 
   logger.info('[telegram] 请求成功', {
     method: args.method,
-    status: response.status,
+    status: responseStatus,
     payloadType: isFormData ? 'form-data' : 'json',
     response: json,
   });
 
+  const resultObject = json.result && typeof json.result === 'object' ? json.result : undefined;
+
   return {
-    messageId:
-      json.result && typeof json.result === 'object'
-        ? json.result.message_id
-        : undefined,
-    videoFileId:
-      json.result && typeof json.result === 'object'
-        ? (json.result.video?.file_id ?? json.result.document?.file_id)
-        : undefined,
-    videoFileUniqueId:
-      json.result && typeof json.result === 'object'
-        ? (json.result.video?.file_unique_id ?? json.result.document?.file_unique_id)
-        : undefined,
+    messageId: resultObject ? resultObject.message_id : undefined,
+    videoFileId: resultObject ? resultObject.video?.file_id : undefined,
+    videoFileUniqueId: resultObject ? resultObject.video?.file_unique_id : undefined,
+    documentFileId: resultObject ? resultObject.document?.file_id : undefined,
+    documentFileUniqueId: resultObject ? resultObject.document?.file_unique_id : undefined,
+    animationFileId: resultObject ? (resultObject as { animation?: { file_id?: string } }).animation?.file_id : undefined,
+    animationFileUniqueId: resultObject ? (resultObject as { animation?: { file_unique_id?: string } }).animation?.file_unique_id : undefined,
+    updates: Array.isArray(resultObject) ? (resultObject as TelegramUpdate[]) : undefined,
   };
 }
 

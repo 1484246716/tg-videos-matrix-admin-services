@@ -5,7 +5,7 @@ dotenv.config();
 
 export const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
 export const telegramApiBase =
-  process.env.TELEGRAM_BOT_API_BASE || 'https://api.telegram.org';
+  process.env.TELEGRAM_BOT_API_BASE || 'http://localhost:8081';
 
 export const SCHEDULER_POLL_MS = 5000;
 export const MAX_SCHEDULE_BATCH = 100;

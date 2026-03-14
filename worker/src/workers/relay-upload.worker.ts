@@ -23,6 +23,7 @@ export const relayUploadWorker = new Worker(
     }
 
     const mediaAssetId = BigInt(mediaAssetIdRaw);
+    const traceId = `relay-upload-${mediaAssetIdRaw}-${Date.now()}`;
 
     const mediaAsset = await prisma.mediaAsset.findUnique({
       where: { id: mediaAssetId },
@@ -65,34 +66,138 @@ export const relayUploadWorker = new Worker(
       throw new Error('中转频道机器人不存在或未启用');
     }
 
+    const stableCheckStart = Date.now();
     await waitForFileStable(mediaAsset.localPath);
+    const stableCheckDurationMs = Date.now() - stableCheckStart;
+    if (stableCheckDurationMs > 1000) {
+      logger.info('[q_relay_upload] 文件稳定性检查耗时', {
+        traceId,
+        stage: 'wait_for_stable',
+        mediaAssetId: mediaAssetIdRaw,
+        durationMs: stableCheckDurationMs,
+      });
+    }
 
     const formData = new FormData();
     formData.append('chat_id', relayChannel.tgChatId.toString());
     formData.append('caption', mediaAsset.originalName);
-    formData.append('video', await openAsBlob(mediaAsset.localPath), basename(mediaAsset.localPath));
-    formData.append('supports_streaming', 'true');
+
+    const useDocument = mediaAsset.fileSize && mediaAsset.fileSize >= BigInt(900 * 1024 * 1024);
+    const blobStart = Date.now();
+    if (useDocument) {
+      formData.append('document', await openAsBlob(mediaAsset.localPath), basename(mediaAsset.localPath));
+    } else {
+      formData.append('video', await openAsBlob(mediaAsset.localPath), basename(mediaAsset.localPath));
+      formData.append('supports_streaming', 'true');
+    }
+    const blobDurationMs = Date.now() - blobStart;
+    if (blobDurationMs > 500) {
+      logger.info('[q_relay_upload] 文件读取/封装耗时', {
+        traceId,
+        stage: 'blob_build',
+        mediaAssetId: mediaAssetIdRaw,
+        durationMs: blobDurationMs,
+      });
+    }
 
     logger.info('[q_relay_upload] 开始上传媒体资源', {
+      traceId,
+      stage: 'start',
       mediaAssetId: mediaAssetIdRaw,
       relayChannelId: relayChannelIdRaw,
+      uploadMethod: useDocument ? 'sendDocument' : 'sendVideo',
     });
 
-    const sendResult = await sendTelegramRequest({
+    const uploadStart = Date.now();
+
+    let sendResult;
+    try {
+      sendResult = await sendTelegramRequest({
       botToken: relayChannel.bot.tokenEncrypted,
-      method: 'sendVideo',
+      method: useDocument ? 'sendDocument' : 'sendVideo',
       payload: formData,
     });
+    } catch (err: any) {
+      logger.info('[q_relay_upload] 上传请求耗时', {
+        traceId,
+        stage: 'send_request',
+        mediaAssetId: mediaAssetIdRaw,
+        relayChannelId: relayChannelIdRaw,
+        durationMs: Date.now() - uploadStart,
+      });
+
+      const errorCode = err?.code ?? null;
+      if (errorCode === 'TG_SOCKET_HANG_UP') {
+        await prisma.mediaAsset.update({
+          where: { id: mediaAssetId },
+          data: {
+            status: MediaStatus.ingesting,
+            ingestError: null,
+          },
+        });
+
+        await backfillQueue.add(
+          'check-file-id',
+          {
+            mediaAssetId: mediaAssetId.toString(),
+            chatId: relayChannel.tgChatId.toString(),
+            fileName: mediaAsset.originalName,
+          },
+          {
+            delay: 180000 + Math.floor(Math.random() * 30000),
+            attempts: 10,
+            backoff: { type: 'exponential', delay: 60000 },
+            removeOnComplete: true,
+            removeOnFail: 200,
+          },
+        );
+
+        logger.warn('[q_relay_upload] 上传连接中断，转入回查队列', {
+          traceId,
+          mediaAssetId: mediaAssetIdRaw,
+          relayChannelId: relayChannelIdRaw,
+          errorCode,
+        });
+
+        return {
+          ok: true,
+          pending: true,
+          mediaAssetId: mediaAssetIdRaw,
+          relayChannelId: relayChannelIdRaw,
+          viaBackfill: true,
+        };
+      }
+
+      throw err;
+    }
 
     if (!sendResult.messageId) {
       throw new Error('中转上传成功但缺少 Telegram message_id');
     }
 
+    logger.info('[q_relay_upload] 上传请求耗时', {
+      traceId,
+      stage: 'send_request',
+      mediaAssetId: mediaAssetIdRaw,
+      relayChannelId: relayChannelIdRaw,
+      durationMs: Date.now() - uploadStart,
+    });
+
+    const archiveStart = Date.now();
     let archivePath: string | null = null;
     try {
       archivePath = await moveToArchive(mediaAsset.localPath);
     } catch (moveErr) {
       logError('[q_relay_upload] 归档文件失败', moveErr);
+    }
+    const archiveDurationMs = Date.now() - archiveStart;
+    if (archiveDurationMs > 500) {
+      logger.info('[q_relay_upload] 归档耗时', {
+        traceId,
+        stage: 'archive',
+        mediaAssetId: mediaAssetIdRaw,
+        durationMs: archiveDurationMs,
+      });
     }
 
     const directFileId = sendResult.videoFileId ?? sendResult.documentFileId ?? sendResult.animationFileId;
@@ -160,7 +265,7 @@ export const relayUploadWorker = new Worker(
   },
   {
     connection: connection as any,
-    concurrency: 2,
+    concurrency: 1,
     lockDuration: 30 * 60 * 1000,
     maxStalledCount: 1,
     stalledInterval: 30000,

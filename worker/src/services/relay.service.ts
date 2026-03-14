@@ -3,6 +3,7 @@ import { basename } from 'node:path';
 import { MediaStatus } from '@prisma/client';
 import { prisma, getTaskDefinitionModel } from '../infra/prisma';
 import { hashFile, scanChannelVideos } from '../shared/file-utils';
+import { logger } from '../logger';
 
 export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
   const definition = await getTaskDefinitionModel().findUnique({
@@ -57,7 +58,18 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
       scannedFiles += 1;
 
       const s = await stat(filePath);
+      const hashStart = Date.now();
       const fileHash = await hashFile(filePath);
+      const hashDurationMs = Date.now() - hashStart;
+
+      if (hashDurationMs > 500) {
+        logger.info('[relay] hashFile 耗时', {
+          stage: 'hash_file',
+          filePath,
+          fileSize: s.size,
+          durationMs: hashDurationMs,
+        });
+      }
 
       let asset = await prisma.mediaAsset.findUnique({
         where: {
