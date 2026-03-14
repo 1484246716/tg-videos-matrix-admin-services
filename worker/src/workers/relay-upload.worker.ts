@@ -161,7 +161,7 @@ export const relayUploadWorker = new Worker(
   {
     connection: connection as any,
     concurrency: 2,
-    lockDuration: 15 * 60 * 1000,
+    lockDuration: 30 * 60 * 1000,
     maxStalledCount: 1,
     stalledInterval: 30000,
   },
