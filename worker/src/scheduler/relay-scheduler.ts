@@ -9,7 +9,7 @@ import { enqueueRelayAssetsFromTaskDefinition } from '../services/relay.service'
 export async function scheduleDueRelayUploadTasks() {
   const staleIngestingBefore = new Date(Date.now() - 5 * 60 * 1000);
 
-  const dueAssets = await prisma.mediaAsset.findMany({
+  const candidateAssets = await prisma.mediaAsset.findMany({
     where: {
       telegramFileId: null,
       relayMessageId: null, // 🔴 绝对防御：只要拿了流水凭证在等待提取的，绝对不抓取
@@ -21,8 +21,8 @@ export async function scheduleDueRelayUploadTasks() {
         },
       ],
     },
-    orderBy: { createdAt: 'asc' },
-    take: MAX_SCHEDULE_BATCH,
+    orderBy: [{ channelId: 'asc' }, { createdAt: 'asc' }],
+    take: MAX_SCHEDULE_BATCH * 10,
     select: {
       id: true,
       channelId: true,
@@ -33,9 +33,36 @@ export async function scheduleDueRelayUploadTasks() {
     },
   });
 
+  const groupedByChannel = new Map<string, typeof candidateAssets>();
+  for (const asset of candidateAssets) {
+    const key = asset.channelId.toString();
+    const bucket = groupedByChannel.get(key);
+    if (bucket) {
+      bucket.push(asset);
+    } else {
+      groupedByChannel.set(key, [asset]);
+    }
+  }
+
+  const selectedAssets: typeof candidateAssets = [];
+  while (selectedAssets.length < MAX_SCHEDULE_BATCH && groupedByChannel.size > 0) {
+    for (const [key, bucket] of groupedByChannel) {
+      const next = bucket.shift();
+      if (next) {
+        selectedAssets.push(next);
+      }
+      if (bucket.length === 0) {
+        groupedByChannel.delete(key);
+      }
+      if (selectedAssets.length >= MAX_SCHEDULE_BATCH) {
+        break;
+      }
+    }
+  }
+
   let queuedCount = 0;
 
-  for (const asset of dueAssets) {
+  for (const asset of selectedAssets) {
     const sourceMeta = (asset.sourceMeta ?? {}) as Record<string, unknown>;
     const relayChannelId = sourceMeta.relayChannelId;
     if (typeof relayChannelId !== 'string' || !relayChannelId.trim()) continue;
@@ -93,7 +120,10 @@ export async function scheduleDueRelayUploadTasks() {
   }
 
   if (queuedCount > 0) {
-    logger.info('[scheduler] 已入队中转上传任务', { count: queuedCount });
+    logger.info('[scheduler] 已入队中转上传任务', {
+      count: queuedCount,
+      mode: 'round_robin_by_channel',
+    });
   }
 }
 

@@ -103,7 +103,11 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
         createdAssets += 1;
       }
 
-      if (asset.status === MediaStatus.relay_uploaded || asset.status === MediaStatus.ingesting) {
+      if (
+        asset.status === MediaStatus.relay_uploaded ||
+        asset.status === MediaStatus.ingesting ||
+        asset.status === MediaStatus.failed
+      ) {
         continue;
       }
 

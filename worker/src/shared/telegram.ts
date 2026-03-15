@@ -1,6 +1,7 @@
 import axios from 'axios';
 import http from 'node:http';
 import https from 'node:https';
+import FormData from 'form-data';
 import { telegramApiBase } from '../config/env';
 import { logger, logError } from '../logger';
 
@@ -48,17 +49,19 @@ export type TelegramUpdate = {
   update_id: number;
   message?: {
     message_id: number;
+    date?: number;
     caption?: string;
     chat?: { id: number | string };
-    document?: { file_name?: string };
-    video?: { file_name?: string };
+    document?: { file_name?: string; file_size?: number; file_id?: string; file_unique_id?: string };
+    video?: { file_name?: string; file_size?: number; file_id?: string; file_unique_id?: string };
   };
   channel_post?: {
     message_id: number;
+    date?: number;
     caption?: string;
     chat?: { id: number | string };
-    document?: { file_name?: string };
-    video?: { file_name?: string };
+    document?: { file_name?: string; file_size?: number; file_id?: string; file_unique_id?: string };
+    video?: { file_name?: string; file_size?: number; file_id?: string; file_unique_id?: string };
   };
 };
 
@@ -77,6 +80,7 @@ export type TelegramRequestArgs = {
   botToken: string;
   method: TelegramRequestMethod;
   payload: Record<string, unknown> | FormData;
+  timeoutMs?: number;
 };
 
 export type TelegramResponse = {
@@ -88,13 +92,14 @@ export type TelegramResponse = {
   animationFileId?: string;
   animationFileUniqueId?: string;
   updates?: TelegramUpdate[];
+  updateIdMax?: number;
 };
 
 export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<TelegramResponse> {
   const endpoint = `${normalizeTelegramApiBase(telegramApiBase)}/bot${args.botToken}/${args.method}`;
 
   const isFormData = args.payload instanceof FormData;
-  const timeoutMs = 45 * 60 * 1000;
+  const timeoutMs = args.timeoutMs ?? 45 * 60 * 1000;
 
   let responseStatus = 0;
   let json: {
@@ -111,8 +116,13 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
   };
 
   try {
+    const formHeaders = isFormData && typeof (args.payload as FormData).getHeaders === 'function'
+      ? (args.payload as FormData).getHeaders()
+      : undefined;
     const response = await axios.post(endpoint, args.payload, {
-      headers: isFormData ? undefined : { 'content-type': 'application/json' },
+      headers: isFormData
+        ? { ...formHeaders, 'content-length': (args.payload as FormData).getLengthSync() }
+        : { 'content-type': 'application/json' },
       timeout: timeoutMs,
       maxBodyLength: Infinity,
       maxContentLength: Infinity,
@@ -124,39 +134,42 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
     responseStatus = response.status;
     json = response.data as typeof json;
   } catch (error) {
-    if (axios.isAxiosError(error)) {
-      if (error.code === 'ECONNABORTED') {
-      logError('[telegram] 请求超时', {
+    const rawCode = typeof error === 'object' && error ? (error as { code?: string }).code : undefined;
+    const rawMessage = typeof error === 'object' && error ? (error as { message?: string }).message : undefined;
+    const isSocketHangUp =
+      rawCode === 'ECONNRESET' ||
+      rawCode === 'EPIPE' ||
+      rawCode === 'TG_SOCKET_HANG_UP' ||
+      (typeof rawMessage === 'string' && rawMessage.toLowerCase().includes('socket hang up'));
+
+    if (isSocketHangUp) {
+      logError('[telegram] 连接被中断', {
         method: args.method,
         timeoutMs,
         payloadType: isFormData ? 'form-data' : 'json',
+        code: rawCode ?? null,
+        message: rawMessage ?? null,
       });
+
       const err: TelegramError = {
-        code: 'TG_TIMEOUT',
-        message: `Telegram 请求超时（${timeoutMs}ms）`,
+        code: 'TG_SOCKET_HANG_UP',
+        message: 'Telegram 连接中断（socket hang up）',
       };
+
       throw err;
-      }
+    }
 
-      const isSocketHangUp =
-        error.code === 'ECONNRESET' ||
-        error.code === 'EPIPE' ||
-        (typeof error.message === 'string' && error.message.toLowerCase().includes('socket hang up'));
-
-      if (isSocketHangUp) {
-        logError('[telegram] 连接被中断', {
+    if (axios.isAxiosError(error)) {
+      if (error.code === 'ECONNABORTED') {
+        logError('[telegram] 请求超时', {
           method: args.method,
           timeoutMs,
           payloadType: isFormData ? 'form-data' : 'json',
-          code: error.code ?? null,
-          message: error.message,
         });
-
         const err: TelegramError = {
-          code: 'TG_SOCKET_HANG_UP',
-          message: 'Telegram 连接中断（socket hang up）',
+          code: 'TG_TIMEOUT',
+          message: `Telegram 请求超时（${timeoutMs}ms）`,
         };
-
         throw err;
       }
     }
@@ -195,6 +208,11 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
 
   const resultObject = json.result && typeof json.result === 'object' ? json.result : undefined;
 
+  const updates = Array.isArray(json.result) ? (json.result as TelegramUpdate[]) : undefined;
+  const updateIdMax = updates && updates.length > 0
+    ? updates.reduce((max, update) => (update.update_id > max ? update.update_id : max), updates[0].update_id)
+    : undefined;
+
   return {
     messageId: resultObject ? resultObject.message_id : undefined,
     videoFileId: resultObject ? resultObject.video?.file_id : undefined,
@@ -203,7 +221,8 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
     documentFileUniqueId: resultObject ? resultObject.document?.file_unique_id : undefined,
     animationFileId: resultObject ? (resultObject as { animation?: { file_id?: string } }).animation?.file_id : undefined,
     animationFileUniqueId: resultObject ? (resultObject as { animation?: { file_unique_id?: string } }).animation?.file_unique_id : undefined,
-    updates: Array.isArray(resultObject) ? (resultObject as TelegramUpdate[]) : undefined,
+    updates,
+    updateIdMax,
   };
 }
 
@@ -263,6 +282,30 @@ export async function sendTextByTelegram(args: {
     messageId: result.messageId,
     messageLink: toTelegramMessageLink(args.chatId, result.messageId),
   };
+}
+
+export async function getTelegramUpdates(args: {
+  botToken: string;
+  offset?: number;
+  limit?: number;
+  timeoutSec?: number;
+  allowedUpdates?: string[];
+}): Promise<{ updates: TelegramUpdate[]; updateIdMax?: number }> {
+  const payload: Record<string, unknown> = {
+    ...(args.offset ? { offset: args.offset } : {}),
+    ...(args.limit ? { limit: args.limit } : {}),
+    ...(args.timeoutSec ? { timeout: args.timeoutSec } : {}),
+    ...(args.allowedUpdates ? { allowed_updates: args.allowedUpdates } : {}),
+  };
+
+  const result = await sendTelegramRequest({
+    botToken: args.botToken,
+    method: 'getUpdates',
+    payload,
+    timeoutMs: (args.timeoutSec ?? 5) * 1000,
+  });
+
+  return { updates: result.updates ?? [], updateIdMax: result.updateIdMax };
 }
 
 export async function editMessageTextByTelegram(args: {

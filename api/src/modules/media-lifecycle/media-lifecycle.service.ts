@@ -155,4 +155,78 @@ export class MediaLifecycleService {
       })),
     };
   }
+
+  private isCooldownSatisfied(failedAt?: Date | null) {
+    if (!failedAt) return true;
+    const cooldownMs = 30 * 60 * 1000;
+    return Date.now() - failedAt.getTime() >= cooldownMs;
+  }
+
+  async retryRelay(id: string) {
+    const asset = await this.prisma.mediaAsset.findUnique({
+      where: { id: BigInt(id) },
+      select: { id: true, status: true, updatedAt: true, ingestError: true },
+    });
+
+    if (!asset) throw new NotFoundException('media asset not found');
+
+    if (asset.status !== 'failed') {
+      return { ok: false, reason: 'only_failed_can_retry' };
+    }
+
+    if (!this.isCooldownSatisfied(asset.updatedAt)) {
+      return { ok: false, reason: 'cooldown_not_reached' };
+    }
+
+    await this.prisma.mediaAsset.update({
+      where: { id: asset.id },
+      data: {
+        status: 'ready',
+        ingestError: null,
+        updatedAt: new Date(),
+      },
+    });
+
+    return { ok: true };
+  }
+
+  async retryRelayBatch(ids: string[]) {
+    if (!ids.length) return { ok: true, updated: 0, skipped: 0, skippedIds: [] as string[] };
+
+    const assets = await this.prisma.mediaAsset.findMany({
+      where: {
+        id: { in: ids.map((id) => BigInt(id)) },
+      },
+      select: { id: true, status: true, updatedAt: true },
+    });
+
+    const eligibleIds: bigint[] = [];
+    const skippedIds: string[] = [];
+
+    for (const asset of assets) {
+      if (asset.status !== 'failed' || !this.isCooldownSatisfied(asset.updatedAt)) {
+        skippedIds.push(asset.id.toString());
+        continue;
+      }
+      eligibleIds.push(asset.id);
+    }
+
+    if (eligibleIds.length) {
+      await this.prisma.mediaAsset.updateMany({
+        where: { id: { in: eligibleIds } },
+        data: {
+          status: 'ready',
+          ingestError: null,
+          updatedAt: new Date(),
+        },
+      });
+    }
+
+    return {
+      ok: true,
+      updated: eligibleIds.length,
+      skipped: skippedIds.length,
+      skippedIds,
+    };
+  }
 }

@@ -1,11 +1,13 @@
 import { Worker } from 'bullmq';
-import { openAsBlob } from 'node:fs';
+import { createReadStream } from 'node:fs';
 import { basename } from 'node:path';
-import { connection, backfillQueue } from '../infra/redis';
+import { PassThrough } from 'node:stream';
+import FormData from 'form-data';
+import { connection } from '../infra/redis';
 import { prisma } from '../infra/prisma';
 import { logger, logError } from '../logger';
 import { moveToArchive, waitForFileStable } from '../shared/file-utils';
-import { sendTelegramRequest } from '../shared/telegram';
+import { getTelegramUpdates, sendTelegramRequest } from '../shared/telegram';
 import { MediaStatus } from '@prisma/client';
 
 export const relayUploadWorker = new Worker(
@@ -83,20 +85,55 @@ export const relayUploadWorker = new Worker(
     formData.append('caption', mediaAsset.originalName);
 
     const useDocument = mediaAsset.fileSize && mediaAsset.fileSize >= BigInt(900 * 1024 * 1024);
-    const blobStart = Date.now();
+    const streamStart = Date.now();
+    const fileStream = createReadStream(mediaAsset.localPath);
+    const fileName = basename(mediaAsset.localPath);
+    const fileSize = mediaAsset.fileSize ? Number(mediaAsset.fileSize) : undefined;
+    const streamWithProgress = new PassThrough();
+    let streamedBytes = 0;
+    let lastProgressAt = Date.now();
+
+    fileStream.on('data', (chunk) => {
+      streamedBytes += chunk.length;
+      const now = Date.now();
+      if (now - lastProgressAt >= 30 * 1000) {
+        logger.info('[q_relay_upload] 上传字节进度', {
+          traceId,
+          stage: 'upload_progress_bytes',
+          mediaAssetId: mediaAssetIdRaw,
+          relayChannelId: relayChannelIdRaw,
+          streamedBytes,
+          fileSize,
+        });
+        lastProgressAt = now;
+      }
+    });
+
+    fileStream.on('error', (err) => {
+      streamWithProgress.destroy(err);
+    });
+
+    fileStream.pipe(streamWithProgress);
+
     if (useDocument) {
-      formData.append('document', await openAsBlob(mediaAsset.localPath), basename(mediaAsset.localPath));
+      formData.append('document', streamWithProgress, {
+        filename: fileName,
+        knownLength: fileSize,
+      });
     } else {
-      formData.append('video', await openAsBlob(mediaAsset.localPath), basename(mediaAsset.localPath));
+      formData.append('video', streamWithProgress, {
+        filename: fileName,
+        knownLength: fileSize,
+      });
       formData.append('supports_streaming', 'true');
     }
-    const blobDurationMs = Date.now() - blobStart;
-    if (blobDurationMs > 500) {
+    const streamDurationMs = Date.now() - streamStart;
+    if (streamDurationMs > 500) {
       logger.info('[q_relay_upload] 文件读取/封装耗时', {
         traceId,
         stage: 'blob_build',
         mediaAssetId: mediaAssetIdRaw,
-        durationMs: blobDurationMs,
+        durationMs: streamDurationMs,
       });
     }
 
@@ -109,6 +146,17 @@ export const relayUploadWorker = new Worker(
     });
 
     const uploadStart = Date.now();
+    const uploadStartAt = new Date();
+
+    const progressTicker = setInterval(() => {
+      logger.info('[q_relay_upload] 上传进行中', {
+        traceId,
+        stage: 'upload_progress',
+        mediaAssetId: mediaAssetIdRaw,
+        relayChannelId: relayChannelIdRaw,
+        elapsedMs: Date.now() - uploadStart,
+      });
+    }, 60 * 1000);
 
     let sendResult;
     try {
@@ -118,6 +166,7 @@ export const relayUploadWorker = new Worker(
       payload: formData,
     });
     } catch (err: any) {
+      clearInterval(progressTicker);
       logger.info('[q_relay_upload] 上传请求耗时', {
         traceId,
         stage: 'send_request',
@@ -127,53 +176,65 @@ export const relayUploadWorker = new Worker(
       });
 
       const errorCode = err?.code ?? null;
+      const errorMessage = err?.message ?? null;
       if (errorCode === 'TG_SOCKET_HANG_UP') {
-        await prisma.mediaAsset.update({
-          where: { id: mediaAssetId },
-          data: {
-            status: MediaStatus.ingesting,
-            ingestError: null,
-          },
-        });
-
-        await backfillQueue.add(
-          'check-file-id',
-          {
-            mediaAssetId: mediaAssetId.toString(),
-            chatId: relayChannel.tgChatId.toString(),
-            fileName: mediaAsset.originalName,
-          },
-          {
-            delay: 180000 + Math.floor(Math.random() * 30000),
-            attempts: 10,
-            backoff: { type: 'exponential', delay: 60000 },
-            removeOnComplete: true,
-            removeOnFail: 200,
-          },
-        );
-
-        logger.warn('[q_relay_upload] 上传连接中断，转入回查队列', {
+        logger.warn('[q_relay_upload] 命中连接中断兜底条件', {
           traceId,
           mediaAssetId: mediaAssetIdRaw,
           relayChannelId: relayChannelIdRaw,
           errorCode,
+          errorMessage,
         });
 
-        return {
-          ok: true,
-          pending: true,
-          mediaAssetId: mediaAssetIdRaw,
-          relayChannelId: relayChannelIdRaw,
-          viaBackfill: true,
-        };
+        const fallbackResult = await tryRecoverAfterHangUp({
+          botToken: relayChannel.bot.tokenEncrypted,
+          relayChannelId: relayChannel.tgChatId.toString(),
+          originalName: mediaAsset.originalName,
+          fileSize: fileSize ?? undefined,
+          uploadStartAt,
+        });
+
+        if (fallbackResult) {
+          await prisma.mediaAsset.update({
+            where: { id: mediaAssetId },
+            data: {
+              status: MediaStatus.relay_uploaded,
+              relayMessageId: BigInt(fallbackResult.messageId),
+              telegramFileId: fallbackResult.telegramFileId,
+              telegramFileUniqueId: fallbackResult.telegramFileUniqueId,
+              ingestError: null,
+            },
+          });
+
+          logger.info('[q_relay_upload] 终极兜底补偿成功', {
+            traceId,
+            mediaAssetId: mediaAssetIdRaw,
+            relayChannelId: relayChannelIdRaw,
+            messageId: fallbackResult.messageId,
+          });
+
+          return {
+            ok: true,
+            direct: false,
+            compensated: true,
+            mediaAssetId: mediaAssetIdRaw,
+            relayChannelId: relayChannelIdRaw,
+            messageId: fallbackResult.messageId,
+          };
+        }
+
+        throw new Error('上传连接中断');
       }
 
       throw err;
     }
 
     if (!sendResult.messageId) {
+      clearInterval(progressTicker);
       throw new Error('中转上传成功但缺少 Telegram message_id');
     }
+
+    clearInterval(progressTicker);
 
     logger.info('[q_relay_upload] 上传请求耗时', {
       traceId,
@@ -204,7 +265,6 @@ export const relayUploadWorker = new Worker(
     const directFileUniqueId = sendResult.videoFileUniqueId ?? sendResult.documentFileUniqueId ?? sendResult.animationFileUniqueId ?? null;
 
     if (directFileId) {
-      // 🟢 小文件直接出了 file_id，直接标记成功
       await prisma.mediaAsset.update({
         where: { id: mediaAssetId },
         data: {
@@ -225,42 +285,17 @@ export const relayUploadWorker = new Worker(
         messageId: sendResult.messageId,
       };
     } else {
-      // 🟡 大文件暂无 file_id，保持 ingesting 状态，记下凭证，推入回查队列
       await prisma.mediaAsset.update({
         where: { id: mediaAssetId },
         data: {
-          status: MediaStatus.ingesting,
+          status: MediaStatus.failed,
           relayMessageId: BigInt(sendResult.messageId),
-          ingestError: null,
+          ingestError: '中转上传成功但未返回 file_id',
           ...(archivePath ? { archivePath, localPath: archivePath } : {}),
         },
       });
 
-      await backfillQueue.add(
-        'check-file-id',
-        {
-          mediaAssetId: mediaAssetId.toString(),
-          chatId: relayChannel.tgChatId.toString(),
-          messageId: sendResult.messageId.toString(),
-        },
-        {
-          delay: 120000 + Math.floor(Math.random() * 30000), // 2分钟延迟 + 随机抖动防拥挤
-          attempts: 10,
-          backoff: { type: 'exponential', delay: 60000 },
-          removeOnComplete: true,
-          removeOnFail: 200,
-        },
-      );
-
-      logger.info('[q_relay_upload] 大文件已发送，进入回查队列等待 file_id', { messageId: sendResult.messageId });
-
-      return {
-        ok: true,
-        pending: true,
-        mediaAssetId: mediaAssetIdRaw,
-        relayChannelId: relayChannelIdRaw,
-        messageId: sendResult.messageId,
-      };
+      throw new Error('中转上传成功但未返回 file_id');
     }
   },
   {
@@ -311,3 +346,58 @@ relayUploadWorker.on('failed', async (job, err) => {
 relayUploadWorker.on('error', (err) => {
   logError('[q_relay_upload] Worker 异常', err);
 });
+
+async function tryRecoverAfterHangUp(args: {
+  botToken: string;
+  relayChannelId: string;
+  originalName: string;
+  fileSize?: number;
+  uploadStartAt: Date;
+}) {
+  await new Promise((resolve) => setTimeout(resolve, 4000));
+
+  const { updates } = await getTelegramUpdates({
+    botToken: args.botToken,
+    limit: 50,
+    timeoutSec: 3,
+    allowedUpdates: ['channel_post'],
+  });
+
+  if (updates.length === 0) return null;
+
+  const channelId = args.relayChannelId;
+  const windowStart = args.uploadStartAt.getTime() - 10 * 60 * 1000;
+  const windowEnd = Date.now() + 5 * 60 * 1000;
+
+  const matched = updates.find((update) => {
+    const post = update.channel_post;
+    if (!post?.chat?.id) return false;
+    if (String(post.chat.id) !== channelId) return false;
+
+    const doc = post.document;
+    const video = post.video;
+    const fileName = doc?.file_name ?? video?.file_name;
+    const fileSize = doc?.file_size ?? video?.file_size;
+    const fileId = doc?.file_id ?? video?.file_id;
+
+    if (!fileName || !fileSize || !fileId) return false;
+    if (fileName !== args.originalName) return false;
+    if (args.fileSize && fileSize !== args.fileSize) return false;
+
+    const timestamp = post.date ? post.date * 1000 : 0;
+    if (!timestamp || timestamp < windowStart || timestamp > windowEnd) return false;
+
+    return true;
+  });
+
+  if (!matched?.channel_post) return null;
+
+  const matchedDoc = matched.channel_post.document ?? matched.channel_post.video;
+  if (!matchedDoc?.file_id || !matchedDoc?.file_unique_id) return null;
+
+  return {
+    messageId: matched.channel_post.message_id,
+    telegramFileId: matchedDoc.file_id,
+    telegramFileUniqueId: matchedDoc.file_unique_id,
+  };
+}

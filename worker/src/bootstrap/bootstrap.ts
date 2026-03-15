@@ -8,7 +8,6 @@ import '../workers/dispatch.worker';
 import '../workers/relay-upload.worker';
 import '../workers/catalog.worker';
 import '../workers/mass-message.worker';
-import '../workers/relay-fileid-backfill.worker'; // 🔴 核心修复：将回查Worker挂载到主进程
 
 async function drainStaleRelayJobs() {
   logger.info('[bootstrap] 正在清理过期的中转上传任务...');
@@ -79,6 +78,6 @@ export async function bootstrapWorker() {
   }, 5000);
 
   logger.info(
-    'Worker 已启动，队列：q_dispatch + q_relay_upload + q_catalog + q_mass_message + q_relay_fileid_backfill，任务调度已启用',
+    'Worker 已启动，队列：q_dispatch + q_relay_upload + q_catalog + q_mass_message，任务调度已启用',
   );
 }

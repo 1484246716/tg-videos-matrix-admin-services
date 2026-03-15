@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Query, Post, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { Permissions } from '../auth/permissions.decorator';
 import { PermissionsGuard } from '../auth/permissions.guard';
@@ -29,5 +29,17 @@ export class MediaLifecycleController {
   @Get(':id')
   getDetail(@Param('id') id: string) {
     return this.mediaLifecycleService.getDetail(id);
+  }
+
+  @Permissions('videos:update')
+  @Post(':id/retry-relay')
+  retryRelay(@Param('id') id: string) {
+    return this.mediaLifecycleService.retryRelay(id);
+  }
+
+  @Permissions('videos:update')
+  @Post('retry-relay')
+  retryRelayBatch(@Body('ids') ids: string[]) {
+    return this.mediaLifecycleService.retryRelayBatch(ids ?? []);
   }
 }
