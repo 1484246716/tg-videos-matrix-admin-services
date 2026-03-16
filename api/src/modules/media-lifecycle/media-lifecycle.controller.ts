@@ -13,12 +13,14 @@ export class MediaLifecycleController {
   @Get()
   list(
     @Query('channelId') channelId?: string,
+    @Query('telegramFileId') telegramFileId?: string,
     @Query('keyword') keyword?: string,
     @Query('stage') stage?: string,
     @Query('limit') limit?: string,
   ) {
     return this.mediaLifecycleService.list({
       channelId,
+      telegramFileId,
       keyword,
       stage,
       limit: limit ? Number(limit) : undefined,

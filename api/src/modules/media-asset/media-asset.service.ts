@@ -30,14 +30,23 @@ export class MediaAssetService {
   async list(params: {
     channelId?: string;
     status?: MediaStatus;
+    keyword?: string;
     limit?: number;
     userId?: string;
     role?: string;
   }) {
+    const keyword = (params.keyword || '').trim();
+
     const items = await this.prisma.mediaAsset.findMany({
       where: {
         channelId: params.channelId ? BigInt(params.channelId) : undefined,
         status: params.status,
+        originalName: keyword
+          ? {
+              contains: keyword,
+              mode: 'insensitive',
+            }
+          : undefined,
         channel:
           params.role === 'admin'
             ? undefined

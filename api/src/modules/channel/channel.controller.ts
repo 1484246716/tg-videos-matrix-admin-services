@@ -6,6 +6,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   Request,
   UseGuards,
 } from '@nestjs/common';
@@ -28,8 +29,15 @@ export class ChannelController {
 
   @Permissions('videos:view')
   @Get()
-  list(@Request() req: AuthRequest) {
-    return this.channelService.list(req.user.userId, req.user.role);
+  list(
+    @Request() req: AuthRequest,
+    @Query('status') status?: string,
+    @Query('keyword') keyword?: string,
+  ) {
+    return this.channelService.list(req.user.userId, req.user.role, {
+      status,
+      keyword,
+    });
   }
 
   @Permissions('videos:view')

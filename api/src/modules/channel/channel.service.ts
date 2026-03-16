@@ -17,6 +17,17 @@ import { UpdateChannelStatusDto } from './dto/update-channel-status.dto';
 export class ChannelService {
   constructor(private readonly prisma: PrismaService) { }
 
+  private parseSafeBigInt(value: string) {
+    const raw = value.trim();
+    if (!raw) return null;
+    if (!/^\d+$/.test(raw)) return null;
+    try {
+      return BigInt(raw);
+    } catch {
+      return null;
+    }
+  }
+
   private serializeBigInt<T>(value: T): T {
     return JSON.parse(
       JSON.stringify(value, (_key, v) =>
@@ -92,14 +103,37 @@ export class ChannelService {
     await rm(target, { recursive: true, force: true });
   }
 
-  async list(userId?: string, role?: string) {
+  async list(
+    userId?: string,
+    role?: string,
+    filters?: {
+      status?: string;
+      keyword?: string;
+    },
+  ) {
+    const where: Prisma.ChannelWhereInput =
+      role === 'admin'
+        ? {}
+        : {
+            createdBy: userId ? BigInt(userId) : undefined,
+          };
+
+    const status = (filters?.status || '').trim();
+    if (status && ['active', 'paused', 'archived'].includes(status)) {
+      where.status = status as any;
+    }
+
+    const keyword = (filters?.keyword || '').trim();
+    if (keyword) {
+      const idValue = this.parseSafeBigInt(keyword);
+      where.OR = [
+        { name: { contains: keyword, mode: 'insensitive' } },
+        ...(idValue ? [{ id: idValue }] : []),
+      ];
+    }
+
     const rows = await this.prisma.channel.findMany({
-      where:
-        role === 'admin'
-          ? undefined
-          : {
-              createdBy: userId ? BigInt(userId) : undefined,
-            },
+      where,
       orderBy: { createdAt: 'desc' },
       include: {
         defaultBot: {

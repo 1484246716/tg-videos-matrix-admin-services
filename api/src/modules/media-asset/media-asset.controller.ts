@@ -23,12 +23,14 @@ export class MediaAssetController {
   list(
     @Query('channelId') channelId?: string,
     @Query('status') status?: MediaStatus,
+    @Query('keyword') keyword?: string,
     @Query('limit') limit?: string,
     @Request() req?: AuthRequest,
   ) {
     return this.mediaAssetService.list({
       channelId,
       status,
+      keyword,
       limit: limit ? Number(limit) : undefined,
       userId: req?.user.userId,
       role: req?.user.role,

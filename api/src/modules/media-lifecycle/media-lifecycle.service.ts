@@ -25,12 +25,25 @@ const STAGE_FILTER_MAP: Record<string, { mediaStatus?: any; dispatchStatus?: any
 export class MediaLifecycleService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async list(params: { channelId?: string; keyword?: string; stage?: string; limit?: number }) {
+  async list(params: {
+    channelId?: string;
+    telegramFileId?: string;
+    keyword?: string;
+    stage?: string;
+    limit?: number;
+  }) {
     const stageFilter = params.stage ? STAGE_FILTER_MAP[params.stage] : undefined;
+    const tfid = (params.telegramFileId || '').trim();
 
     const mediaAssets = await this.prisma.mediaAsset.findMany({
       where: {
         channelId: params.channelId ? BigInt(params.channelId) : undefined,
+        telegramFileId: tfid
+          ? {
+              contains: tfid,
+              mode: 'insensitive',
+            }
+          : undefined,
         originalName: params.keyword ? { contains: params.keyword, mode: 'insensitive' } : undefined,
         status: stageFilter?.mediaStatus ? stageFilter.mediaStatus : undefined,
       },
