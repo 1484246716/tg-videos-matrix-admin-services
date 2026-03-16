@@ -16,6 +16,35 @@ import {
   RELAY_UPLOAD_GRAMJS_THRESHOLD_MB,
 } from '../config/env';
 
+const PROGRESS_TTL_SECONDS = 24 * 60 * 60;
+const PROGRESS_WRITE_INTERVAL_MS = 5000;
+
+function buildProgressKey(mediaAssetId: string) {
+  return `media:progress:${mediaAssetId}`;
+}
+
+async function writeProgress(params: {
+  mediaAssetId: string;
+  streamedBytes: number;
+  totalBytes?: number;
+  progress: number;
+}) {
+  const payload = {
+    mediaAssetId: params.mediaAssetId,
+    streamedBytes: params.streamedBytes,
+    totalBytes: params.totalBytes ?? null,
+    progress: Number(params.progress.toFixed(2)),
+    updatedAt: new Date().toISOString(),
+  };
+
+  await connection.set(
+    buildProgressKey(params.mediaAssetId),
+    JSON.stringify(payload),
+    'EX',
+    PROGRESS_TTL_SECONDS,
+  );
+}
+
 export const relayUploadWorker = new Worker(
   'q_relay_upload',
   async (job) => {
@@ -47,6 +76,20 @@ export const relayUploadWorker = new Worker(
 
     if (!mediaAsset) {
       throw new Error(`未找到媒体资源: ${mediaAssetIdRaw}`);
+    }
+
+    if (mediaAsset.status === MediaStatus.relay_uploaded) {
+      logger.info('[q_relay_upload] 任务已完成，跳过重复执行', {
+        traceId,
+        stage: 'skip_already_uploaded',
+        mediaAssetId: mediaAssetIdRaw,
+      });
+      return {
+        ok: true,
+        skipped: true,
+        reason: 'already_uploaded',
+        mediaAssetId: mediaAssetIdRaw,
+      };
     }
 
     const relayChannel = await prisma.relayChannel.findUnique({
@@ -102,6 +145,7 @@ export const relayUploadWorker = new Worker(
       });
 
       const uploadStart = Date.now();
+      let lastProgressWriteAt = 0;
 
       let gramjsMessageId: number;
       try {
@@ -112,13 +156,25 @@ export const relayUploadWorker = new Worker(
           chatId: relayChannel.tgChatId.toString(),
           workers: GRAMJS_UPLOAD_WORKERS,
           progressCallback: (progress) => {
+            const percent = Number((progress * 100).toFixed(2));
             logger.info('[q_relay_upload] GramJS 上传进度', {
               traceId,
               stage: 'gramjs_progress',
               mediaAssetId: mediaAssetIdRaw,
               relayChannelId: relayChannelIdRaw,
-              progress: Number((progress * 100).toFixed(2)),
+              progress: percent,
             });
+
+            const now = Date.now();
+            if (now - lastProgressWriteAt >= PROGRESS_WRITE_INTERVAL_MS) {
+              void writeProgress({
+                mediaAssetId: mediaAssetIdRaw,
+                streamedBytes: fileSize ? Math.floor((fileSize * percent) / 100) : 0,
+                totalBytes: fileSize,
+                progress: percent,
+              });
+              lastProgressWriteAt = now;
+            }
           },
         });
 
@@ -208,6 +264,13 @@ export const relayUploadWorker = new Worker(
         },
       });
 
+      await writeProgress({
+        mediaAssetId: mediaAssetIdRaw,
+        streamedBytes: fileSize ?? 0,
+        totalBytes: fileSize,
+        progress: 100,
+      });
+
       return {
         ok: true,
         direct: true,
@@ -216,6 +279,13 @@ export const relayUploadWorker = new Worker(
         messageId: gramjsMessageId,
       };
     }
+
+    await writeProgress({
+      mediaAssetId: mediaAssetIdRaw,
+      streamedBytes: 0,
+      totalBytes: fileSize,
+      progress: 0,
+    });
 
     const formData = new FormData();
     formData.append('chat_id', relayChannel.tgChatId.toString());
@@ -228,6 +298,7 @@ export const relayUploadWorker = new Worker(
     const streamWithProgress = new PassThrough();
     let streamedBytes = 0;
     let lastProgressAt = Date.now();
+    let lastProgressWriteAt = 0;
 
     fileStream.on('data', (chunk) => {
       streamedBytes += chunk.length;
@@ -242,6 +313,17 @@ export const relayUploadWorker = new Worker(
           fileSize,
         });
         lastProgressAt = now;
+      }
+
+      if (now - lastProgressWriteAt >= PROGRESS_WRITE_INTERVAL_MS) {
+        const progress = fileSize ? (streamedBytes / fileSize) * 100 : 0;
+        void writeProgress({
+          mediaAssetId: mediaAssetIdRaw,
+          streamedBytes,
+          totalBytes: fileSize,
+          progress,
+        });
+        lastProgressWriteAt = now;
       }
     });
 
@@ -372,6 +454,13 @@ export const relayUploadWorker = new Worker(
 
     clearInterval(progressTicker);
 
+    await writeProgress({
+      mediaAssetId: mediaAssetIdRaw,
+      streamedBytes,
+      totalBytes: fileSize,
+      progress: fileSize ? (streamedBytes / fileSize) * 100 : 100,
+    });
+
     logger.info('[q_relay_upload] 上传请求耗时', {
       traceId,
       stage: 'send_request',
@@ -420,6 +509,13 @@ export const relayUploadWorker = new Worker(
         },
       });
 
+      await writeProgress({
+        mediaAssetId: mediaAssetIdRaw,
+        streamedBytes: fileSize ?? streamedBytes,
+        totalBytes: fileSize,
+        progress: 100,
+      });
+
       return {
         ok: true,
         direct: true,
@@ -456,7 +552,21 @@ relayUploadWorker.on('completed', (job) => {
 
 relayUploadWorker.on('failed', async (job, err) => {
   const mediaAssetIdRaw = job?.data?.mediaAssetId as string | undefined;
-  if (mediaAssetIdRaw) {
+  let shouldMarkFailed = true;
+
+  if (mediaAssetIdRaw && err instanceof Error) {
+    if (err.message.includes('ENOENT')) {
+      const asset = await prisma.mediaAsset.findUnique({
+        where: { id: BigInt(mediaAssetIdRaw) },
+        select: { status: true },
+      });
+      if (asset?.status === MediaStatus.relay_uploaded) {
+        shouldMarkFailed = false;
+      }
+    }
+  }
+
+  if (mediaAssetIdRaw && shouldMarkFailed) {
     await prisma.mediaAsset.update({
       where: { id: BigInt(mediaAssetIdRaw) },
       data: {

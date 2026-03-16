@@ -10,7 +10,7 @@ export const telegramApiBase =
 export const SCHEDULER_POLL_MS = 5000;
 export const MAX_SCHEDULE_BATCH = 100;
 export const TASK_DEFINITION_LOCK_TTL_MS = Number(
-  process.env.TASK_DEFINITION_LOCK_TTL_MS || '120000',
+  process.env.TASK_DEFINITION_LOCK_TTL_MS || '15000',
 );
 export const TASK_DEFINITION_ERROR_RETRY_SEC = Number(
   process.env.TASK_DEFINITION_ERROR_RETRY_SEC || '300',

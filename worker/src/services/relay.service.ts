@@ -2,7 +2,7 @@ import { stat } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { MediaStatus } from '@prisma/client';
 import { prisma, getTaskDefinitionModel } from '../infra/prisma';
-import { hashFile, scanChannelVideos } from '../shared/file-utils';
+import { hashFile, scanChannelVideos, waitForFileStable } from '../shared/file-utils';
 import { logger } from '../logger';
 
 export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
@@ -56,6 +56,16 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
 
     for (const filePath of files) {
       scannedFiles += 1;
+
+      try {
+        await waitForFileStable(filePath);
+      } catch (error) {
+        logger.warn('[relay] 文件未稳定或不可用，跳过', {
+          filePath,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
 
       const s = await stat(filePath);
       const hashStart = Date.now();

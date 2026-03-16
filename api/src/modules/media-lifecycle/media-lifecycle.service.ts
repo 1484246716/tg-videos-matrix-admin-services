@@ -1,5 +1,15 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import IORedis from 'ioredis';
 import { PrismaService } from '../prisma/prisma.service';
+
+let mediaLifecycleRedis: IORedis | null = null;
+
+function getMediaLifecycleRedis() {
+  if (mediaLifecycleRedis) return mediaLifecycleRedis;
+  const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+  mediaLifecycleRedis = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+  return mediaLifecycleRedis;
+}
 
 const STAGE_FILTER_MAP: Record<string, { mediaStatus?: any; dispatchStatus?: any; catalogStatus?: any }> = {
   scanned: { mediaStatus: 'ready' },
@@ -89,6 +99,25 @@ export class MediaLifecycleService {
           : null,
       };
     });
+  }
+
+  async getProgress(ids: string[]) {
+    if (!ids.length) return {};
+    const redis = getMediaLifecycleRedis();
+    const keys = ids.map((id) => `media:progress:${id}`);
+    const values = await redis.mget(...keys);
+    const result: Record<string, any> = {};
+
+    values.forEach((value, index) => {
+      if (!value) return;
+      try {
+        result[ids[index]] = JSON.parse(value);
+      } catch {
+        // ignore malformed entries
+      }
+    });
+
+    return result;
   }
 
   async getDetail(id: string) {

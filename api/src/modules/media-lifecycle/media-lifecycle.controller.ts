@@ -26,6 +26,13 @@ export class MediaLifecycleController {
   }
 
   @Permissions('videos:view')
+  @Get('progress')
+  getProgress(@Query('ids') ids?: string) {
+    const list = ids ? ids.split(',').map((id) => id.trim()).filter(Boolean) : [];
+    return this.mediaLifecycleService.getProgress(list);
+  }
+
+  @Permissions('videos:view')
   @Get(':id')
   getDetail(@Param('id') id: string) {
     return this.mediaLifecycleService.getDetail(id);
