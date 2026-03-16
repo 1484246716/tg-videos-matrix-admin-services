@@ -74,7 +74,8 @@ export type TelegramRequestMethod =
   | 'editMessageText'
   | 'forwardMessage'
   | 'deleteMessage'
-  | 'getUpdates';
+  | 'getUpdates'
+  | 'getChat';
 
 export type TelegramRequestArgs = {
   botToken: string;

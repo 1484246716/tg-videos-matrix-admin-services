@@ -7,8 +7,14 @@ import { connection } from '../infra/redis';
 import { prisma } from '../infra/prisma';
 import { logger, logError } from '../logger';
 import { moveToArchive, waitForFileStable } from '../shared/file-utils';
+import { sendViaGramjs } from '../shared/gramjs/upload';
 import { getTelegramUpdates, sendTelegramRequest } from '../shared/telegram';
 import { MediaStatus } from '@prisma/client';
+import {
+  GRAMJS_FORWARD_TARGET_CHAT_ID,
+  GRAMJS_UPLOAD_WORKERS,
+  RELAY_UPLOAD_GRAMJS_THRESHOLD_MB,
+} from '../config/env';
 
 export const relayUploadWorker = new Worker(
   'q_relay_upload',
@@ -80,15 +86,145 @@ export const relayUploadWorker = new Worker(
       });
     }
 
+    const fileName = basename(mediaAsset.localPath);
+    const fileSize = mediaAsset.fileSize ? Number(mediaAsset.fileSize) : undefined;
+    const gramjsThresholdBytes = RELAY_UPLOAD_GRAMJS_THRESHOLD_MB * 1024 * 1024;
+    const useGramjs = fileSize !== undefined && fileSize >= gramjsThresholdBytes;
+
+    if (useGramjs) {
+      logger.info('[q_relay_upload] 使用 GramJS 上传大文件', {
+        traceId,
+        stage: 'start',
+        mediaAssetId: mediaAssetIdRaw,
+        relayChannelId: relayChannelIdRaw,
+        uploadMethod: 'gramjs',
+        fileSize,
+      });
+
+      const uploadStart = Date.now();
+
+      let gramjsMessageId: number;
+      try {
+        const gramjsResult = await sendViaGramjs({
+          filePath: mediaAsset.localPath,
+          fileName,
+          caption: mediaAsset.originalName,
+          chatId: relayChannel.tgChatId.toString(),
+          workers: GRAMJS_UPLOAD_WORKERS,
+          progressCallback: (progress) => {
+            logger.info('[q_relay_upload] GramJS 上传进度', {
+              traceId,
+              stage: 'gramjs_progress',
+              mediaAssetId: mediaAssetIdRaw,
+              relayChannelId: relayChannelIdRaw,
+              progress: Number((progress * 100).toFixed(2)),
+            });
+          },
+        });
+
+        gramjsMessageId = gramjsResult.messageId;
+      } catch (err) {
+        logError('[q_relay_upload] GramJS 上传失败', err);
+        throw err instanceof Error ? err : new Error('GramJS 上传失败');
+      }
+
+      logger.info('[q_relay_upload] 上传请求耗时', {
+        traceId,
+        stage: 'send_request',
+        mediaAssetId: mediaAssetIdRaw,
+        relayChannelId: relayChannelIdRaw,
+        durationMs: Date.now() - uploadStart,
+      });
+
+      const forwardTargetChatId =
+        GRAMJS_FORWARD_TARGET_CHAT_ID || relayChannel.tgChatId.toString();
+
+      let forwardResult;
+      try {
+        forwardResult = await sendTelegramRequest({
+          botToken: relayChannel.bot.tokenEncrypted,
+          method: 'forwardMessage',
+          payload: {
+            chat_id: forwardTargetChatId,
+            from_chat_id: relayChannel.tgChatId.toString(),
+            message_id: gramjsMessageId,
+            disable_notification: true,
+          },
+        });
+      } catch (forwardErr) {
+        logError('[q_relay_upload] forwardMessage 失败', forwardErr);
+        throw forwardErr instanceof Error ? forwardErr : new Error('forwardMessage 失败');
+      }
+
+      const forwardFileId =
+        forwardResult.videoFileId ??
+        forwardResult.documentFileId ??
+        forwardResult.animationFileId;
+      const forwardFileUniqueId =
+        forwardResult.videoFileUniqueId ??
+        forwardResult.documentFileUniqueId ??
+        forwardResult.animationFileUniqueId ??
+        null;
+
+      if (!forwardFileId) {
+        await prisma.mediaAsset.update({
+          where: { id: mediaAssetId },
+          data: {
+            status: MediaStatus.failed,
+            relayMessageId: BigInt(gramjsMessageId),
+            ingestError: 'GramJS 上传成功但 forwardMessage 未返回 file_id',
+          },
+        });
+
+        throw new Error('GramJS 上传成功但 forwardMessage 未返回 file_id');
+      }
+
+      const archiveStart = Date.now();
+      let archivePath: string | null = null;
+      try {
+        archivePath = await moveToArchive(mediaAsset.localPath);
+      } catch (moveErr) {
+        logError('[q_relay_upload] 归档文件失败', moveErr);
+      }
+      const archiveDurationMs = Date.now() - archiveStart;
+      if (archiveDurationMs > 500) {
+        logger.info('[q_relay_upload] 归档耗时', {
+          traceId,
+          stage: 'archive',
+          mediaAssetId: mediaAssetIdRaw,
+          durationMs: archiveDurationMs,
+        });
+      }
+
+      await prisma.mediaAsset.update({
+        where: { id: mediaAssetId },
+        data: {
+          status: MediaStatus.relay_uploaded,
+          relayMessageId: BigInt(gramjsMessageId),
+          telegramFileId: forwardFileId,
+          telegramFileUniqueId: forwardFileUniqueId,
+          ingestError: null,
+          ...(archivePath ? { archivePath, localPath: archivePath } : {}),
+        },
+      });
+
+      return {
+        ok: true,
+        direct: true,
+        mediaAssetId: mediaAssetIdRaw,
+        relayChannelId: relayChannelIdRaw,
+        messageId: gramjsMessageId,
+      };
+    }
+
     const formData = new FormData();
     formData.append('chat_id', relayChannel.tgChatId.toString());
     formData.append('caption', mediaAsset.originalName);
 
-    const useDocument = mediaAsset.fileSize && mediaAsset.fileSize >= BigInt(900 * 1024 * 1024);
+    const useDocument =
+      mediaAsset.fileSize && mediaAsset.fileSize >= BigInt(900 * 1024 * 1024);
     const streamStart = Date.now();
     const fileStream = createReadStream(mediaAsset.localPath);
-    const fileName = basename(mediaAsset.localPath);
-    const fileSize = mediaAsset.fileSize ? Number(mediaAsset.fileSize) : undefined;
     const streamWithProgress = new PassThrough();
     let streamedBytes = 0;
     let lastProgressAt = Date.now();
@@ -161,10 +297,10 @@ export const relayUploadWorker = new Worker(
     let sendResult;
     try {
       sendResult = await sendTelegramRequest({
-      botToken: relayChannel.bot.tokenEncrypted,
-      method: useDocument ? 'sendDocument' : 'sendVideo',
-      payload: formData,
-    });
+        botToken: relayChannel.bot.tokenEncrypted,
+        method: useDocument ? 'sendDocument' : 'sendVideo',
+        payload: formData,
+      });
     } catch (err: any) {
       clearInterval(progressTicker);
       logger.info('[q_relay_upload] 上传请求耗时', {
@@ -261,8 +397,15 @@ export const relayUploadWorker = new Worker(
       });
     }
 
-    const directFileId = sendResult.videoFileId ?? sendResult.documentFileId ?? sendResult.animationFileId;
-    const directFileUniqueId = sendResult.videoFileUniqueId ?? sendResult.documentFileUniqueId ?? sendResult.animationFileUniqueId ?? null;
+    const directFileId =
+      sendResult.videoFileId ??
+      sendResult.documentFileId ??
+      sendResult.animationFileId;
+    const directFileUniqueId =
+      sendResult.videoFileUniqueId ??
+      sendResult.documentFileUniqueId ??
+      sendResult.animationFileUniqueId ??
+      null;
 
     if (directFileId) {
       await prisma.mediaAsset.update({

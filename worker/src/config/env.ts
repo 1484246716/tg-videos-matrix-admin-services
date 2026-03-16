@@ -16,6 +16,19 @@ export const TASK_DEFINITION_ERROR_RETRY_SEC = Number(
   process.env.TASK_DEFINITION_ERROR_RETRY_SEC || '300',
 );
 
+export const GRAMJS_API_ID = Number(process.env.GRAMJS_API_ID || '0');
+export const GRAMJS_API_HASH = process.env.GRAMJS_API_HASH || '';
+export const GRAMJS_BOT_TOKEN = process.env.GRAMJS_BOT_TOKEN || '';
+export const GRAMJS_SESSION = process.env.GRAMJS_SESSION || '';
+export const GRAMJS_FORWARD_TARGET_CHAT_ID =
+  process.env.GRAMJS_FORWARD_TARGET_CHAT_ID || '';
+export const GRAMJS_UPLOAD_WORKERS = Number(
+  process.env.GRAMJS_UPLOAD_WORKERS || '16',
+);
+export const RELAY_UPLOAD_GRAMJS_THRESHOLD_MB = Number(
+  process.env.RELAY_UPLOAD_GRAMJS_THRESHOLD_MB || '1024',
+);
+
 export const RELAY_MIN_STABLE_CHECKS = Number(
   process.env.RELAY_MIN_STABLE_CHECKS || '3',
 );

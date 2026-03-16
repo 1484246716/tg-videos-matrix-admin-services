@@ -183,6 +183,8 @@ export class MediaLifecycleService {
       data: {
         status: 'ready',
         ingestError: null,
+        relayMessageId: null,
+        telegramFileId: null,
         updatedAt: new Date(),
       },
     });
@@ -217,6 +219,8 @@ export class MediaLifecycleService {
         data: {
           status: 'ready',
           ingestError: null,
+          relayMessageId: null,
+          telegramFileId: null,
           updatedAt: new Date(),
         },
       });
