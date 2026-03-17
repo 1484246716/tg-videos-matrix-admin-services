@@ -22,43 +22,43 @@ import { PublishCatalogDto } from './dto/publish-catalog.dto';
 export class CatalogController {
   constructor(private readonly catalogService: CatalogService) {}
 
-  @Permissions('tasks:view')
+  @Permissions("tasks:view")
   @Get('templates')
   listTemplates() {
     return this.catalogService.listTemplates();
   }
 
-  @Permissions('tasks:view')
+  @Permissions("tasks:view")
   @Get('templates/:id')
   getTemplate(@Param('id') id: string) {
     return this.catalogService.getTemplate(id);
   }
 
-  @Permissions('tasks:create')
+  @Permissions("tasks:create")
   @Post('templates')
   createTemplate(@Body() dto: CreateCatalogTemplateDto) {
     return this.catalogService.createTemplate(dto);
   }
 
-  @Permissions('tasks:update')
+  @Permissions("tasks:update")
   @Patch('templates/:id')
   updateTemplate(@Param('id') id: string, @Body() dto: UpdateCatalogTemplateDto) {
     return this.catalogService.updateTemplate(id, dto);
   }
 
-  @Permissions('tasks:delete')
+  @Permissions("tasks:delete")
   @Delete('templates/:id')
   deleteTemplate(@Param('id') id: string) {
     return this.catalogService.deleteTemplate(id);
   }
 
-  @Permissions('tasks:view')
+  @Permissions("tasks:view")
   @Post('render-preview')
   renderPreview(@Body() dto: RenderCatalogPreviewDto) {
     return this.catalogService.renderPreview(dto);
   }
 
-  @Permissions('tasks:create')
+  @Permissions("tasks:create")
   @Post('publish')
   publish(@Body() dto: PublishCatalogDto) {
     return this.catalogService.publish(dto);

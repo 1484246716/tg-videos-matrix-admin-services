@@ -27,7 +27,7 @@ interface AuthRequest {
 export class ChannelController {
   constructor(private readonly channelService: ChannelService) {}
 
-  @Permissions('videos:view')
+  @Permissions('channels:view')
   @Get()
   list(
     @Request() req: AuthRequest,
@@ -40,19 +40,19 @@ export class ChannelController {
     });
   }
 
-  @Permissions('videos:view')
+  @Permissions('channels:view')
   @Get(':id')
   getOne(@Param('id') id: string, @Request() req: AuthRequest) {
     return this.channelService.getOne(id, req.user.userId, req.user.role);
   }
 
-  @Permissions('videos:update')
+  @Permissions('channels:update')
   @Post()
   create(@Body() dto: CreateChannelDto, @Request() req: AuthRequest) {
     return this.channelService.create(dto, req.user.userId, req.user.role);
   }
 
-  @Permissions('videos:update')
+  @Permissions('channels:update')
   @Patch('batch')
   batchUpdate(
     @Body()
@@ -75,7 +75,7 @@ export class ChannelController {
     return this.channelService.batchUpdate(body.ids, body.data, req.user.userId, req.user.role);
   }
 
-  @Permissions('videos:update')
+  @Permissions('channels:update')
   @Patch(':id')
   update(
     @Param('id') id: string,
@@ -85,7 +85,7 @@ export class ChannelController {
     return this.channelService.update(id, dto, req.user.userId, req.user.role);
   }
 
-  @Permissions('videos:update')
+  @Permissions('channels:update')
   @Patch(':id/status')
   updateStatus(
     @Param('id') id: string,
@@ -95,7 +95,7 @@ export class ChannelController {
     return this.channelService.updateStatus(id, dto, req.user.userId, req.user.role);
   }
 
-  @Permissions('videos:delete')
+  @Permissions('channels:delete')
   @Delete(':id')
   remove(@Param('id') id: string, @Request() req: AuthRequest) {
     return this.channelService.remove(id, req.user.userId, req.user.role);

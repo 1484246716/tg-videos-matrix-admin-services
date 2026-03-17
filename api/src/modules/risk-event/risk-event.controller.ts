@@ -10,7 +10,7 @@ import { RiskEventService } from './risk-event.service';
 export class RiskEventController {
   constructor(private readonly riskEventService: RiskEventService) {}
 
-  @Permissions('tasks:view')
+  @Permissions('risk-events:view')
   @Get()
   list(
     @Query('eventType') eventType?: string,

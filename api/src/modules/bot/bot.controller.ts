@@ -11,25 +11,25 @@ import { UpdateBotDto } from './dto/update-bot.dto';
 export class BotController {
   constructor(private readonly botService: BotService) {}
 
-  @Permissions('tasks:view')
+  @Permissions('bots:view')
   @Get()
   list() {
     return this.botService.list();
   }
 
-  @Permissions('tasks:create')
+  @Permissions('bots:create')
   @Post()
   create(@Body() dto: CreateBotDto) {
     return this.botService.create(dto);
   }
 
-  @Permissions('tasks:update')
+  @Permissions('bots:update')
   @Patch(':id')
   update(@Param('id') id: string, @Body() dto: UpdateBotDto) {
     return this.botService.update(id, dto);
   }
 
-  @Permissions('tasks:delete')
+  @Permissions('bots:delete')
   @Delete(':id')
   remove(@Param('id') id: string) {
     return this.botService.remove(id);

@@ -20,31 +20,31 @@ import { UpdateRelayChannelDto } from './dto/update-relay-channel.dto';
 export class RelayChannelController {
   constructor(private readonly relayChannelService: RelayChannelService) {}
 
-  @Permissions('videos:view')
+  @Permissions('relay-channels:view')
   @Get()
   list() {
     return this.relayChannelService.list();
   }
 
-  @Permissions('videos:view')
+  @Permissions('relay-channels:view')
   @Get(':id')
   getOne(@Param('id') id: string) {
     return this.relayChannelService.getOne(id);
   }
 
-  @Permissions('videos:update')
+  @Permissions('relay-channels:update')
   @Post()
   create(@Body() dto: CreateRelayChannelDto) {
     return this.relayChannelService.create(dto);
   }
 
-  @Permissions('videos:update')
+  @Permissions('relay-channels:update')
   @Patch(':id')
   update(@Param('id') id: string, @Body() dto: UpdateRelayChannelDto) {
     return this.relayChannelService.update(id, dto);
   }
 
-  @Permissions('videos:delete')
+  @Permissions('relay-channels:delete')
   @Delete(':id')
   remove(@Param('id') id: string) {
     return this.relayChannelService.remove(id);

@@ -26,7 +26,7 @@ interface AuthRequest {
 export class MessageTemplateController {
   constructor(private readonly service: MessageTemplateService) {}
 
-  @Permissions('tasks:view')
+  @Permissions('mass-messaging:view')
   @Get()
   list(
     @Query('isActive') isActive?: string,
@@ -41,19 +41,19 @@ export class MessageTemplateController {
     });
   }
 
-  @Permissions('tasks:view')
+  @Permissions('mass-messaging:view')
   @Get(':id')
   getOne(@Param('id') id: string, @Request() req?: AuthRequest) {
     return this.service.getOne(id, req?.user.userId, req?.user.role);
   }
 
-  @Permissions('tasks:create')
+  @Permissions('mass-messaging:create')
   @Post()
   create(@Body() dto: CreateMessageTemplateDto, @Request() req?: AuthRequest) {
     return this.service.create(dto, req?.user.userId, req?.user.role);
   }
 
-  @Permissions('tasks:update')
+  @Permissions('mass-messaging:update')
   @Patch(':id')
   update(
     @Param('id') id: string,
@@ -63,7 +63,7 @@ export class MessageTemplateController {
     return this.service.update(id, dto, req?.user.userId, req?.user.role);
   }
 
-  @Permissions('tasks:delete')
+  @Permissions('mass-messaging:delete')
   @Delete(':id')
   remove(@Param('id') id: string, @Request() req?: AuthRequest) {
     return this.service.remove(id, req?.user.userId, req?.user.role);

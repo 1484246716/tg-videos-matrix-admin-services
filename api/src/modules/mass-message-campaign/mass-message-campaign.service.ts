@@ -90,6 +90,10 @@ export class MassMessageCampaignService {
       throw new BadRequestException('templateId or contentOverride is required');
     }
 
+    if (dto.scheduleType === 'recurring' && !dto.scheduledAt) {
+      throw new BadRequestException('scheduledAt is required for recurring');
+    }
+
     const now = new Date();
     const timezone = dto.timezone ?? 'Asia/Shanghai';
 
@@ -97,15 +101,17 @@ export class MassMessageCampaignService {
     const scheduledAt =
       dto.scheduleType === 'scheduled'
         ? parseIsoDateOrThrow(dto.scheduledAt!, 'scheduledAt')
-        : null;
+        : dto.scheduledAt
+          ? parseIsoDateOrThrow(dto.scheduledAt, 'scheduledAt')
+          : null;
 
     const firstRunAt =
       scheduleType === 'immediate'
         ? now
         : scheduleType === 'scheduled'
           ? scheduledAt!
-          : // recurring: first run immediately unless scheduledAt is provided in future revisions
-            now;
+          : // recurring: use scheduledAt if provided, otherwise run immediately
+            scheduledAt ?? now;
 
     const retryCount = dto.retryCount ?? 3;
     const retryIntervalSec = dto.retryIntervalSec ?? 30;
@@ -149,23 +155,25 @@ export class MassMessageCampaignService {
       },
     });
 
-    // Immediately enqueue items so UI "测试发送" can trigger sending without relying on DB polling.
-    // Worker will still update statuses and handle retries.
-    try {
-      const queue = getMassMessageQueue();
-      for (const item of created.items ?? []) {
-        await queue.add(
-          'mass-message-send',
-          { itemId: item.id.toString() },
-          {
-            jobId: `mass-message-item-${item.id.toString()}`,
-            removeOnComplete: true,
-            removeOnFail: 200,
-          },
-        );
+    if (scheduleType === 'immediate') {
+      // Immediately enqueue items so UI "测试发送" can trigger sending without relying on DB polling.
+      // Worker will still update statuses and handle retries.
+      try {
+        const queue = getMassMessageQueue();
+        for (const item of created.items ?? []) {
+          await queue.add(
+            'mass-message-send',
+            { itemId: item.id.toString() },
+            {
+              jobId: `mass-message-item-${item.id.toString()}`,
+              removeOnComplete: true,
+              removeOnFail: 200,
+            },
+          );
+        }
+      } catch {
+        // If enqueue fails, scheduler can still pick it up later. Do not fail the API call.
       }
-    } catch {
-      // If enqueue fails, scheduler can still pick it up later. Do not fail the API call.
     }
 
     return this.serializeBigInt(created);

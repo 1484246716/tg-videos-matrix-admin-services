@@ -23,7 +23,7 @@ interface AuthRequest {
 export class MassMessageCampaignController {
   constructor(private readonly service: MassMessageCampaignService) {}
 
-  @Permissions('tasks:view')
+  @Permissions('mass-messaging:view')
   @Get()
   list(
     @Query('status') status?: string,
@@ -38,13 +38,13 @@ export class MassMessageCampaignController {
     });
   }
 
-  @Permissions('tasks:view')
+  @Permissions('mass-messaging:view')
   @Get(':id')
   getOne(@Param('id') id: string, @Request() req?: AuthRequest) {
     return this.service.getOne(id, req?.user.userId, req?.user.role);
   }
 
-  @Permissions('tasks:create')
+  @Permissions('mass-messaging:create')
   @Post()
   create(@Body() dto: CreateMassMessageCampaignDto, @Request() req?: AuthRequest) {
     return this.service.create(dto, req?.user.userId, req?.user.role);

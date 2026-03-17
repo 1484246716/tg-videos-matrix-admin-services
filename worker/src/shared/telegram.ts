@@ -67,6 +67,7 @@ export type TelegramUpdate = {
 
 export type TelegramRequestMethod =
     | 'sendVideo'
+    | 'sendPhoto'
     | 'sendDocument'
     | 'sendMessage'
     | 'pinChatMessage'
@@ -256,12 +257,42 @@ export async function sendVideoByTelegram(args: {
   };
 }
 
+export async function sendPhotoByTelegram(args: {
+  botToken: string;
+  chatId: string;
+  fileId: string;
+  caption?: string | null;
+  parseMode?: string | null;
+  replyMarkup?: unknown;
+}): Promise<TelegramSendResult> {
+  const payload: Record<string, unknown> = {
+    chat_id: args.chatId,
+    photo: args.fileId,
+  };
+
+  if (args.caption) payload.caption = args.caption;
+  if (args.parseMode) payload.parse_mode = args.parseMode;
+  if (args.replyMarkup) payload.reply_markup = args.replyMarkup;
+
+  const result = await sendTelegramRequest({
+    botToken: args.botToken,
+    method: 'sendPhoto',
+    payload,
+  });
+
+  return {
+    messageId: result.messageId!,
+    messageLink: result.messageId ? toTelegramMessageLink(args.chatId, result.messageId) : null,
+  };
+}
+
 export async function sendTextByTelegram(args: {
   botToken: string;
   chatId: string;
   text: string;
   parseMode?: string;
   replyMarkup?: unknown;
+  disableWebPagePreview?: boolean;
 }): Promise<TelegramSendResult> {
   const result = await sendTelegramRequest({
     botToken: args.botToken,
@@ -270,7 +301,7 @@ export async function sendTextByTelegram(args: {
       chat_id: args.chatId,
       text: args.text,
       parse_mode: args.parseMode ?? 'HTML',
-      disable_web_page_preview: true,
+      disable_web_page_preview: args.disableWebPagePreview ?? true,
       ...(args.replyMarkup ? { reply_markup: args.replyMarkup } : {}),
     },
   });

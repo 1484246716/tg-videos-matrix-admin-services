@@ -18,7 +18,7 @@ interface AuthRequest {
 export class MediaAssetController {
   constructor(private readonly mediaAssetService: MediaAssetService) {}
 
-  @Permissions('videos:view')
+  @Permissions('media:view')
   @Get()
   list(
     @Query('channelId') channelId?: string,
@@ -37,25 +37,25 @@ export class MediaAssetController {
     });
   }
 
-  @Permissions('videos:upload')
+  @Permissions('media:upload')
   @Post()
   create(@Body() dto: CreateMediaAssetDto) {
     return this.mediaAssetService.create(dto);
   }
 
-  @Permissions('videos:update')
+  @Permissions('media:update')
   @Patch(':id/status')
   updateStatus(@Param('id') id: string, @Body() dto: UpdateMediaAssetStatusDto) {
     return this.mediaAssetService.updateStatus(id, dto);
   }
 
-  @Permissions('videos:update')
+  @Permissions('media:update')
   @Patch(':id/relay-uploaded')
   markRelayUploaded(@Param('id') id: string, @Body() dto: MarkRelayUploadedDto) {
     return this.mediaAssetService.markRelayUploaded(id, dto);
   }
 
-  @Permissions('videos:upload')
+  @Permissions('media:upload')
   @Post('relay-upload/batch-enqueue')
   batchEnqueueRelayUpload(@Body() dto: BatchEnqueueRelayUploadDto) {
     return this.mediaAssetService.batchEnqueueRelayUpload(dto);

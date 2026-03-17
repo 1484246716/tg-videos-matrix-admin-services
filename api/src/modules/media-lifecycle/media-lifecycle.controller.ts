@@ -9,7 +9,7 @@ import { MediaLifecycleService } from './media-lifecycle.service';
 export class MediaLifecycleController {
   constructor(private readonly mediaLifecycleService: MediaLifecycleService) {}
 
-  @Permissions('videos:view')
+  @Permissions('media-lifecycle:view')
   @Get()
   list(
     @Query('channelId') channelId?: string,
@@ -27,26 +27,26 @@ export class MediaLifecycleController {
     });
   }
 
-  @Permissions('videos:view')
+  @Permissions('media-lifecycle:view')
   @Get('progress')
   getProgress(@Query('ids') ids?: string) {
     const list = ids ? ids.split(',').map((id) => id.trim()).filter(Boolean) : [];
     return this.mediaLifecycleService.getProgress(list);
   }
 
-  @Permissions('videos:view')
+  @Permissions('media-lifecycle:view')
   @Get(':id')
   getDetail(@Param('id') id: string) {
     return this.mediaLifecycleService.getDetail(id);
   }
 
-  @Permissions('videos:update')
+  @Permissions('media-lifecycle:update')
   @Post(':id/retry-relay')
   retryRelay(@Param('id') id: string) {
     return this.mediaLifecycleService.retryRelay(id);
   }
 
-  @Permissions('videos:update')
+  @Permissions('media-lifecycle:update')
   @Post('retry-relay')
   retryRelayBatch(@Body('ids') ids: string[]) {
     return this.mediaLifecycleService.retryRelayBatch(ids ?? []);

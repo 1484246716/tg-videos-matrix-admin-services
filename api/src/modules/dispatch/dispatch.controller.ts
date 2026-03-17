@@ -12,7 +12,7 @@ import { UpdateDispatchTaskStatusDto } from './dto/update-dispatch-task-status.d
 export class DispatchController {
   constructor(private readonly dispatchService: DispatchService) {}
 
-  @Permissions('tasks:view')
+  @Permissions("tasks:view")
   @Get()
   list(
     @Query('channelId') channelId?: string,
@@ -26,13 +26,13 @@ export class DispatchController {
     });
   }
 
-  @Permissions('tasks:create')
+  @Permissions("tasks:create")
   @Post()
   create(@Body() dto: CreateDispatchTaskDto) {
     return this.dispatchService.create(dto);
   }
 
-  @Permissions('tasks:update')
+  @Permissions("tasks:update")
   @Patch(':id/status')
   updateStatus(
     @Param('id') id: string,
@@ -41,7 +41,7 @@ export class DispatchController {
     return this.dispatchService.updateStatus(id, dto);
   }
 
-  @Permissions('tasks:view')
+  @Permissions("tasks:view")
   @Get(':id/logs')
   logs(@Param('id') id: string, @Query('limit') limit?: string) {
     return this.dispatchService.listLogs(id, limit ? Number(limit) : undefined);

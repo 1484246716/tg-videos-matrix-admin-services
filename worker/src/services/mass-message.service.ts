@@ -4,7 +4,9 @@ import { logger } from '../logger';
 import type { TelegramError } from '../shared/telegram';
 import {
   pinMessageByTelegram,
+  sendPhotoByTelegram,
   sendTextByTelegram,
+  sendVideoByTelegram,
   unpinMessageByTelegram,
 } from '../shared/telegram';
 
@@ -25,6 +27,14 @@ function normalizeReplyMarkup(input: unknown) {
     if (value.length === 0) return [];
     if (Array.isArray(value[0])) return value as unknown[][];
 
+    // UI: [{ buttons: [...] }]
+    if (typeof value[0] === 'object' && value[0] !== null && 'buttons' in (value[0] as any)) {
+      const rows = (value as Array<{ buttons?: unknown }>).map((row) =>
+        Array.isArray(row.buttons) ? row.buttons : [],
+      );
+      return rows;
+    }
+
     // Flat array => wrap as single row
     return [value as unknown[]];
   };
@@ -33,14 +43,24 @@ function normalizeReplyMarkup(input: unknown) {
     return rows
       .map((row) => (Array.isArray(row) ? row : []))
       .map((row) =>
-        row.filter((btn) => {
-          if (!btn || typeof btn !== 'object') return false;
-          const anyBtn = btn as any;
-          const text = typeof anyBtn.text === 'string' ? anyBtn.text.trim() : '';
-          const url = typeof anyBtn.url === 'string' ? anyBtn.url.trim() : '';
-          // Telegram requires at least one action field; for our UI, url is mandatory.
-          return Boolean(text && url);
-        }),
+        row
+          .map((btn) => {
+            if (!btn || typeof btn !== 'object') return null;
+            const anyBtn = btn as any;
+            const text = typeof anyBtn.text === 'string' ? anyBtn.text.trim() : '';
+            const url = typeof anyBtn.url === 'string' ? anyBtn.url.trim() : '';
+            const callbackData =
+              typeof anyBtn.callback_data === 'string'
+                ? anyBtn.callback_data.trim()
+                : typeof anyBtn.callbackData === 'string'
+                  ? anyBtn.callbackData.trim()
+                  : '';
+            if (!text) return null;
+            if (url) return { ...anyBtn, text, url };
+            if (callbackData) return { ...anyBtn, text, callback_data: callbackData };
+            return null;
+          })
+          .filter(Boolean),
       )
       .filter((row) => row.length > 0);
   };
@@ -142,6 +162,11 @@ export async function handleMassMessageItem(itemIdRaw: string) {
     const replyMarkup =
       normalizeReplyMarkup(campaign.buttonsOverride ?? template?.buttons ?? undefined);
 
+    const mediaUrl = (campaign.imageUrlOverride ?? template?.imageUrl ?? '').trim();
+    const isVideo = mediaUrl
+      ? /\.(mp4|webm|ogg|mov|m4v|avi|mkv)(\?.*)?$/i.test(mediaUrl)
+      : false;
+
     if (item.targetType !== 'channel') {
       // v1: group pin not supported; sending to group may also be unsupported depending on targetId semantics
       throw new Error(`不支持的 targetType=${item.targetType}（v1 仅支持频道）`);
@@ -177,19 +202,40 @@ export async function handleMassMessageItem(itemIdRaw: string) {
     if (!bot) throw new Error(`未找到机器人: ${channel.defaultBotId.toString()}`);
     if (bot.status !== 'active') throw new Error(`机器人未启用: ${bot.status}`);
 
-    const sendResult = await sendTextByTelegram({
-      botToken: bot.tokenEncrypted,
-      chatId: channel.tgChatId,
-      text,
-      parseMode: resolveParseMode(format),
-      replyMarkup,
-    });
+    const parseMode = resolveParseMode(format);
+
+    const sendResult = mediaUrl
+      ? isVideo
+        ? await sendVideoByTelegram({
+            botToken: bot.tokenEncrypted,
+            chatId: channel.tgChatId,
+            fileId: mediaUrl,
+            caption: text,
+            parseMode,
+            replyMarkup,
+          })
+        : await sendPhotoByTelegram({
+            botToken: bot.tokenEncrypted,
+            chatId: channel.tgChatId,
+            fileId: mediaUrl,
+            caption: text,
+            parseMode,
+            replyMarkup,
+          })
+      : await sendTextByTelegram({
+          botToken: bot.tokenEncrypted,
+          chatId: channel.tgChatId,
+          text,
+          parseMode,
+          replyMarkup,
+          disableWebPagePreview: false,
+        });
 
     let pinSuccess: boolean | null = null;
     let pinErrorMessage: string | null = null;
 
     const pinMode = campaign.pinMode as unknown as 'none' | 'pin_after_send' | 'replace_pin';
-    const shouldPin = pinMode !== 'none' && channel.adPinEnabled;
+    const shouldPin = pinMode !== 'none';
 
     if (shouldPin) {
       try {

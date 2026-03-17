@@ -13,7 +13,7 @@ interface AuthRequest {
 export class MassMessageItemController {
   constructor(private readonly service: MassMessageItemService) {}
 
-  @Permissions('tasks:view')
+  @Permissions('mass-messaging:view')
   @Get()
   list(
     @Query('campaignId') campaignId?: string,

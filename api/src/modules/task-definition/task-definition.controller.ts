@@ -21,7 +21,7 @@ import { TaskDefinitionService } from './task-definition.service';
 export class TaskDefinitionController {
   constructor(private readonly taskDefinitionService: TaskDefinitionService) {}
 
-  @Permissions('tasks:view')
+  @Permissions("tasks:view")
   @Get()
   list(
     @Query('taskType') taskType?:

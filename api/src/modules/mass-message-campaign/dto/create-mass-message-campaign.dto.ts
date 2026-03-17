@@ -49,7 +49,7 @@ export class CreateMassMessageCampaignDto {
   @MaxLength(64)
   timezone?: string;
 
-  @ValidateIf((o) => o.scheduleType === 'scheduled')
+  @ValidateIf((o) => o.scheduleType === 'scheduled' || o.scheduleType === 'recurring')
   @IsString()
   scheduledAt?: string; // ISO string
 
