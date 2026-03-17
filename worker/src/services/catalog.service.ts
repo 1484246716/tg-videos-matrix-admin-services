@@ -5,6 +5,7 @@ import {
   pinMessageByTelegram,
   sendTextByTelegram,
 } from '../shared/telegram';
+import { pickRandomBot } from '../shared/resource-picker';
 import { logError } from '../logger';
 
 export async function handleCatalogJob(channelIdRaw: string) {
@@ -30,6 +31,8 @@ export async function handleCatalogJob(channelIdRaw: string) {
   if (channel.defaultBot.status !== 'active') {
     throw new Error(`频道机器人未启用: ${channelIdRaw}`);
   }
+
+  const bot = await pickRandomBot();
 
   let catalogTemplate = await prisma.catalogTemplate.findFirst({
     where: { isActive: true },
@@ -139,7 +142,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
     .slice(0, 19);
   content = content.replace(/{{update_time}}/g, beijingTimeStr);
 
-  const botToken = channel.defaultBot.tokenEncrypted;
+  const botToken = bot.tokenEncrypted;
   let finalMessageId: number | null = null;
   const contentPreview = content.slice(0, 4000);
   let pinAttempted = false;

@@ -3,6 +3,7 @@ import { logError } from '../logger';
 import { prisma } from '../infra/prisma';
 import { sendVideoByTelegram, TelegramError } from '../shared/telegram';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
+import { pickRandomBot } from '../shared/resource-picker';
 import { TaskStatus } from '@prisma/client';
 
 export async function handleDispatchJob(
@@ -139,22 +140,7 @@ export async function handleDispatchJob(
       throw new Error('分发任务或频道未配置机器人');
     }
 
-    const bot = await prisma.bot.findUnique({
-      where: { id: resolvedBotId },
-      select: {
-        id: true,
-        status: true,
-        tokenEncrypted: true,
-      },
-    });
-
-    if (!bot) {
-      throw new Error(`未找到机器人: ${resolvedBotId.toString()}`);
-    }
-
-    if (bot.status !== 'active') {
-      throw new Error(`机器人未启用: ${bot.status}`);
-    }
+    const bot = await pickRandomBot();
 
     const sendResult = await sendVideoByTelegram({
       botToken: bot.tokenEncrypted,
@@ -170,7 +156,7 @@ export async function handleDispatchJob(
       data: {
         status: TaskStatus.success,
         finishedAt: new Date(),
-        botId: resolvedBotId,
+        botId: bot.id,
         telegramMessageId: BigInt(sendResult.messageId),
         telegramMessageLink: sendResult.messageLink,
         telegramErrorCode: null,
@@ -183,7 +169,7 @@ export async function handleDispatchJob(
         dispatchTaskId,
         action: 'task_success',
         detail: {
-          botId: resolvedBotId.toString(),
+          botId: bot.id.toString(),
           messageId: sendResult.messageId,
           messageLink: sendResult.messageLink,
         },

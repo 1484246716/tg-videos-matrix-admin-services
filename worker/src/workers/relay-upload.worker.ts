@@ -9,6 +9,7 @@ import { logger, logError } from '../logger';
 import { moveToArchive, waitForFileStable } from '../shared/file-utils';
 import { sendViaGramjs } from '../shared/gramjs/upload';
 import { getTelegramUpdates, sendTelegramRequest } from '../shared/telegram';
+import { pickRandomRelayChannel } from '../shared/resource-picker';
 import { MediaStatus } from '@prisma/client';
 import {
   GRAMJS_FORWARD_TARGET_CHAT_ID,
@@ -92,30 +93,15 @@ export const relayUploadWorker = new Worker(
       };
     }
 
-    const relayChannel = await prisma.relayChannel.findUnique({
-      where: { id: BigInt(relayChannelIdRaw) },
-      include: {
-        bot: {
-          select: {
-            id: true,
-            status: true,
-            tokenEncrypted: true,
-          },
-        },
-      },
+    const relayChannel = await pickRandomRelayChannel();
+    const selectedRelayChannelId = relayChannel.id?.toString?.() ?? String(relayChannel.id);
+
+    logger.info('[q_relay_upload] 随机选中中转频道', {
+      traceId,
+      mediaAssetId: mediaAssetIdRaw,
+      relayChannelId: selectedRelayChannelId,
+      sourceRelayChannelId: relayChannelIdRaw,
     });
-
-    if (!relayChannel) {
-      throw new Error(`未找到中转频道: ${relayChannelIdRaw}`);
-    }
-
-    if (!relayChannel.isActive) {
-      throw new Error(`中转频道未启用: ${relayChannelIdRaw}`);
-    }
-
-    if (!relayChannel.bot || relayChannel.bot.status !== 'active') {
-      throw new Error('中转频道机器人不存在或未启用');
-    }
 
     const stableCheckStart = Date.now();
     await waitForFileStable(mediaAsset.localPath);
