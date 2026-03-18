@@ -15,6 +15,22 @@ async function bootstrap() {
         return;
       }
 
+      const corsOrigin = (process.env.CORS_ORIGIN || '').trim();
+      if (corsOrigin === '*') {
+        callback(null, true);
+        return;
+      }
+
+      const allowedList = corsOrigin
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean);
+
+      if (allowedList.length > 0) {
+        callback(null, allowedList.includes(origin));
+        return;
+      }
+
       const allowed =
         /^http:\/\/localhost:\d+$/.test(origin) ||
         /^http:\/\/127\.0\.0\.1:\d+$/.test(origin);
