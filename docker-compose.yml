@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: tg-crm-postgres
+    container_name: tg-crm-postgresv2
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
@@ -19,7 +19,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: tg-crm-redis
+    container_name: tg-crm-redisv2
     restart: unless-stopped
     ports:
       - "6379:6379"
@@ -48,12 +48,13 @@ services:
       NODE_ENV: production
       PORT: 3001
       JWT_SECRET: ${JWT_SECRET:-replace_me}
-      TELEGRAM_BOT_API_BASE: http://tg-bot-api:8081
+      # 【同步修改点】：这里也要改成新名字，否则 api 连不上 bot 容器
+      TELEGRAM_BOT_API_BASE: http://tg-bot-api-v2:8081
       CHANNELS_ROOT_DIR: /data/channels
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
-    command: sh -c "npm run prisma:generate -w @tg-crm/api && npm run start -w @tg-crm/api"
+    command: sh -c "pnpm --filter @tg-crm/api exec prisma generate && pnpm --filter @tg-crm/api run start"
     ports:
       - "3001:3001"
     volumes:
@@ -77,13 +78,15 @@ services:
         condition: service_healthy
       api:
         condition: service_started
-      tg-bot-api:
+      # 【同步修改点】：依赖的服务名换成新名字
+      tg-bot-api-v2:
         condition: service_started
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/tg_crm?schema=public
       REDIS_URL: redis://redis:6379
       NODE_ENV: production
-      TELEGRAM_BOT_API_BASE: http://tg-bot-api:8081
+      # 【同步修改点】：这里也要改成新名字，否则 worker 连不上 bot 容器
+      TELEGRAM_BOT_API_BASE: http://tg-bot-api-v2:8081
       GRAMJS_API_ID: "${GRAMJS_API_ID:-}"
       GRAMJS_API_HASH: "${GRAMJS_API_HASH:-}"
       GRAMJS_BOT_TOKEN: "${GRAMJS_BOT_TOKEN:-}"
@@ -92,13 +95,14 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
-    command: sh -c "npm run prisma:generate -w @tg-crm/api && npm run start -w @tg-crm/worker"
+    command: sh -c "pnpm --filter @tg-crm/api exec prisma generate && pnpm --filter @tg-crm/worker run start"
     volumes:
       - ./data/tg-crm/channels:/data/channels
 
-  tg-bot-api:
+  # 【主要修改点】：服务名和容器名都加上了 -v2 的后缀
+  tg-bot-api-v2:
     image: aiogram/telegram-bot-api:latest
-    container_name: tg-bot-api
+    container_name: tg-bot-api-v2
     restart: unless-stopped
     environment:
       TELEGRAM_API_ID: "6"
@@ -115,7 +119,8 @@ services:
       - "--temp-dir"
       - "/var/lib/telegram-bot-api/tmp"
     ports:
-      - "8081:8081"
+      # 为了防止端口冲突，把暴露到外部的端口从 8081 改成 8082，容器内部还是 8081
+      - "8082:8081"
     volumes:
       - ./videos:/app/videos
       - ./data/tg-bot-api:/var/lib/telegram-bot-api
@@ -123,7 +128,7 @@ services:
 
   alist:
     image: xhofe/alist:latest
-    container_name: tg-crm-alist
+    container_name: tg-crm-alistv2
     restart: unless-stopped
     ports:
       - "5244:5244"

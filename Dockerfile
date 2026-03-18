@@ -4,18 +4,32 @@ WORKDIR /app
 
 ENV NODE_ENV=development
 
-COPY package*.json ./
-COPY api/package*.json ./api/
-COPY worker/package*.json ./worker/
+# 1. 配置 Debian 镜像源并安装 openssl（修复之前的报错）
+RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources && \
+    sed -i 's/security.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources
+RUN apt-get update -y && apt-get install -y openssl
 
-RUN npm install --include=dev
-RUN npm install --include=dev -w @tg-crm/api -w @tg-crm/worker
+# 2. 全局安装 pnpm 并配置国内镜像
+RUN npm install -g pnpm --registry=https://registry.npmmirror.com
+RUN pnpm config set registry https://registry.npmmirror.com
 
+# 3. 仅拷贝包配置和 workspace 文件，利用 Docker 缓存加速安装
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY api/package.json ./api/
+COPY worker/package.json ./worker/
+
+# 4. 使用 pnpm 安装项目所有依赖
+RUN pnpm install
+
+# 5. 拷贝真正的业务代码 (此时因为有了 .dockerignore，宿主机的 node_modules 不会跟进去)
 COPY api ./api
 COPY worker ./worker
 
-RUN npx --yes prisma generate --schema /app/api/prisma/schema.prisma
-RUN npm run build -w @tg-crm/api
-RUN npm run build -w @tg-crm/worker
+# 6. 生成 Prisma Client
+RUN pnpm --filter @tg-crm/api exec prisma generate --schema=/app/api/prisma/schema.prisma
 
-CMD ["npm", "run", "start", "-w", "@tg-crm/api"]
+# 7. 构建 workspaces
+RUN pnpm --filter @tg-crm/api run build
+RUN pnpm --filter @tg-crm/worker run build
+
+CMD ["pnpm", "--filter", "@tg-crm/api", "run", "start"]
