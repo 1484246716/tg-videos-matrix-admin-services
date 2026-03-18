@@ -1,0 +1,138 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tg-crm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: tg_crm
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tg_crm"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: tg-crm-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tg-crm-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/tg_crm?schema=public
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+      PORT: 3001
+      JWT_SECRET: ${JWT_SECRET:-replace_me}
+      TELEGRAM_BOT_API_BASE: http://tg-bot-api:8081
+      CHANNELS_ROOT_DIR: /data/channels
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+    command: sh -c "npm run prisma:generate -w @tg-crm/api && npm run start -w @tg-crm/api"
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./data/tg-crm/channels:/data/channels
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tg-crm-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+      tg-bot-api:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/tg_crm?schema=public
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+      TELEGRAM_BOT_API_BASE: http://tg-bot-api:8081
+      GRAMJS_API_ID: "${GRAMJS_API_ID:-}"
+      GRAMJS_API_HASH: "${GRAMJS_API_HASH:-}"
+      GRAMJS_BOT_TOKEN: "${GRAMJS_BOT_TOKEN:-}"
+      GRAMJS_SESSION: "${GRAMJS_SESSION:-}"
+      RELAY_UPLOAD_GRAMJS_THRESHOLD_MB: "${RELAY_UPLOAD_GRAMJS_THRESHOLD_MB:-1024}"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+    command: sh -c "npm run prisma:generate -w @tg-crm/api && npm run start -w @tg-crm/worker"
+    volumes:
+      - ./data/tg-crm/channels:/data/channels
+
+  tg-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: tg-bot-api
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: "6"
+      TELEGRAM_API_HASH: "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+      TELEGRAM_LOCAL: "1"
+      TELEGRAM_VERBOSITY: "4"
+    command:
+      - "--http-timeout"
+      - "3600"
+      - "--http-poll-timeout"
+      - "3600"
+      - "--log-verbosity"
+      - "4"
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./videos:/app/videos
+      - ./data/tg-bot-api:/var/lib/telegram-bot-api
+      - ./data/tg-bot-api-tmp:/tmp/telegram-bot-api
+
+  alist:
+    image: xhofe/alist:latest
+    container_name: tg-crm-alist
+    restart: unless-stopped
+    ports:
+      - "5244:5244"
+    environment:
+      PUID: "0"
+      PGID: "0"
+      UMASK: "022"
+    volumes:
+      - ./data/alist:/opt/alist/data
+      - ./data/tg-crm/channels:/data/channels
+
+volumes:
+  pg_data:
+  redis_data:
