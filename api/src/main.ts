@@ -1,8 +1,11 @@
-import 'dotenv/config';
+import * as dotenv from 'dotenv';
+import { resolve } from 'node:path';
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { AppModule } from './modules/app.module';
+
+dotenv.config({ path: resolve(__dirname, '..', '..', '.env') });
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
