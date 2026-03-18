@@ -6,39 +6,9 @@
     "auditLog": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\.b214ec8ecd02ed5f8eedb087944e3da38b930882-audit.json",
     "files": [
         {
-            "date": 1773193645949,
-            "name": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\worker-2026-03-11.log",
-            "hash": "bf337d447594e8943a7e9da078ac73ff291a3973939e8ea974b4a6ce788813e8"
-        },
-        {
-            "date": 1773290352803,
-            "name": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\worker-2026-03-12.log",
-            "hash": "35e41e2451ebe9d6342ea5de815daae7f66825f5ca360bfc6a8b5ca972ca6be2"
-        },
-        {
-            "date": 1773339288915,
-            "name": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\worker-2026-03-13.log",
-            "hash": "75a86967a6afc7e6b29864e09f4fccfc55ace9fc4153015927c15a5fcaca09fa"
-        },
-        {
-            "date": 1773449175407,
-            "name": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\worker-2026-03-14.log",
-            "hash": "b4cc8030937a1330dab6aa2e2e9b1b206e4b5c10087accd36645a403a6828a2e"
-        },
-        {
-            "date": 1773543950207,
-            "name": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\worker-2026-03-15.log",
-            "hash": "7f7f7e0710bde7d2a895106f1f4bc72d6845ff48d14dd8661d6a979bfc8adb30"
-        },
-        {
-            "date": 1773622334965,
-            "name": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\worker-2026-03-16.log",
-            "hash": "c41ee12ba09b24cb20b7b17101c0fe4423a46c528514f94f903200251fcacc50"
-        },
-        {
-            "date": 1773689305721,
-            "name": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\worker-2026-03-17.log",
-            "hash": "b788bdc71450bf8825e9d084ae45f339e9842599d74f2478941da30e1f9a84ef"
+            "date": 1773824830262,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\worker-2026-03-18.log",
+            "hash": "816e6c510c8a8231e2092b0f272c9095cfac99af4250df9ae21940704c5c30f4"
         }
     ],
     "hashType": "sha256"
