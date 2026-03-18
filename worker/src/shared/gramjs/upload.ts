@@ -16,7 +16,6 @@ export async function sendViaGramjs(args: {
   const message = await client.sendFile(args.chatId, {
     file: args.filePath,
     caption: args.caption ?? fileName,
-    fileName,
     forceDocument: true,
     workers: args.workers,
     progressCallback: args.progressCallback,

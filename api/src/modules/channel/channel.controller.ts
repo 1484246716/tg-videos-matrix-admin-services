@@ -17,6 +17,7 @@ import { ChannelService } from './channel.service';
 import { CreateChannelDto } from './dto/create-channel.dto';
 import { UpdateChannelDto } from './dto/update-channel.dto';
 import { UpdateChannelStatusDto } from './dto/update-channel-status.dto';
+import { Prisma } from '@prisma/client';
 
 interface AuthRequest {
   user: { userId: string; username: string; role: string };
@@ -65,8 +66,8 @@ export class ChannelController {
         defaultBotId?: string | null;
         aiSystemPromptTemplate?: string;
         navTemplateText?: string;
-        aiReplyMarkup?: unknown;
-        navReplyMarkup?: unknown;
+        aiReplyMarkup?: Prisma.InputJsonValue;
+        navReplyMarkup?: Prisma.InputJsonValue;
         tags?: string[];
       };
     },
