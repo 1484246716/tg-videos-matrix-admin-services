@@ -112,12 +112,14 @@ services:
       - "3600"
       - "--log-verbosity"
       - "4"
+      - "--temp-dir"
+      - "/var/lib/telegram-bot-api/tmp"
     ports:
       - "8081:8081"
     volumes:
       - ./videos:/app/videos
       - ./data/tg-bot-api:/var/lib/telegram-bot-api
-      - ./data/tg-bot-api-tmp:/tmp/telegram-bot-api
+      - ./data/tg-bot-api-tmp:/var/lib/telegram-bot-api/tmp
 
   alist:
     image: xhofe/alist:latest
