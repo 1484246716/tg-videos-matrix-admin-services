@@ -246,6 +246,12 @@ export const relayUploadWorker = new Worker(
           telegramFileId: forwardFileId,
           telegramFileUniqueId: forwardFileUniqueId,
           ingestError: null,
+          sourceMeta: {
+            ...(mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
+              ? (mediaAsset.sourceMeta as Record<string, unknown>)
+              : {}),
+            relayBotId: relayChannel.bot.id.toString(),
+          },
           ...(archivePath ? { archivePath, localPath: archivePath } : {}),
         },
       });
@@ -407,6 +413,12 @@ export const relayUploadWorker = new Worker(
               telegramFileId: fallbackResult.telegramFileId,
               telegramFileUniqueId: fallbackResult.telegramFileUniqueId,
               ingestError: null,
+              sourceMeta: {
+                ...(mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
+                  ? (mediaAsset.sourceMeta as Record<string, unknown>)
+                  : {}),
+                relayBotId: relayChannel.bot.id.toString(),
+              },
             },
           });
 
@@ -491,6 +503,12 @@ export const relayUploadWorker = new Worker(
           telegramFileId: directFileId,
           telegramFileUniqueId: directFileUniqueId,
           ingestError: null,
+          sourceMeta: {
+            ...(mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
+              ? (mediaAsset.sourceMeta as Record<string, unknown>)
+              : {}),
+            relayBotId: relayChannel.bot.id.toString(),
+          },
           ...(archivePath ? { archivePath, localPath: archivePath } : {}),
         },
       });

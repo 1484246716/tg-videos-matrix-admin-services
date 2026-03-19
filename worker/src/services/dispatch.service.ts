@@ -1,5 +1,5 @@
 import { generateTextWithAiProfile } from '../ai-provider';
-import { logError } from '../logger';
+import { logger, logError } from '../logger';
 import { prisma } from '../infra/prisma';
 import { sendVideoByTelegram, TelegramError } from '../shared/telegram';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
@@ -68,6 +68,11 @@ export async function handleDispatchJob(
       throw new Error('媒体资源缺少 telegramFileId（中转尚未完成）');
     }
 
+    const mediaSourceMeta =
+      task.mediaAsset.sourceMeta && typeof task.mediaAsset.sourceMeta === 'object'
+        ? (task.mediaAsset.sourceMeta as Record<string, unknown>)
+        : null;
+
     let finalCaption = task.caption || task.mediaAsset.aiGeneratedCaption;
 
     if (!finalCaption && task.channel.aiSystemPromptTemplate) {
@@ -135,12 +140,33 @@ export async function handleDispatchJob(
       });
     }
 
-    const resolvedBotId = task.botId ?? task.channel.defaultBotId;
+    const sourceRelayBotIdRaw = mediaSourceMeta?.relayBotId;
+    const sourceRelayBotId =
+      typeof sourceRelayBotIdRaw === 'string' && /^\d+$/.test(sourceRelayBotIdRaw)
+        ? BigInt(sourceRelayBotIdRaw)
+        : null;
+
+    const resolvedBotId = sourceRelayBotId ?? task.botId ?? task.channel.defaultBotId;
     if (!resolvedBotId) {
       throw new Error('分发任务或频道未配置机器人');
     }
 
-    const bot = await pickRandomBot();
+    let bot = await prisma.bot.findFirst({
+      where: {
+        id: resolvedBotId,
+        status: 'active',
+      },
+      select: { id: true, tokenEncrypted: true },
+    });
+
+    if (!bot) {
+      bot = await pickRandomBot();
+      logger.warn('[q_dispatch] 未找到指定机器人，回退到随机机器人', {
+        dispatchTaskId: task.id.toString(),
+        resolvedBotId: resolvedBotId.toString(),
+        fallbackBotId: bot.id.toString(),
+      });
+    }
 
     const sendResult = await sendVideoByTelegram({
       botToken: bot.tokenEncrypted,
