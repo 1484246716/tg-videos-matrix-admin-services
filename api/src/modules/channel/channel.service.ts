@@ -381,11 +381,13 @@ export class ChannelService {
   }
 
   async remove(id: string, userId?: string, role?: string) {
+    const channelId = BigInt(id);
+
     const existing = await this.prisma.channel.findFirst({
       where:
         role === 'admin'
-          ? { id: BigInt(id) }
-          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
+          ? { id: channelId }
+          : { id: channelId, createdBy: userId ? BigInt(userId) : undefined },
       select: { id: true, folderPath: true },
     });
 
@@ -394,14 +396,51 @@ export class ChannelService {
     }
 
     try {
-      const deleted = await this.prisma.channel.delete({
-        where: { id: BigInt(id) },
+      const deleted = await this.prisma.$transaction(async (tx) => {
+        await tx.riskEvent.deleteMany({
+          where: { channelId },
+        });
+
+        await tx.dispatchTaskLog.deleteMany({
+          where: {
+            dispatchTask: {
+              channelId,
+            },
+          },
+        });
+
+        await tx.dispatchTask.deleteMany({
+          where: { channelId },
+        });
+
+        await tx.mediaAsset.deleteMany({
+          where: { channelId },
+        });
+
+        await tx.catalogTask.deleteMany({
+          where: { channelId },
+        });
+
+        await tx.catalogHistory.deleteMany({
+          where: { channelId },
+        });
+
+        return tx.channel.delete({
+          where: { id: channelId },
+        });
       });
 
       await this.removeFolder(existing.folderPath);
 
       return this.serializeBigInt(deleted);
     } catch (error) {
+      if (
+        error instanceof PrismaClientKnownRequestError &&
+        error.code === 'P2003'
+      ) {
+        throw new ConflictException('频道仍有关联数据，请先清理后再删除');
+      }
+
       throw new InternalServerErrorException('删除频道失败，目录或数据库操作异常');
     }
   }
