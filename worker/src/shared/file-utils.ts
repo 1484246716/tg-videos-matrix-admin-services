@@ -1,6 +1,6 @@
 import { createReadStream } from 'node:fs';
 import { mkdir, readdir, rename, stat } from 'node:fs/promises';
-import { basename, dirname, extname, join, resolve } from 'node:path';
+import { basename, dirname, extname, join, normalize, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
   RELAY_MIN_STABLE_CHECKS,
@@ -76,8 +76,27 @@ export async function hashFile(filePath: string): Promise<string> {
 }
 
 export async function scanChannelVideos(folderPath: string) {
-  const absolute = resolve(folderPath);
-  const entries = await readdir(absolute, { withFileTypes: true });
+  const rawRoot = (process.env.CHANNELS_ROOT_DIR || './data/channels').trim();
+
+  const root = /^\/[a-zA-Z]/.test(rawRoot)
+    ? resolve(process.cwd(), '..', rawRoot.replace(/^\//, ''))
+    : resolve(rawRoot);
+
+  const normalizedInput = normalize(folderPath.trim().replace(/\\/g, '/'));
+  const relativePath = normalizedInput.replace(/^[\\/]+/, '');
+  const absolute = resolve(root, relativePath);
+
+  let entries: Array<import('node:fs').Dirent> = [];
+  try {
+    entries = await readdir(absolute, { withFileTypes: true, encoding: 'utf8' });
+  } catch (error) {
+    logger.warn('[scan] 目录不存在或不可访问', {
+      folderPath,
+      absolute,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return [];
+  }
 
   const files = entries
     .filter((entry) => entry.isFile())
