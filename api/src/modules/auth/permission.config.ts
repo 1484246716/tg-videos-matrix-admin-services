@@ -41,6 +41,7 @@ export const PERMISSION_MODULES: PermissionModule[] = [
     actions: [
       { key: "view", name: "查看" },
       { key: "update", name: "编辑" },
+      { key: "delete", name: "删除" },
     ],
   },
   {
@@ -134,7 +135,7 @@ export const ROLE_TEMPLATES: RoleTemplate[] = [
       ...permissionsFor("dashboard", ["view"]),
       ...permissionsFor("channels", ["view", "create", "update", "delete"]),
       ...permissionsFor("media", ["view", "upload", "update", "delete"]),
-      ...permissionsFor("media-lifecycle", ["view", "update"]),
+      ...permissionsFor("media-lifecycle", ["view", "update", "delete"]),
       ...permissionsFor("mass-messaging", ["view", "create", "update", "delete"]),
       ...permissionsFor("bots", ["view", "create", "update"]),
       ...permissionsFor("relay-channels", ["view", "update"]),

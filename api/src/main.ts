@@ -3,8 +3,9 @@ import { resolve } from 'node:path';
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { NextFunction, Request, Response } from 'express';
 import { AppModule } from './modules/app.module';
-import { AppLogger } from './logger';
+import { AppLogger, logger } from './logger';
 
 dotenv.config({ path: resolve(__dirname, '..', '..', '.env') });
 
@@ -45,6 +46,25 @@ async function bootstrap() {
     },
     credentials: true,
   });
+
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const start = Date.now();
+
+    res.on('finish', () => {
+      logger.info('HTTP request completed', {
+        context: 'HttpRequest',
+        method: req.method,
+        path: req.originalUrl || req.url,
+        statusCode: res.statusCode,
+        durationMs: Date.now() - start,
+        ip: req.ip,
+        userAgent: req.headers['user-agent'],
+      });
+    });
+
+    next();
+  });
+
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,

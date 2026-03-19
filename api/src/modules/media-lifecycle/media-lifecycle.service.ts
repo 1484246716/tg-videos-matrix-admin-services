@@ -1,4 +1,10 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  InternalServerErrorException,
+  NotFoundException,
+} from '@nestjs/common';
+import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 import IORedis from 'ioredis';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -274,5 +280,61 @@ export class MediaLifecycleService {
       skipped: skippedIds.length,
       skippedIds,
     };
+  }
+
+  async remove(id: string) {
+    const mediaAssetId = BigInt(id);
+
+    const existing = await this.prisma.mediaAsset.findUnique({
+      where: { id: mediaAssetId },
+      select: { id: true },
+    });
+
+    if (!existing) {
+      throw new NotFoundException('media asset not found');
+    }
+
+    try {
+      const deleted = await this.prisma.$transaction(async (tx) => {
+        const dispatchTasks = await tx.dispatchTask.findMany({
+          where: { mediaAssetId },
+          select: { id: true },
+        });
+
+        const dispatchTaskIds = dispatchTasks.map((task) => task.id);
+
+        if (dispatchTaskIds.length > 0) {
+          await tx.riskEvent.deleteMany({
+            where: { dispatchTaskId: { in: dispatchTaskIds } },
+          });
+
+          await tx.dispatchTaskLog.deleteMany({
+            where: { dispatchTaskId: { in: dispatchTaskIds } },
+          });
+
+          await tx.dispatchTask.deleteMany({
+            where: { id: { in: dispatchTaskIds } },
+          });
+        }
+
+        return tx.mediaAsset.delete({
+          where: { id: mediaAssetId },
+        });
+      });
+
+      return {
+        id: deleted.id.toString(),
+        ok: true,
+      };
+    } catch (error) {
+      if (
+        error instanceof PrismaClientKnownRequestError &&
+        error.code === 'P2003'
+      ) {
+        throw new ConflictException('该视频仍有关联数据，请先处理后再删除');
+      }
+
+      throw new InternalServerErrorException('删除失败，关联数据清理异常');
+    }
   }
 }

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Query, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Query, Post, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { Permissions } from '../auth/permissions.decorator';
 import { PermissionsGuard } from '../auth/permissions.guard';
@@ -50,5 +50,11 @@ export class MediaLifecycleController {
   @Post('retry-relay')
   retryRelayBatch(@Body('ids') ids: string[]) {
     return this.mediaLifecycleService.retryRelayBatch(ids ?? []);
+  }
+
+  @Permissions('media-lifecycle:delete')
+  @Delete(':id')
+  remove(@Param('id') id: string) {
+    return this.mediaLifecycleService.remove(id);
   }
 }
