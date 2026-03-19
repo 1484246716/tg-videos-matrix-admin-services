@@ -43,17 +43,21 @@ services:
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/tg_crm?schema=public
-      REDIS_URL: redis://redis:6379
-      NODE_ENV: production
-      PORT: 3001
-      JWT_SECRET: ${JWT_SECRET:-replace_me}
-      # 【同步修改点】：这里也要改成新名字，否则 api 连不上 bot 容器
-      TELEGRAM_BOT_API_BASE: http://tg-bot-api-v2:8081
-      CHANNELS_ROOT_DIR: /data/channels
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      # 【核心改动】：全部改为 ${变量名} 动态读取 .env 文件
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      NODE_ENV: ${NODE_ENV}
+      PORT: ${PORT}
+      JWT_SECRET: ${JWT_SECRET}
+      TELEGRAM_BOT_API_BASE: ${TELEGRAM_BOT_API_BASE}
+      CHANNELS_ROOT_DIR: ${CHANNELS_ROOT_DIR}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      # 补全 Relay 相关变量
+      RELAY_MIN_STABLE_CHECKS: ${RELAY_MIN_STABLE_CHECKS}
+      RELAY_STABLE_INTERVAL_MS: ${RELAY_STABLE_INTERVAL_MS}
+      RELAY_MTIME_COOLDOWN_MS: ${RELAY_MTIME_COOLDOWN_MS}
     command: sh -c "pnpm --filter @tg-crm/api exec prisma generate && pnpm --filter @tg-crm/api run start"
     ports:
       - "3001:3001"
@@ -78,28 +82,34 @@ services:
         condition: service_healthy
       api:
         condition: service_started
-      # 【同步修改点】：依赖的服务名换成新名字
       tg-bot-api-v2:
         condition: service_started
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/tg_crm?schema=public
-      REDIS_URL: redis://redis:6379
-      NODE_ENV: production
-      # 【同步修改点】：这里也要改成新名字，否则 worker 连不上 bot 容器
-      TELEGRAM_BOT_API_BASE: http://tg-bot-api-v2:8081
-      GRAMJS_API_ID: "${GRAMJS_API_ID:-}"
-      GRAMJS_API_HASH: "${GRAMJS_API_HASH:-}"
-      GRAMJS_BOT_TOKEN: "${GRAMJS_BOT_TOKEN:-}"
-      GRAMJS_SESSION: "${GRAMJS_SESSION:-}"
-      RELAY_UPLOAD_GRAMJS_THRESHOLD_MB: "${RELAY_UPLOAD_GRAMJS_THRESHOLD_MB:-1024}"
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      # 【核心改动】：全部改为 ${变量名} 动态读取
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      NODE_ENV: ${NODE_ENV}
+      TELEGRAM_BOT_API_BASE: ${TELEGRAM_BOT_API_BASE}
+      CHANNELS_ROOT_DIR: ${CHANNELS_ROOT_DIR}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      # 补全 Relay 相关变量
+      RELAY_MIN_STABLE_CHECKS: ${RELAY_MIN_STABLE_CHECKS}
+      RELAY_STABLE_INTERVAL_MS: ${RELAY_STABLE_INTERVAL_MS}
+      RELAY_MTIME_COOLDOWN_MS: ${RELAY_MTIME_COOLDOWN_MS}
+      # 补全所有 GramJS 核心上传变量
+      GRAMJS_API_ID: ${GRAMJS_API_ID}
+      GRAMJS_API_HASH: ${GRAMJS_API_HASH}
+      GRAMJS_BOT_TOKEN: ${GRAMJS_BOT_TOKEN}
+      GRAMJS_SESSION: ${GRAMJS_SESSION}
+      RELAY_UPLOAD_GRAMJS_THRESHOLD_MB: ${RELAY_UPLOAD_GRAMJS_THRESHOLD_MB}
+      GRAMJS_FORWARD_TARGET_CHAT_ID: ${GRAMJS_FORWARD_TARGET_CHAT_ID}
+      GRAMJS_UPLOAD_WORKERS: ${GRAMJS_UPLOAD_WORKERS}
     command: sh -c "pnpm --filter @tg-crm/api exec prisma generate && pnpm --filter @tg-crm/worker run start"
     volumes:
       - ./data/tg-crm/channels:/data/channels
 
-  # 【主要修改点】：服务名和容器名都加上了 -v2 的后缀
   tg-bot-api-v2:
     image: aiogram/telegram-bot-api:latest
     container_name: tg-bot-api-v2
@@ -119,7 +129,6 @@ services:
       - "--temp-dir"
       - "/var/lib/telegram-bot-api/tmp"
     ports:
-      # 为了防止端口冲突，把暴露到外部的端口从 8081 改成 8082，容器内部还是 8081
       - "8082:8081"
     volumes:
       - ./videos:/app/videos
