@@ -62,7 +62,8 @@ services:
     ports:
       - "3001:3001"
     volumes:
-      - ./data/tg-crm/channels:/data/channels
+      # 【核心修复】：挂载父目录，确保 channels 和 archived 处于同一文件系统
+      - ./data/tg-crm:/data
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3001/api/health"]
       interval: 10s
@@ -108,7 +109,8 @@ services:
       GRAMJS_UPLOAD_WORKERS: ${GRAMJS_UPLOAD_WORKERS}
     command: sh -c "pnpm --filter @tg-crm/api exec prisma generate && pnpm --filter @tg-crm/worker run start"
     volumes:
-      - ./data/tg-crm/channels:/data/channels
+      # 【核心修复】：与 API 保持一致，挂载父目录
+      - ./data/tg-crm:/data
 
   tg-bot-api-v2:
     image: aiogram/telegram-bot-api:latest
@@ -147,7 +149,8 @@ services:
       UMASK: "022"
     volumes:
       - ./data/alist:/opt/alist/data
-      - ./data/tg-crm/channels:/data/channels
+      # 【核心修复】：挂载父目录，方便你在 Alist 里同时管理待处理和已归档文件
+      - ./data/tg-crm:/data
 
 volumes:
   pg_data:
