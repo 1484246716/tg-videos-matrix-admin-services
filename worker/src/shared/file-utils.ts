@@ -78,7 +78,8 @@ export async function hashFile(filePath: string): Promise<string> {
 export async function scanChannelVideos(folderPath: string) {
   const rawRoot = (process.env.CHANNELS_ROOT_DIR || './data/channels').trim();
 
-  const root = /^\/[a-zA-Z]/.test(rawRoot)
+  const isWindowsDrivePath = process.platform === 'win32' && /^\/[a-zA-Z]/.test(rawRoot);
+  const root = isWindowsDrivePath
     ? resolve(process.cwd(), '..', rawRoot.replace(/^\//, ''))
     : resolve(rawRoot);
 
@@ -93,6 +94,8 @@ export async function scanChannelVideos(folderPath: string) {
     logger.warn('[scan] 目录不存在或不可访问', {
       folderPath,
       absolute,
+      root,
+      rawRoot,
       error: error instanceof Error ? error.message : String(error),
     });
     return [];
