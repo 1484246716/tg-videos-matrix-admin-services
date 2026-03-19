@@ -4,11 +4,14 @@ import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { AppModule } from './modules/app.module';
+import { AppLogger } from './logger';
 
 dotenv.config({ path: resolve(__dirname, '..', '..', '.env') });
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, {
+    logger: new AppLogger(),
+  });
 
   app.setGlobalPrefix('api');
   app.enableCors({
