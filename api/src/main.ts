@@ -23,11 +23,14 @@ async function bootstrap() {
       }
 
       const corsOrigin = (process.env.CORS_ORIGIN || '').trim();
+      
+      // 允许全部
       if (corsOrigin === '*') {
         callback(null, true);
         return;
       }
 
+      // 处理逗号分隔的多个域名
       const allowedList = corsOrigin
         .split(',')
         .map((value) => value.trim())
@@ -38,12 +41,18 @@ async function bootstrap() {
         return;
       }
 
+      // 默认放行本地开发
       const allowed =
         /^http:\/\/localhost:\d+$/.test(origin) ||
         /^http:\/\/127\.0\.0\.1:\d+$/.test(origin);
 
       callback(null, allowed);
     },
+    // 👇 新增/强化的核心配置在这里
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS', 
+    allowedHeaders: 'Content-Type, Accept, Authorization, X-Requested-With',
+    preflightContinue: false, 
+    optionsSuccessStatus: 204,
     credentials: true,
   });
 
