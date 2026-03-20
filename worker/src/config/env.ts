@@ -36,5 +36,12 @@ export const RELAY_STABLE_INTERVAL_MS = Number(
   process.env.RELAY_STABLE_INTERVAL_MS || '10000',
 );
 export const RELAY_MTIME_COOLDOWN_MS = Number(
-  process.env.RELAY_MTIME_COOLDOWN_MS || '60000',
+  process.env.RELAY_MTIME_COOLDOWN_MS || '120000',
 );
+
+// ===== FFprobe 配置 =====
+export const RELAY_ENABLE_FFPROBE_CHECK = process.env.RELAY_ENABLE_FFPROBE_CHECK === 'true';
+export const RELAY_FFPROBE_TIMEOUT_MS = parseInt(process.env.RELAY_FFPROBE_TIMEOUT_MS || '15000', 10);
+export const RELAY_FFPROBE_MIN_DURATION_SEC = parseInt(process.env.RELAY_FFPROBE_MIN_DURATION_SEC || '1', 10);
+
+
