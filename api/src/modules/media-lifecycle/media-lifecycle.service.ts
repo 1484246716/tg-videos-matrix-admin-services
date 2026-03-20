@@ -44,12 +44,24 @@ export class MediaLifecycleService {
     const mediaAssets = await this.prisma.mediaAsset.findMany({
       where: {
         channelId: params.channelId ? BigInt(params.channelId) : undefined,
-        telegramFileId: tfid
+        ...(tfid
           ? {
-              contains: tfid,
-              mode: 'insensitive',
+              OR: [
+                {
+                  telegramFileId: {
+                    contains: tfid,
+                    mode: 'insensitive',
+                  },
+                },
+                {
+                  telegramFileUniqueId: {
+                    contains: tfid,
+                    mode: 'insensitive',
+                  },
+                },
+              ],
             }
-          : undefined,
+          : {}),
         originalName: params.keyword ? { contains: params.keyword, mode: 'insensitive' } : undefined,
         status: stageFilter?.mediaStatus ? stageFilter.mediaStatus : undefined,
       },

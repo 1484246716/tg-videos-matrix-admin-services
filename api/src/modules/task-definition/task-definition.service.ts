@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   InternalServerErrorException,
   NotFoundException,
@@ -69,6 +70,17 @@ export class TaskDefinitionService {
 
   async create(dto: CreateTaskDefinitionDto) {
     this.validateRunIntervalSec(dto.runIntervalSec);
+
+    const existingSameType = await this.taskDefinitionModel.findFirst({
+      where: { taskType: dto.taskType },
+      select: { id: true, name: true },
+    });
+
+    if (existingSameType) {
+      throw new ConflictException(
+        `任务类型 ${dto.taskType} 已存在（ID=${existingSameType.id.toString()}，名称=${existingSameType.name}），每种类型仅允许创建一个任务。`,
+      );
+    }
 
     const now = new Date();
     const isEnabled = dto.isEnabled ?? true;
