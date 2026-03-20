@@ -115,20 +115,36 @@ export class BotService {
     };
   }
 
-  async remove(id: string) {
+  async remove(id: string, force = false) {
     const botId = BigInt(id);
+
+    const existing = await this.prisma.bot.findUnique({
+      where: { id: botId },
+      select: { id: true },
+    });
+
+    if (!existing) {
+      throw new NotFoundException('bot not found');
+    }
 
     const usedByChannels = await this.prisma.channel.count({
       where: { defaultBotId: botId },
     });
 
-    if (usedByChannels > 0) {
-      throw new BadRequestException('bot is referenced by channels, unbind first');
+    if (usedByChannels > 0 && !force) {
+      throw new BadRequestException('bot is referenced by channels, unbind first or delete with force=true');
+    }
+
+    if (usedByChannels > 0 && force) {
+      await this.prisma.channel.updateMany({
+        where: { defaultBotId: botId },
+        data: { defaultBotId: null },
+      });
     }
 
     await this.prisma.bot.delete({ where: { id: botId } });
 
-    return { ok: true };
+    return { ok: true, unboundChannels: force ? usedByChannels : 0 };
   }
 
   private maskToken(raw: string) {

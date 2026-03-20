@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { Permissions } from '../auth/permissions.decorator';
 import { PermissionsGuard } from '../auth/permissions.guard';
@@ -31,7 +31,7 @@ export class BotController {
 
   @Permissions('bots:delete')
   @Delete(':id')
-  remove(@Param('id') id: string) {
-    return this.botService.remove(id);
+  remove(@Param('id') id: string, @Query('force') force?: string) {
+    return this.botService.remove(id, force === 'true');
   }
 }

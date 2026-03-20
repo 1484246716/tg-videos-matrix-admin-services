@@ -3,7 +3,6 @@ import { logger, logError } from '../logger';
 import { prisma } from '../infra/prisma';
 import { sendVideoByTelegram, TelegramError } from '../shared/telegram';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
-import { pickRandomBot } from '../shared/resource-picker';
 import { TaskStatus } from '@prisma/client';
 
 export async function handleDispatchJob(
@@ -151,7 +150,7 @@ export async function handleDispatchJob(
       throw new Error('分发任务或频道未配置机器人');
     }
 
-    let bot = await prisma.bot.findFirst({
+    const bot = await prisma.bot.findFirst({
       where: {
         id: resolvedBotId,
         status: 'active',
@@ -160,12 +159,9 @@ export async function handleDispatchJob(
     });
 
     if (!bot) {
-      bot = await pickRandomBot();
-      logger.warn('[q_dispatch] 未找到指定机器人，回退到随机机器人', {
-        dispatchTaskId: task.id.toString(),
-        resolvedBotId: resolvedBotId.toString(),
-        fallbackBotId: bot.id.toString(),
-      });
+      throw new Error(
+        `未找到可用机器人: dispatchTaskId=${task.id.toString()}, resolvedBotId=${resolvedBotId.toString()}`,
+      );
     }
 
     const sendResult = await sendVideoByTelegram({

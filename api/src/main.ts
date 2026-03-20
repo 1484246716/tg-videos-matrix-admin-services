@@ -22,31 +22,32 @@ async function bootstrap() {
         return;
       }
 
+      const normalizedOrigin = origin.replace(/\/$/, '');
       const corsOrigin = (process.env.CORS_ORIGIN || '').trim();
-      
+
       // 允许全部
       if (corsOrigin === '*') {
         callback(null, true);
         return;
       }
 
-      // 处理逗号分隔的多个域名
-      const allowedList = corsOrigin
-        .split(',')
-        .map((value) => value.trim())
-        .filter(Boolean);
+      // 开发环境下始终放行 localhost/127.0.0.1，避免本地联调预检请求 404
+      const isLocalDevOrigin =
+        /^https?:\/\/localhost(:\d+)?$/.test(normalizedOrigin) ||
+        /^https?:\/\/127\.0\.0\.1(:\d+)?$/.test(normalizedOrigin);
 
-      if (allowedList.length > 0) {
-        callback(null, allowedList.includes(origin));
+      if (process.env.NODE_ENV !== 'production' && isLocalDevOrigin) {
+        callback(null, true);
         return;
       }
 
-      // 默认放行本地开发
-      const allowed =
-        /^http:\/\/localhost:\d+$/.test(origin) ||
-        /^http:\/\/127\.0\.0\.1:\d+$/.test(origin);
+      // 处理逗号分隔的多个域名（并去除末尾斜杠，避免精确匹配失败）
+      const allowedList = corsOrigin
+        .split(',')
+        .map((value) => value.trim().replace(/\/$/, ''))
+        .filter(Boolean);
 
-      callback(null, allowed);
+      callback(null, allowedList.includes(normalizedOrigin));
     },
     // 👇 新增/强化的核心配置在这里
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS', 

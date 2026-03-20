@@ -5,7 +5,6 @@ import {
   pinMessageByTelegram,
   sendTextByTelegram,
 } from '../shared/telegram';
-import { pickRandomBot } from '../shared/resource-picker';
 import { logError } from '../logger';
 
 export async function handleCatalogJob(channelIdRaw: string) {
@@ -32,7 +31,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
     throw new Error(`频道机器人未启用: ${channelIdRaw}`);
   }
 
-  const bot = await pickRandomBot();
+  const bot = channel.defaultBot;
 
   let catalogTemplate = await prisma.catalogTemplate.findFirst({
     where: { isActive: true },

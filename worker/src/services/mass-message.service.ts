@@ -9,7 +9,6 @@ import {
   sendVideoByTelegram,
   unpinMessageByTelegram,
 } from '../shared/telegram';
-import { pickRandomBot } from '../shared/resource-picker';
 
 function resolveParseMode(format: 'markdown' | 'html' | 'plain' | null | undefined) {
   if (!format) return 'HTML';
@@ -196,7 +195,17 @@ export async function handleMassMessageItem(itemIdRaw: string) {
       throw new Error('频道未配置默认机器人');
     }
 
-    const bot = await pickRandomBot();
+    const bot = await prisma.bot.findFirst({
+      where: {
+        id: channel.defaultBotId,
+        status: 'active',
+      },
+      select: { id: true, tokenEncrypted: true },
+    });
+
+    if (!bot) {
+      throw new Error(`频道默认机器人不可用: channelId=${channel.id.toString()}, botId=${channel.defaultBotId?.toString()}`);
+    }
 
     const parseMode = resolveParseMode(format);
 

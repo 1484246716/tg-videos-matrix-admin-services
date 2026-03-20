@@ -1,8 +1,10 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   InternalServerErrorException,
   NotFoundException,
+  HttpException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
@@ -34,6 +36,86 @@ export class ChannelService {
         typeof v === 'bigint' ? v.toString() : v,
       ),
     ) as T;
+  }
+
+  private getTelegramBotApiBase() {
+    return (
+      (process.env.TELEGRAM_BOT_API_BASE || 'https://api.telegram.org').trim() ||
+      'https://api.telegram.org'
+    ).replace(/\/$/, '');
+  }
+
+  private async assertBotIsChannelAdmin(botId: string, tgChatId: string) {
+    const bot = await this.prisma.bot.findUnique({
+      where: { id: BigInt(botId) },
+      select: { id: true, tokenEncrypted: true, name: true },
+    });
+
+    if (!bot) {
+      throw new BadRequestException('请先选择有效机器人');
+    }
+
+    const token = (bot.tokenEncrypted || '').trim();
+    if (!token) {
+      throw new BadRequestException('机器人 Token 为空，无法校验管理员权限');
+    }
+
+    const apiBase = this.getTelegramBotApiBase();
+    const chatId = tgChatId.trim();
+
+    const meResp = await fetch(`${apiBase}/bot${token}/getMe`);
+    if (!meResp.ok) {
+      throw new BadRequestException(`机器人可用性校验失败: HTTP ${meResp.status}`);
+    }
+
+    const meData = (await meResp.json()) as {
+      ok?: boolean;
+      result?: { id?: number };
+      description?: string;
+    };
+
+    if (!meData.ok || !meData.result?.id) {
+      throw new BadRequestException(
+        `机器人可用性校验失败: ${meData.description || 'getMe failed'}`,
+      );
+    }
+
+    const memberResp = await fetch(
+      `${apiBase}/bot${token}/getChatMember?chat_id=${encodeURIComponent(chatId)}&user_id=${meData.result.id}`,
+    );
+
+    const memberData = (await memberResp.json().catch(() => ({}))) as {
+      ok?: boolean;
+      result?: { status?: string };
+      description?: string;
+      error_code?: number;
+    };
+
+    if (!memberResp.ok || !memberData.ok) {
+      const desc = (memberData.description || '').toLowerCase();
+
+      if (
+        desc.includes('chat not found') ||
+        desc.includes('user not found') ||
+        desc.includes('member list is inaccessible') ||
+        desc.includes('bot is not a member')
+      ) {
+        throw new BadRequestException('请先将机器人加入目标频道并设为管理员后再添加');
+      }
+
+      if (desc.includes('need administrator rights') || desc.includes('not enough rights')) {
+        throw new BadRequestException('请将机器人设为管理后添加机器人');
+      }
+
+      throw new BadRequestException(
+        `管理员身份校验失败: ${memberData.description || `HTTP ${memberResp.status}`}`,
+      );
+    }
+
+    const status = memberData.result?.status;
+    if (status !== 'administrator' && status !== 'creator') {
+      throw new BadRequestException('请将机器人设为管理后添加机器人');
+    }
   }
 
   private getChannelsRootDir() {
@@ -92,9 +174,14 @@ export class ChannelService {
 
     try {
       await access(from);
+    } catch {
+      throw new ConflictException('原目录不存在，禁止自动新建目录，请先确认原目录路径');
+    }
+
+    try {
       await rename(from, to);
     } catch {
-      await mkdir(to, { recursive: true });
+      throw new ConflictException('目录迁移失败，未执行自动新建，请检查目标路径是否可用');
     }
   }
 
@@ -156,6 +243,10 @@ export class ChannelService {
 
   async create(dto: CreateChannelDto, userId?: string, role?: string) {
     try {
+      if (dto.defaultBotId) {
+        await this.assertBotIsChannelAdmin(dto.defaultBotId, dto.tgChatId);
+      }
+
       await this.ensureFolderCreated(dto.folderPath);
 
       const created = await this.prisma.channel.create({
@@ -186,7 +277,7 @@ export class ChannelService {
         throw new ConflictException('频道 ChatId 已存在，请勿重复创建');
       }
 
-      if (error instanceof ConflictException) {
+      if (error instanceof HttpException) {
         throw error;
       }
 
@@ -298,7 +389,7 @@ export class ChannelService {
         role === 'admin'
           ? { id: BigInt(id) }
           : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
-      select: { id: true, folderPath: true },
+      select: { id: true, folderPath: true, tgChatId: true, defaultBotId: true },
     });
 
     if (!existing) {
@@ -306,6 +397,17 @@ export class ChannelService {
     }
 
     const nextFolderPath = dto.folderPath ?? existing.folderPath;
+    const nextTgChatId = dto.tgChatId ?? existing.tgChatId;
+
+    if (dto.defaultBotId) {
+      const shouldCheckBotAdmin =
+        dto.defaultBotId !== (existing.defaultBotId ? existing.defaultBotId.toString() : undefined) ||
+        nextTgChatId !== existing.tgChatId;
+
+      if (shouldCheckBotAdmin) {
+        await this.assertBotIsChannelAdmin(dto.defaultBotId, nextTgChatId);
+      }
+    }
 
     const data: Prisma.ChannelUncheckedUpdateInput = {
       name: dto.name,

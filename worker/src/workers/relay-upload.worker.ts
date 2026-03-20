@@ -9,7 +9,6 @@ import { logger, logError } from '../logger';
 import { moveToArchive, waitForFileStable } from '../shared/file-utils';
 import { sendViaGramjs } from '../shared/gramjs/upload';
 import { getTelegramUpdates, sendTelegramRequest } from '../shared/telegram';
-import { pickRandomRelayChannel } from '../shared/resource-picker';
 import { MediaStatus } from '@prisma/client';
 import {
   GRAMJS_FORWARD_TARGET_CHAT_ID,
@@ -93,14 +92,59 @@ export const relayUploadWorker = new Worker(
       };
     }
 
-    const relayChannel = await pickRandomRelayChannel();
+    if (!mediaAsset.channelId) {
+      throw new Error(`媒体资源缺少关联频道: ${mediaAssetIdRaw}`);
+    }
+
+    const channel = await prisma.channel.findUnique({
+      where: { id: mediaAsset.channelId },
+      select: { id: true, defaultBotId: true, status: true },
+    });
+
+    if (!channel) {
+      throw new Error(`未找到媒体所属频道: ${mediaAsset.channelId.toString()}`);
+    }
+
+    if (!channel.defaultBotId) {
+      throw new Error(`频道未绑定机器人: channelId=${channel.id.toString()}`);
+    }
+
+    const relayChannel = await prisma.relayChannel.findFirst({
+      where: {
+        botId: channel.defaultBotId,
+        isActive: true,
+      },
+      include: {
+        bot: {
+          select: { id: true, tokenEncrypted: true, status: true },
+        },
+      },
+      orderBy: [{ id: 'asc' }],
+    });
+
+    if (!relayChannel) {
+      throw new Error(
+        `未找到可用中转频道: channelId=${channel.id.toString()}, botId=${channel.defaultBotId.toString()}`,
+      );
+    }
+
+    if (relayChannel.bot.status !== 'active') {
+      throw new Error(
+        `中转频道绑定机器人未启用: relayChannelId=${relayChannel.id.toString()}, botId=${relayChannel.bot.id.toString()}`,
+      );
+    }
+
     const selectedRelayChannelId = relayChannel.id?.toString?.() ?? String(relayChannel.id);
 
-    logger.info('[q_relay_upload] 随机选中中转频道', {
+    logger.info('[q_relay_upload] 固定选中中转频道(按频道绑定bot)', {
       traceId,
       mediaAssetId: mediaAssetIdRaw,
+      channelId: channel.id.toString(),
+      channelBotId: channel.defaultBotId.toString(),
       relayChannelId: selectedRelayChannelId,
+      relayBotId: relayChannel.bot.id.toString(),
       sourceRelayChannelId: relayChannelIdRaw,
+      pickMode: 'fixed_by_channel_bot',
     });
 
     const stableCheckStart = Date.now();
