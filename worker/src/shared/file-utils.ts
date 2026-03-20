@@ -2,7 +2,12 @@ import { createReadStream } from 'node:fs';
 import { mkdir, readdir, rename, stat } from 'node:fs/promises';
 import { basename, dirname, extname, join, normalize, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import {
+  RELAY_ENABLE_FFPROBE_CHECK,
+  RELAY_FFPROBE_MIN_DURATION_SEC,
+  RELAY_FFPROBE_TIMEOUT_MS,
   RELAY_MIN_STABLE_CHECKS,
   RELAY_MTIME_COOLDOWN_MS,
   RELAY_STABLE_INTERVAL_MS,
@@ -18,6 +23,7 @@ const SUPPORTED_VIDEO_EXT = new Set([
   '.webm',
 ]);
 
+const execFileAsync = promisify(execFile);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function moveToArchive(localPath: string): Promise<string> {
@@ -38,7 +44,70 @@ export async function moveToArchive(localPath: string): Promise<string> {
   return archivePath;
 }
 
+async function probeVideoByFfprobe(filePath: string) {
+  const probeStart = Date.now();
+  logger.info('[relay] ffprobe 开始探测', {
+    stage: 'ffprobe_start',
+    filePath,
+    timeoutMs: RELAY_FFPROBE_TIMEOUT_MS,
+    minDurationSec: RELAY_FFPROBE_MIN_DURATION_SEC,
+  });
+
+  const { stdout } = await execFileAsync(
+    'ffprobe',
+    [
+      '-v',
+      'error',
+      '-show_streams',
+      '-show_format',
+      '-of',
+      'json',
+      filePath,
+    ],
+    { timeout: RELAY_FFPROBE_TIMEOUT_MS },
+  );
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(stdout || '{}');
+  } catch {
+    throw new Error('ffprobe 输出非 JSON，无法解析');
+  }
+
+  const streams = Array.isArray(parsed?.streams) ? parsed.streams : [];
+  const hasVideoStream = streams.some((s: any) => s?.codec_type === 'video');
+  if (!hasVideoStream) {
+    throw new Error('ffprobe 未检测到视频流');
+  }
+
+  const durationRaw = parsed?.format?.duration;
+  const duration = Number(durationRaw);
+  if (!Number.isFinite(duration) || duration < RELAY_FFPROBE_MIN_DURATION_SEC) {
+    throw new Error(
+      `ffprobe 时长异常: duration=${String(durationRaw)}, min=${RELAY_FFPROBE_MIN_DURATION_SEC}`,
+    );
+  }
+
+  logger.info('[relay] ffprobe 探测通过', {
+    stage: 'ffprobe_pass',
+    filePath,
+    durationSec: duration,
+    streamCount: streams.length,
+    elapsedMs: Date.now() - probeStart,
+  });
+}
+
 export async function waitForFileStable(filePath: string) {
+  const stableStart = Date.now();
+  logger.info('[relay] 文件稳定性检查开始', {
+    stage: 'stable_check_start',
+    filePath,
+    minStableChecks: RELAY_MIN_STABLE_CHECKS,
+    stableIntervalMs: RELAY_STABLE_INTERVAL_MS,
+    mtimeCooldownMs: RELAY_MTIME_COOLDOWN_MS,
+    ffprobeEnabled: RELAY_ENABLE_FFPROBE_CHECK,
+  });
+
   let previousSize: number | null = null;
   let stableCount = 0;
 
@@ -59,9 +128,55 @@ export async function waitForFileStable(filePath: string) {
 
   const finalStat = await stat(filePath);
   const ageMs = Date.now() - finalStat.mtimeMs;
+
+  logger.info('[relay] 静默期判定结果', {
+    stage: 'mtime_cooldown_check',
+    filePath,
+    fileSize: Number(finalStat.size),
+    ageMs: Math.floor(ageMs),
+    requiredCooldownMs: RELAY_MTIME_COOLDOWN_MS,
+    passed: ageMs >= RELAY_MTIME_COOLDOWN_MS,
+  });
+
   if (ageMs < RELAY_MTIME_COOLDOWN_MS) {
-    await sleep(RELAY_MTIME_COOLDOWN_MS - ageMs);
+    throw new Error(
+      `文件处于静默冷却期，最后修改距今 ${Math.floor(ageMs / 1000)} 秒，要求至少 ${Math.floor(RELAY_MTIME_COOLDOWN_MS / 1000)} 秒`,
+    );
   }
+
+  if (!RELAY_ENABLE_FFPROBE_CHECK) {
+    logger.info('[relay] 已跳过 ffprobe 探测（配置关闭）', {
+      stage: 'ffprobe_skipped',
+      filePath,
+    });
+    logger.info('[relay] 文件稳定性检查通过', {
+      stage: 'stable_check_pass',
+      filePath,
+      elapsedMs: Date.now() - stableStart,
+      ffprobeEnabled: false,
+    });
+    return;
+  }
+
+  try {
+    await probeVideoByFfprobe(filePath);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    logger.warn('[relay] ffprobe 检测未通过，跳过', {
+      stage: 'ffprobe_fail',
+      filePath,
+      reason,
+      elapsedMs: Date.now() - stableStart,
+    });
+    throw new Error(`ffprobe 检测未通过: ${reason}`);
+  }
+
+  logger.info('[relay] 文件稳定性检查通过', {
+    stage: 'stable_check_pass',
+    filePath,
+    elapsedMs: Date.now() - stableStart,
+    ffprobeEnabled: true,
+  });
 }
 
 export async function hashFile(filePath: string): Promise<string> {

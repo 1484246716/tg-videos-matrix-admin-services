@@ -4,10 +4,10 @@ WORKDIR /app
 
 ENV NODE_ENV=development
 
-# 1. 配置 Debian 镜像源并安装 openssl（修复之前的报错）
+# 1. 配置 Debian 镜像源并安装运行依赖（openssl + ffmpeg/ffprobe）
 RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources && \
     sed -i 's/security.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources
-RUN apt-get update -y && apt-get install -y openssl
+RUN apt-get update -y && apt-get install -y openssl ffmpeg
 
 # 2. 全局安装 pnpm 并配置国内镜像
 RUN npm install -g pnpm --registry=https://registry.npmmirror.com
