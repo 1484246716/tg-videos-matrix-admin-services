@@ -14,7 +14,11 @@ import {
   GRAMJS_FORWARD_TARGET_CHAT_ID,
   GRAMJS_UPLOAD_WORKERS,
   RELAY_UPLOAD_GRAMJS_THRESHOLD_MB,
+  TYPEA_FAIL_ON_FILE_MISSING,
+  TYPEA_INGEST_LEASE_MS,
+  TYPEA_INGEST_MAX_RETRIES,
 } from '../config/env';
+import { TYPEA_INGEST_ERROR_CODE, TYPEA_INGEST_FINAL_REASON } from '../shared/metrics';
 
 const PROGRESS_TTL_SECONDS = 24 * 60 * 60;
 const PROGRESS_WRITE_INTERVAL_MS = 5000;
@@ -62,6 +66,9 @@ export const relayUploadWorker = new Worker(
     const mediaAssetId = BigInt(mediaAssetIdRaw);
     const traceId = `relay-upload-${mediaAssetIdRaw}-${Date.now()}`;
 
+    const buildLeaseUntil = () =>
+      new Date(Date.now() + TYPEA_INGEST_LEASE_MS).toISOString();
+
     const mediaAsset = await prisma.mediaAsset.findUnique({
       where: { id: mediaAssetId },
       include: {
@@ -77,6 +84,28 @@ export const relayUploadWorker = new Worker(
     if (!mediaAsset) {
       throw new Error(`未找到媒体资源: ${mediaAssetIdRaw}`);
     }
+
+    const sourceMetaBase =
+      mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
+        ? (mediaAsset.sourceMeta as Record<string, unknown>)
+        : {};
+
+    const heartbeat = async (extra?: Record<string, unknown>) => {
+      await prisma.mediaAsset.update({
+        where: { id: mediaAssetId },
+        data: {
+          sourceMeta: {
+            ...sourceMetaBase,
+            ...(extra || {}),
+            ingestLeaseUntil: buildLeaseUntil(),
+            ingestWorkerJobId: String(job.id),
+            ingestLastHeartbeatAt: new Date().toISOString(),
+          },
+        },
+      });
+    };
+
+    await heartbeat();
 
     if (mediaAsset.status === MediaStatus.relay_uploaded) {
       logger.info('[q_relay_upload] 任务已完成，跳过重复执行', {
@@ -148,6 +177,7 @@ export const relayUploadWorker = new Worker(
     });
 
     const stableCheckStart = Date.now();
+    await heartbeat({ ingestStage: 'wait_for_stable' });
     await waitForFileStable(mediaAsset.localPath);
     const stableCheckDurationMs = Date.now() - stableCheckStart;
     if (stableCheckDurationMs > 1000) {
@@ -295,6 +325,10 @@ export const relayUploadWorker = new Worker(
               ? (mediaAsset.sourceMeta as Record<string, unknown>)
               : {}),
             relayBotId: relayChannel.bot.id.toString(),
+            ingestLeaseUntil: null,
+            ingestLastHeartbeatAt: new Date().toISOString(),
+            ingestWorkerJobId: null,
+            ingestStage: 'done',
           },
           ...(archivePath ? { archivePath, localPath: archivePath } : {}),
         },
@@ -412,6 +446,10 @@ export const relayUploadWorker = new Worker(
       });
     }, 60 * 1000);
 
+    const heartbeatTicker = setInterval(() => {
+      void heartbeat({ ingestStage: 'uploading' });
+    }, 20 * 1000);
+
     let sendResult;
     try {
       sendResult = await sendTelegramRequest({
@@ -421,6 +459,7 @@ export const relayUploadWorker = new Worker(
       });
     } catch (err: any) {
       clearInterval(progressTicker);
+      clearInterval(heartbeatTicker);
       logger.info('[q_relay_upload] 上传请求耗时', {
         traceId,
         stage: 'send_request',
@@ -462,6 +501,10 @@ export const relayUploadWorker = new Worker(
                   ? (mediaAsset.sourceMeta as Record<string, unknown>)
                   : {}),
                 relayBotId: relayChannel.bot.id.toString(),
+                ingestLeaseUntil: null,
+                ingestLastHeartbeatAt: new Date().toISOString(),
+                ingestWorkerJobId: null,
+                ingestStage: 'done',
               },
             },
           });
@@ -491,10 +534,12 @@ export const relayUploadWorker = new Worker(
 
     if (!sendResult.messageId) {
       clearInterval(progressTicker);
+      clearInterval(heartbeatTicker);
       throw new Error('中转上传成功但缺少 Telegram message_id');
     }
 
     clearInterval(progressTicker);
+    clearInterval(heartbeatTicker);
 
     await writeProgress({
       mediaAssetId: mediaAssetIdRaw,
@@ -552,6 +597,10 @@ export const relayUploadWorker = new Worker(
               ? (mediaAsset.sourceMeta as Record<string, unknown>)
               : {}),
             relayBotId: relayChannel.bot.id.toString(),
+            ingestLeaseUntil: null,
+            ingestLastHeartbeatAt: new Date().toISOString(),
+            ingestWorkerJobId: null,
+            ingestStage: 'done',
           },
           ...(archivePath ? { archivePath, localPath: archivePath } : {}),
         },
@@ -600,26 +649,70 @@ relayUploadWorker.on('completed', (job) => {
 
 relayUploadWorker.on('failed', async (job, err) => {
   const mediaAssetIdRaw = job?.data?.mediaAssetId as string | undefined;
-  let shouldMarkFailed = true;
 
-  if (mediaAssetIdRaw && err instanceof Error) {
-    if (err.message.includes('ENOENT')) {
+  if (mediaAssetIdRaw) {
       const asset = await prisma.mediaAsset.findUnique({
         where: { id: BigInt(mediaAssetIdRaw) },
-        select: { status: true },
+      select: { status: true, sourceMeta: true },
       });
-      if (asset?.status === MediaStatus.relay_uploaded) {
-        shouldMarkFailed = false;
-      }
-    }
-  }
 
-  if (mediaAssetIdRaw && shouldMarkFailed) {
+    const sourceMeta =
+      asset?.sourceMeta && typeof asset.sourceMeta === 'object'
+        ? (asset.sourceMeta as Record<string, unknown>)
+        : {};
+
+    const ingestRetryCountRaw = sourceMeta.ingestRetryCount;
+    const ingestRetryCount =
+      typeof ingestRetryCountRaw === 'number'
+        ? ingestRetryCountRaw
+        : typeof ingestRetryCountRaw === 'string' && /^\d+$/.test(ingestRetryCountRaw)
+          ? Number(ingestRetryCountRaw)
+          : 0;
+
+    const message = err instanceof Error ? err.message : String(err);
+    const isFileMissing = message.includes('ENOENT');
+    const exceeded = ingestRetryCount >= TYPEA_INGEST_MAX_RETRIES;
+    const finalOnMissing = TYPEA_FAIL_ON_FILE_MISSING && isFileMissing;
+
+    if (asset?.status !== MediaStatus.relay_uploaded) {
     await prisma.mediaAsset.update({
       where: { id: BigInt(mediaAssetIdRaw) },
       data: {
         status: MediaStatus.failed,
-        ingestError: err instanceof Error ? err.message : '未知错误',
+          ingestError: isFileMissing
+            ? 'SRC_FILE_MISSING: source file not found'
+            : message || '未知错误',
+          sourceMeta: {
+            ...sourceMeta,
+            ingestRetryCount,
+            ingestErrorCode: isFileMissing
+              ? TYPEA_INGEST_ERROR_CODE.srcFileMissing
+              : TYPEA_INGEST_ERROR_CODE.ingestRuntimeError,
+            ingestFinalReason: exceeded || finalOnMissing
+              ? TYPEA_INGEST_FINAL_REASON.failedFinal
+              : TYPEA_INGEST_FINAL_REASON.retryable,
+            ingestLeaseUntil: null,
+            ingestWorkerJobId: null,
+            ingestLastHeartbeatAt: new Date().toISOString(),
+            ingestStage: 'failed',
+          },
+        },
+      });
+    }
+
+    logger.info('[typea_metrics] relay upload failed', {
+      mediaAssetId: mediaAssetIdRaw,
+      typea_file_missing_total: isFileMissing ? 1 : 0,
+      typea_failed_final_total: exceeded || finalOnMissing ? 1 : 0,
+      task_run_total: 1,
+      task_failed_total: 1,
+      task_dead_total: exceeded || finalOnMissing ? 1 : 0,
+      ingestRetryCount,
+      maxRetries: TYPEA_INGEST_MAX_RETRIES,
+      failOnFileMissing: TYPEA_FAIL_ON_FILE_MISSING,
+      metric_labels: {
+        typea_file_missing_total: 'TypeA 源文件缺失总数',
+        typea_failed_final_total: 'TypeA 失败终态总数',
       },
     });
   }

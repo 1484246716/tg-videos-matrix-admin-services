@@ -4,6 +4,9 @@ import { logger, logError } from '../logger';
 import { telegramApiBase } from '../config/env';
 import { scheduleEnabledTaskDefinitions } from '../scheduler/task-definition-scheduler';
 import { scheduleDueMassMessageItems } from '../scheduler/mass-message-scheduler';
+import { reconcileTypeAStuckAssets } from '../services/typea-reconcile.service';
+import { auditTypeAHealth } from '../services/typea-audit.service';
+import { TYPEA_RECONCILE_ENABLED } from '../config/env';
 import '../workers/dispatch.worker';
 import '../workers/relay-upload.worker';
 import '../workers/catalog.worker';
@@ -75,6 +78,16 @@ export async function bootstrapWorker() {
     void scheduleDueMassMessageItems().catch((err) => {
       logError('[scheduler:mass-message-items] 调度异常', err);
     });
+
+    if (TYPEA_RECONCILE_ENABLED) {
+      void reconcileTypeAStuckAssets().catch((err) => {
+        logError('[scheduler:typea-reconcile] 对账修复异常', err);
+      });
+
+      void auditTypeAHealth().catch((err) => {
+        logError('[scheduler:typea-audit] 巡检快照异常', err);
+      });
+    }
   }, 5000);
 
   logger.info(

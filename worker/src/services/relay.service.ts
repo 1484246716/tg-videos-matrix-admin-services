@@ -106,6 +106,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
               relayEnqueueAt: new Date().toISOString(),
               relayPriority: definition.priority,
               relayMaxRetries: definition.maxRetries,
+              ingestRetryCount: 0,
             },
           },
           select: { id: true, status: true },

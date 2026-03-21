@@ -44,4 +44,29 @@ export const RELAY_ENABLE_FFPROBE_CHECK = process.env.RELAY_ENABLE_FFPROBE_CHECK
 export const RELAY_FFPROBE_TIMEOUT_MS = parseInt(process.env.RELAY_FFPROBE_TIMEOUT_MS || '15000', 10);
 export const RELAY_FFPROBE_MIN_DURATION_SEC = parseInt(process.env.RELAY_FFPROBE_MIN_DURATION_SEC || '1', 10);
 
+export const TYPEA_INGEST_MAX_RETRIES = Number(
+  process.env.TYPEA_INGEST_MAX_RETRIES || '3',
+);
+export const TYPEA_INGEST_STALE_MS = Number(
+  process.env.TYPEA_INGEST_STALE_MS || '1800000',
+);
+export const TYPEA_RECONCILE_BATCH = Number(
+  process.env.TYPEA_RECONCILE_BATCH || '200',
+);
+export const TYPEA_INGEST_LEASE_MS = Number(
+  process.env.TYPEA_INGEST_LEASE_MS || '900000',
+);
+export const TYPEA_RECONCILE_ENABLED =
+  process.env.TYPEA_RECONCILE_ENABLED !== 'false';
+export const TYPEA_FAIL_ON_FILE_MISSING =
+  process.env.TYPEA_FAIL_ON_FILE_MISSING !== 'false';
 
+export const TYPEA_ALERT_STALE_THRESHOLD = Number(
+  process.env.TYPEA_ALERT_STALE_THRESHOLD || '0',
+);
+export const TYPEA_ALERT_FAILED_FINAL_SPIKE_THRESHOLD = Number(
+  process.env.TYPEA_ALERT_FAILED_FINAL_SPIKE_THRESHOLD || '5',
+);
+export const TYPEA_ALERT_QUEUE_STUCK_MINUTES = Number(
+  process.env.TYPEA_ALERT_QUEUE_STUCK_MINUTES || '5',
+);

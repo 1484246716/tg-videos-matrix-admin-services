@@ -1,13 +1,19 @@
 import { MediaStatus } from '@prisma/client';
-import { MAX_SCHEDULE_BATCH } from '../config/env';
+import {
+  MAX_SCHEDULE_BATCH,
+  TYPEA_INGEST_LEASE_MS,
+  TYPEA_INGEST_MAX_RETRIES,
+  TYPEA_INGEST_STALE_MS,
+} from '../config/env';
 import { prisma } from '../infra/prisma';
 import { relayUploadQueue } from '../infra/redis';
 import { logger } from '../logger';
 import { updateTaskDefinitionRunStatus } from '../services/task-definition.service';
 import { enqueueRelayAssetsFromTaskDefinition } from '../services/relay.service';
+import { TYPEA_INGEST_FINAL_REASON } from '../shared/metrics';
 
 export async function scheduleDueRelayUploadTasks() {
-  const staleIngestingBefore = new Date(Date.now() - 5 * 60 * 1000);
+  const staleIngestingBefore = new Date(Date.now() - TYPEA_INGEST_STALE_MS);
 
   const candidateAssets = await prisma.mediaAsset.findMany({
     where: {
@@ -61,11 +67,42 @@ export async function scheduleDueRelayUploadTasks() {
   }
 
   let queuedCount = 0;
+  let staleRecoveredCount = 0;
+  let failedFinalCount = 0;
 
   for (const asset of selectedAssets) {
     const sourceMeta = (asset.sourceMeta ?? {}) as Record<string, unknown>;
     const relayChannelId = sourceMeta.relayChannelId;
     if (typeof relayChannelId !== 'string' || !relayChannelId.trim()) continue;
+
+    const ingestRetryCountRaw = sourceMeta.ingestRetryCount;
+    const ingestRetryCount =
+      typeof ingestRetryCountRaw === 'number'
+        ? ingestRetryCountRaw
+        : typeof ingestRetryCountRaw === 'string' && /^\d+$/.test(ingestRetryCountRaw)
+          ? Number(ingestRetryCountRaw)
+          : 0;
+
+    if (asset.status === MediaStatus.ingesting) {
+      if (ingestRetryCount >= TYPEA_INGEST_MAX_RETRIES) {
+        await prisma.mediaAsset.update({
+          where: { id: asset.id },
+          data: {
+            status: MediaStatus.failed,
+            ingestError: `ingesting stale exceed max retries (${TYPEA_INGEST_MAX_RETRIES})`,
+            sourceMeta: {
+              ...sourceMeta,
+              ingestRetryCount,
+              ingestFinalReason: TYPEA_INGEST_FINAL_REASON.staleIngestingExceeded,
+            },
+          },
+        });
+        failedFinalCount += 1;
+        continue;
+      }
+
+      staleRecoveredCount += 1;
+    }
 
     const whereReady = {
       id: asset.id,
@@ -87,6 +124,14 @@ export async function scheduleDueRelayUploadTasks() {
       data: {
         status: MediaStatus.ingesting,
         updatedAt: new Date(),
+        sourceMeta: {
+          ...sourceMeta,
+          ingestRetryCount: asset.status === MediaStatus.ingesting ? ingestRetryCount + 1 : ingestRetryCount,
+          ingestLastScheduledAt: new Date().toISOString(),
+          ingestLeaseUntil: new Date(Date.now() + TYPEA_INGEST_LEASE_MS).toISOString(),
+          ingestLastHeartbeatAt: new Date().toISOString(),
+          ingestWorkerJobId: null,
+        },
       },
     });
 
@@ -119,17 +164,36 @@ export async function scheduleDueRelayUploadTasks() {
     queuedCount += 1;
   }
 
-  if (queuedCount > 0) {
-    logger.info('[scheduler] 已入队中转上传任务', {
-      count: queuedCount,
-      mode: 'round_robin_by_channel',
-    });
-  }
+  logger.info('[typea_metrics] relay schedule tick', {
+    typea_enqueue_total: queuedCount,
+    typea_ingesting_stale_total: staleRecoveredCount,
+    typea_failed_final_total: failedFinalCount,
+    task_run_total: queuedCount,
+    task_failed_total: 0,
+    task_dead_total: failedFinalCount,
+    metric_labels: {
+      typea_enqueue_total: 'TypeA 入队总数',
+      typea_ingesting_stale_total: 'TypeA ingesting 超时回收总数',
+      typea_failed_final_total: 'TypeA 失败终态总数',
+    },
+    mode: 'round_robin_by_channel',
+  });
 }
 
 export async function scheduleRelayForDefinition(taskDefinitionId: bigint) {
   try {
     const enqueueSummary = await enqueueRelayAssetsFromTaskDefinition(taskDefinitionId);
+
+    logger.info('[typea_metrics] relay scan summary', {
+      typea_scan_files_total: enqueueSummary.scannedFiles,
+      typea_enqueue_total: enqueueSummary.enqueuedTasks,
+      metric_labels: {
+        typea_scan_files_total: 'TypeA 扫描文件总数',
+        typea_enqueue_total: 'TypeA 入队总数（扫描阶段）',
+      },
+      taskDefinitionId: taskDefinitionId.toString(),
+    });
+
     await scheduleDueRelayUploadTasks();
     await updateTaskDefinitionRunStatus({
       taskDefinitionId,
