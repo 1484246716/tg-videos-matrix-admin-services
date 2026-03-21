@@ -19,8 +19,13 @@ const SUPPORTED_VIDEO_EXT = new Set([
   '.mkv',
   '.mov',
   '.avi',
-  '.m4v',
   '.webm',
+  '.flv',
+  '.wmv',
+  '.mpeg',
+  '.mpg',
+  '.3gp',
+  '.m4v',
 ]);
 
 const execFileAsync = promisify(execFile);

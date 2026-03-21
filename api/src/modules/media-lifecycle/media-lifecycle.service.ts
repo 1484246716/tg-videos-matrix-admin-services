@@ -3,8 +3,10 @@ import {
   Injectable,
   InternalServerErrorException,
   NotFoundException,
+  BadRequestException,
 } from '@nestjs/common';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
+import { access, unlink } from 'node:fs/promises';
 import IORedis from 'ioredis';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -26,6 +28,31 @@ const STAGE_FILTER_MAP: Record<string, { mediaStatus?: any; dispatchStatus?: any
   cataloged: { catalogStatus: 'success' },
   failed: { mediaStatus: 'failed' },
 };
+
+const INGEST_STUCK_TIMEOUT_CODE = 'INGEST_STUCK_TIMEOUT';
+const INGEST_STUCK_FORCE_DELETE_GRACE_MS = Number(
+  process.env.TYPEA_INGEST_STALE_MS || '1800000',
+);
+
+async function removeFileIfExists(filePath?: string | null) {
+  if (!filePath) return { deleted: false, reason: 'empty_path' };
+
+  try {
+    await access(filePath);
+  } catch {
+    return { deleted: false, reason: 'not_found' };
+  }
+
+  try {
+    await unlink(filePath);
+    return { deleted: true, reason: 'deleted' };
+  } catch (error) {
+    return {
+      deleted: false,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
 
 @Injectable()
 export class MediaLifecycleService {
@@ -85,15 +112,6 @@ export class MediaLifecycleService {
       })
       : [];
 
-    const catalogTasks = stageFilter?.catalogStatus
-      ? await this.prisma.catalogTask.findMany({
-        where: {
-          status: stageFilter.catalogStatus,
-        },
-        orderBy: { createdAt: 'desc' },
-        include: { channel: { select: { id: true, name: true } } },
-      })
-      : [];
 
     const dispatchMap = new Map<string, typeof dispatchTasks>();
     dispatchTasks.forEach((task) => {
@@ -128,6 +146,30 @@ export class MediaLifecycleService {
             telegramErrorMessage: latestDispatch.telegramErrorMessage,
           }
           : null,
+        ingestErrorCode:
+          asset.sourceMeta && typeof asset.sourceMeta === 'object'
+            ? (() => {
+                const code = (asset.sourceMeta as Record<string, unknown>).ingestErrorCode;
+                return typeof code === 'string' ? code : null;
+              })()
+            : null,
+        canForceDelete:
+          asset.status === 'ingesting' &&
+          (() => {
+            const sourceMeta =
+              asset.sourceMeta && typeof asset.sourceMeta === 'object'
+                ? (asset.sourceMeta as Record<string, unknown>)
+                : {};
+            const ingestErrorCode =
+              typeof sourceMeta.ingestErrorCode === 'string'
+                ? sourceMeta.ingestErrorCode
+                : '';
+            if (ingestErrorCode === INGEST_STUCK_TIMEOUT_CODE) return true;
+
+            const updatedAtMs = new Date(asset.updatedAt).getTime();
+            if (!updatedAtMs || Number.isNaN(updatedAtMs)) return false;
+            return Date.now() - updatedAtMs >= INGEST_STUCK_FORCE_DELETE_GRACE_MS;
+          })(),
       };
     });
   }
@@ -294,19 +336,65 @@ export class MediaLifecycleService {
     };
   }
 
-  async remove(id: string) {
+  async remove(id: string, force = false) {
     const mediaAssetId = BigInt(id);
 
     const existing = await this.prisma.mediaAsset.findUnique({
       where: { id: mediaAssetId },
-      select: { id: true },
+      select: {
+        id: true,
+        status: true,
+        updatedAt: true,
+        sourceMeta: true,
+        localPath: true,
+        archivePath: true,
+      },
     });
 
     if (!existing) {
       throw new NotFoundException('media asset not found');
     }
 
+    if (existing.status === 'ingesting' && !force) {
+      const sourceMeta =
+        existing.sourceMeta && typeof existing.sourceMeta === 'object'
+          ? (existing.sourceMeta as Record<string, unknown>)
+          : {};
+      const ingestErrorCode =
+        typeof sourceMeta.ingestErrorCode === 'string'
+          ? sourceMeta.ingestErrorCode
+          : '';
+      const updatedAtMs = new Date(existing.updatedAt).getTime();
+      const isLikelyStuck =
+        ingestErrorCode === INGEST_STUCK_TIMEOUT_CODE ||
+        (!!updatedAtMs && !Number.isNaN(updatedAtMs)
+          ? Date.now() - updatedAtMs >= INGEST_STUCK_FORCE_DELETE_GRACE_MS
+          : false);
+
+      if (!isLikelyStuck) {
+        throw new BadRequestException('该视频正在中转上传中，暂不允许删除');
+      }
+
+      throw new BadRequestException(
+        '该视频疑似卡住，请使用 force=1 进行强制停止并删除',
+      );
+    }
+
     try {
+      const localDelete = await removeFileIfExists(existing.localPath);
+      const archiveDelete =
+        existing.archivePath && existing.archivePath !== existing.localPath
+          ? await removeFileIfExists(existing.archivePath)
+          : { deleted: false, reason: 'same_or_empty_path' };
+
+      const hasPhysicalDeleteError = [localDelete, archiveDelete].some(
+        (result) => result.reason !== 'deleted' && result.reason !== 'not_found' && result.reason !== 'same_or_empty_path',
+      );
+
+      if (hasPhysicalDeleteError) {
+        throw new InternalServerErrorException('物理文件删除失败，请检查文件权限后重试');
+      }
+
       const deleted = await this.prisma.$transaction(async (tx) => {
         const dispatchTasks = await tx.dispatchTask.findMany({
           where: { mediaAssetId },
@@ -337,6 +425,10 @@ export class MediaLifecycleService {
       return {
         id: deleted.id.toString(),
         ok: true,
+        physicalDeleted: {
+          local: localDelete,
+          archive: archiveDelete,
+        },
       };
     } catch (error) {
       if (

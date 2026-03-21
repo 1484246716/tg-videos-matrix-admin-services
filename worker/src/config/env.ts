@@ -60,6 +60,9 @@ export const TYPEA_RECONCILE_ENABLED =
   process.env.TYPEA_RECONCILE_ENABLED !== 'false';
 export const TYPEA_FAIL_ON_FILE_MISSING =
   process.env.TYPEA_FAIL_ON_FILE_MISSING !== 'false';
+export const TYPEA_MAX_UPLOAD_SIZE_MB = Number(
+  process.env.TYPEA_MAX_UPLOAD_SIZE_MB || '2048',
+);
 
 export const TYPEA_ALERT_STALE_THRESHOLD = Number(
   process.env.TYPEA_ALERT_STALE_THRESHOLD || '0',

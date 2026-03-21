@@ -83,10 +83,12 @@ export async function reconcileTypeAStuckAssets() {
         await prisma.mediaAsset.update({
           where: { id: asset.id },
           data: {
-            status: MediaStatus.ready,
-            ingestError: null,
+            status: MediaStatus.failed,
+            ingestError: 'INGEST_STUCK_TIMEOUT: lease expired and upload job is not active',
             sourceMeta: {
               ...sourceMeta,
+              ingestErrorCode: TYPEA_INGEST_ERROR_CODE.ingestStuckTimeout,
+              ingestFinalReason: TYPEA_INGEST_FINAL_REASON.retryable,
               ingestLeaseUntil: null,
               ingestWorkerJobId: null,
               ingestRecoveredAt: new Date().toISOString(),

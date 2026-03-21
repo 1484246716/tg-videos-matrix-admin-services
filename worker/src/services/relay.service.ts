@@ -1,9 +1,11 @@
 import { stat } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { MediaStatus } from '@prisma/client';
+import { TYPEA_MAX_UPLOAD_SIZE_MB } from '../config/env';
 import { prisma, getTaskDefinitionModel } from '../infra/prisma';
-import { hashFile, scanChannelVideos, waitForFileStable } from '../shared/file-utils';
 import { logger } from '../logger';
+import { hashFile, scanChannelVideos, waitForFileStable } from '../shared/file-utils';
+import { TYPEA_INGEST_ERROR_CODE, TYPEA_INGEST_FINAL_REASON } from '../shared/metrics';
 
 export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
   const definition = await getTaskDefinitionModel().findUnique({
@@ -42,9 +44,12 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
     select: { id: true, folderPath: true },
   });
 
+  const maxUploadSizeBytes = TYPEA_MAX_UPLOAD_SIZE_MB * 1024 * 1024;
+
   let scannedFiles = 0;
   let createdAssets = 0;
   let enqueuedTasks = 0;
+  let rejectedTooLarge = 0;
 
   for (const channel of channels) {
     let files: string[] = [];
@@ -68,6 +73,82 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
       }
 
       const s = await stat(filePath);
+
+      if (s.size > maxUploadSizeBytes) {
+        const ingestError = `FILE_TOO_LARGE: file size ${s.size} exceeds ${maxUploadSizeBytes} bytes (${TYPEA_MAX_UPLOAD_SIZE_MB}MB policy)`;
+
+        const fileHash = await hashFile(filePath);
+        const existed = await prisma.mediaAsset.findUnique({
+          where: {
+            fileHash_fileSize: {
+              fileHash,
+              fileSize: s.size,
+            },
+          },
+          select: { id: true, sourceMeta: true },
+        });
+
+        const sourceMeta =
+          existed?.sourceMeta && typeof existed.sourceMeta === 'object'
+            ? (existed.sourceMeta as Record<string, unknown>)
+            : {};
+
+        if (existed) {
+          await prisma.mediaAsset.update({
+            where: { id: existed.id },
+            data: {
+              status: MediaStatus.failed,
+              ingestError,
+              sourceMeta: {
+                ...sourceMeta,
+                relayChannelId: definition.relayChannelId.toString(),
+                taskDefinitionId: definition.id.toString(),
+                ingestErrorCode: TYPEA_INGEST_ERROR_CODE.fileTooLarge,
+                ingestFinalReason: TYPEA_INGEST_FINAL_REASON.fileTooLarge,
+                ingestLeaseUntil: null,
+                ingestWorkerJobId: null,
+                ingestRejectedAt: new Date().toISOString(),
+              },
+            },
+          });
+        } else {
+          await prisma.mediaAsset.create({
+            data: {
+              channelId: channel.id,
+              originalName: basename(filePath),
+              localPath: filePath,
+              fileSize: BigInt(s.size),
+              fileHash,
+              status: MediaStatus.failed,
+              ingestError,
+              sourceMeta: {
+                relayChannelId: definition.relayChannelId.toString(),
+                taskDefinitionId: definition.id.toString(),
+                ingestErrorCode: TYPEA_INGEST_ERROR_CODE.fileTooLarge,
+                ingestFinalReason: TYPEA_INGEST_FINAL_REASON.fileTooLarge,
+                ingestRejectedAt: new Date().toISOString(),
+                relayPriority: definition.priority,
+                relayMaxRetries: definition.maxRetries,
+              },
+            },
+          });
+          createdAssets += 1;
+        }
+
+        rejectedTooLarge += 1;
+        logger.warn('[typea_metrics] relay scan rejected too large file', {
+          typea_rejected_too_large_total: 1,
+          filePath,
+          fileSize: s.size,
+          maxUploadSizeBytes,
+          maxUploadSizeMb: TYPEA_MAX_UPLOAD_SIZE_MB,
+          metric_labels: {
+            typea_rejected_too_large_total: 'TypeA 超大小文件拒绝总数',
+          },
+        });
+        continue;
+      }
+
       const hashStart = Date.now();
       const fileHash = await hashFile(filePath);
       const hashDurationMs = Date.now() - hashStart;
@@ -88,7 +169,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
             fileSize: s.size,
           },
         },
-        select: { id: true, status: true },
+        select: { id: true, status: true, sourceMeta: true },
       });
 
       if (!asset) {
@@ -109,24 +190,52 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
               ingestRetryCount: 0,
             },
           },
-          select: { id: true, status: true },
+          select: { id: true, status: true, sourceMeta: true },
         });
         createdAssets += 1;
       }
 
+      if (!asset) {
+        continue;
+      }
+
+      const sourceMeta =
+        asset.sourceMeta && typeof asset.sourceMeta === 'object'
+          ? (asset.sourceMeta as Record<string, unknown>)
+          : {};
+      const ingestFinalReason =
+        typeof sourceMeta.ingestFinalReason === 'string'
+          ? sourceMeta.ingestFinalReason
+          : '';
+      const isRetryableFailed =
+        asset.status === MediaStatus.failed &&
+        ingestFinalReason === TYPEA_INGEST_FINAL_REASON.retryable;
+
       if (
         asset.status === MediaStatus.relay_uploaded ||
         asset.status === MediaStatus.ingesting ||
-        asset.status === MediaStatus.failed
+        (asset.status === MediaStatus.failed && !isRetryableFailed)
       ) {
         continue;
+      }
+
+      if (isRetryableFailed) {
+        logger.info('[typea_metrics] relay scan recovered retryable failed asset', {
+          mediaAssetId: asset.id.toString(),
+          typea_recovered_retryable_failed_total: 1,
+          metric_labels: {
+            typea_recovered_retryable_failed_total: 'TypeA 扫描阶段恢复可重试失败任务总数',
+          },
+        });
       }
 
       await prisma.mediaAsset.update({
         where: { id: asset.id },
         data: {
           status: MediaStatus.ready,
+          ingestError: null,
           sourceMeta: {
+            ...sourceMeta,
             relayChannelId: definition.relayChannelId.toString(),
             taskDefinitionId: definition.id.toString(),
             relayEnqueueAt: new Date().toISOString(),
@@ -144,6 +253,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
     scannedFiles,
     createdAssets,
     enqueuedTasks,
+    rejectedTooLarge,
     relayChannelId: definition.relayChannelId.toString(),
   };
 }

@@ -176,8 +176,8 @@ export async function scheduleDueRelayUploadTasks() {
       typea_ingesting_stale_total: 'TypeA ingesting 超时回收总数',
       typea_failed_final_total: 'TypeA 失败终态总数',
     },
-    mode: 'round_robin_by_channel',
-  });
+      mode: 'round_robin_by_channel',
+    });
 }
 
 export async function scheduleRelayForDefinition(taskDefinitionId: bigint) {
@@ -187,9 +187,11 @@ export async function scheduleRelayForDefinition(taskDefinitionId: bigint) {
     logger.info('[typea_metrics] relay scan summary', {
       typea_scan_files_total: enqueueSummary.scannedFiles,
       typea_enqueue_total: enqueueSummary.enqueuedTasks,
+      typea_rejected_too_large_total: enqueueSummary.rejectedTooLarge ?? 0,
       metric_labels: {
         typea_scan_files_total: 'TypeA 扫描文件总数',
         typea_enqueue_total: 'TypeA 入队总数（扫描阶段）',
+        typea_rejected_too_large_total: 'TypeA 超大小文件拒绝总数（扫描阶段）',
       },
       taskDefinitionId: taskDefinitionId.toString(),
     });
