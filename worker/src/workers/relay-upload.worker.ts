@@ -24,6 +24,13 @@ import { TYPEA_INGEST_ERROR_CODE, TYPEA_INGEST_FINAL_REASON } from '../shared/me
 const PROGRESS_TTL_SECONDS = 24 * 60 * 60;
 const PROGRESS_WRITE_INTERVAL_MS = 5000;
 
+function calcIngestDurationSec(startedAt?: Date | null, finishedAt?: Date | null) {
+  if (!startedAt || !finishedAt) return null;
+  const diffMs = finishedAt.getTime() - startedAt.getTime();
+  if (!Number.isFinite(diffMs) || diffMs < 0) return null;
+  return Math.floor(diffMs / 1000);
+}
+
 function buildProgressKey(mediaAssetId: string) {
   return `media:progress:${mediaAssetId}`;
 }
@@ -90,6 +97,18 @@ export const relayUploadWorker = new Worker(
       mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
         ? (mediaAsset.sourceMeta as Record<string, unknown>)
         : {};
+
+    const ingestStartedAt = (mediaAsset as any).ingestStartedAt ?? new Date();
+    if (!(mediaAsset as any).ingestStartedAt) {
+      await prisma.mediaAsset.update({
+        where: { id: mediaAssetId },
+        data: {
+          ingestStartedAt,
+          ingestFinishedAt: null,
+          ingestDurationSec: null,
+        } as any,
+      });
+    }
 
     const heartbeat = async (extra?: Record<string, unknown>) => {
       await prisma.mediaAsset.update({
@@ -287,13 +306,16 @@ export const relayUploadWorker = new Worker(
         null;
 
       if (!forwardFileId) {
+        const ingestFinishedAt = new Date();
         await prisma.mediaAsset.update({
           where: { id: mediaAssetId },
           data: {
             status: MediaStatus.failed,
             relayMessageId: BigInt(gramjsMessageId),
             ingestError: 'GramJS 上传成功但 forwardMessage 未返回 file_id',
-          },
+            ingestFinishedAt,
+            ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
+          } as any,
         });
 
         throw new Error('GramJS 上传成功但 forwardMessage 未返回 file_id');
@@ -316,6 +338,7 @@ export const relayUploadWorker = new Worker(
         });
       }
 
+      const ingestFinishedAt = new Date();
       await prisma.mediaAsset.update({
         where: { id: mediaAssetId },
         data: {
@@ -324,6 +347,8 @@ export const relayUploadWorker = new Worker(
           telegramFileId: forwardFileId,
           telegramFileUniqueId: forwardFileUniqueId,
           ingestError: null,
+          ingestFinishedAt,
+          ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
           sourceMeta: {
             ...(mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
               ? (mediaAsset.sourceMeta as Record<string, unknown>)
@@ -335,7 +360,7 @@ export const relayUploadWorker = new Worker(
             ingestStage: 'done',
           },
           ...(archivePath ? { archivePath, localPath: archivePath } : {}),
-        },
+        } as any,
       });
 
       await writeProgress({
@@ -490,6 +515,7 @@ export const relayUploadWorker = new Worker(
         });
 
         if (fallbackResult) {
+          const ingestFinishedAt = new Date();
           await prisma.mediaAsset.update({
             where: { id: mediaAssetId },
             data: {
@@ -498,6 +524,8 @@ export const relayUploadWorker = new Worker(
               telegramFileId: fallbackResult.telegramFileId,
               telegramFileUniqueId: fallbackResult.telegramFileUniqueId,
               ingestError: null,
+              ingestFinishedAt,
+              ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
               sourceMeta: {
                 ...(mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
                   ? (mediaAsset.sourceMeta as Record<string, unknown>)
@@ -508,7 +536,7 @@ export const relayUploadWorker = new Worker(
                 ingestWorkerJobId: null,
                 ingestStage: 'done',
               },
-            },
+            } as any,
           });
 
           logger.info('[q_relay_upload] 终极兜底补偿成功', {
@@ -586,6 +614,7 @@ export const relayUploadWorker = new Worker(
       null;
 
     if (directFileId) {
+      const ingestFinishedAt = new Date();
       await prisma.mediaAsset.update({
         where: { id: mediaAssetId },
         data: {
@@ -594,6 +623,8 @@ export const relayUploadWorker = new Worker(
           telegramFileId: directFileId,
           telegramFileUniqueId: directFileUniqueId,
           ingestError: null,
+          ingestFinishedAt,
+          ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
           sourceMeta: {
             ...(mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
               ? (mediaAsset.sourceMeta as Record<string, unknown>)
@@ -605,7 +636,7 @@ export const relayUploadWorker = new Worker(
             ingestStage: 'done',
           },
           ...(archivePath ? { archivePath, localPath: archivePath } : {}),
-        },
+        } as any,
       });
 
       await writeProgress({
@@ -623,14 +654,17 @@ export const relayUploadWorker = new Worker(
         messageId: sendResult.messageId,
       };
     } else {
+      const ingestFinishedAt = new Date();
       await prisma.mediaAsset.update({
         where: { id: mediaAssetId },
         data: {
           status: MediaStatus.failed,
           relayMessageId: BigInt(sendResult.messageId),
           ingestError: '中转上传成功但未返回 file_id',
+          ingestFinishedAt,
+          ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
           ...(archivePath ? { archivePath, localPath: archivePath } : {}),
-        },
+        } as any,
       });
 
       throw new Error('中转上传成功但未返回 file_id');
@@ -682,6 +716,7 @@ relayUploadWorker.on('failed', async (job, err) => {
           mediaAssetId: mediaAssetIdRaw,
         });
       } else if (asset.status !== MediaStatus.relay_uploaded) {
+        const ingestFinishedAt = new Date();
         await prisma.mediaAsset.updateMany({
           where: { id: BigInt(mediaAssetIdRaw) },
           data: {
@@ -689,6 +724,8 @@ relayUploadWorker.on('failed', async (job, err) => {
             ingestError: isFileMissing
               ? 'SRC_FILE_MISSING: source file not found'
               : message || '未知错误',
+            ingestFinishedAt,
+            ingestDurationSec: null,
             sourceMeta: {
               ...sourceMeta,
               ingestRetryCount,
@@ -703,7 +740,7 @@ relayUploadWorker.on('failed', async (job, err) => {
               ingestLastHeartbeatAt: new Date().toISOString(),
               ingestStage: 'failed',
             },
-          },
+          } as any,
         });
       }
 

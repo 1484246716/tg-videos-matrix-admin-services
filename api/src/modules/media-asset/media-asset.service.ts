@@ -72,6 +72,9 @@ export class MediaAssetService {
       id: item.id.toString(),
       channelId: item.channelId.toString(),
       fileSize: item.fileSize.toString(),
+      ingestDurationSec: item.ingestDurationSec ?? null,
+      ingestStartedAt: item.ingestStartedAt ?? null,
+      ingestFinishedAt: item.ingestFinishedAt ?? null,
       relayMessageId: item.relayMessageId ? item.relayMessageId.toString() : null,
       channel: item.channel
         ? {

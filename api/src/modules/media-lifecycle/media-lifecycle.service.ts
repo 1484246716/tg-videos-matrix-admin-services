@@ -140,6 +140,9 @@ export class MediaLifecycleService {
         fileSize: asset.fileSize ? asset.fileSize.toString() : null,
         createdAt: asset.createdAt,
         updatedAt: asset.updatedAt,
+        ingestStartedAt: asset.ingestStartedAt,
+        ingestFinishedAt: asset.ingestFinishedAt,
+        ingestDurationSec: asset.ingestDurationSec,
         latestDispatch: latestDispatch
           ? {
             id: latestDispatch.id.toString(),
