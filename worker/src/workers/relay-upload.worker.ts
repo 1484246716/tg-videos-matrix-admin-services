@@ -13,6 +13,7 @@ import { MediaStatus } from '@prisma/client';
 import {
   GRAMJS_FORWARD_TARGET_CHAT_ID,
   GRAMJS_UPLOAD_WORKERS,
+  RELAY_UPLOAD_SEND_DOCUMENT_THRESHOLD_MB,
   RELAY_UPLOAD_GRAMJS_THRESHOLD_MB,
   TYPEA_FAIL_ON_FILE_MISSING,
   TYPEA_INGEST_LEASE_MS,
@@ -192,7 +193,9 @@ export const relayUploadWorker = new Worker(
     const fileName = basename(mediaAsset.localPath);
     const fileSize = mediaAsset.fileSize ? Number(mediaAsset.fileSize) : undefined;
     const gramjsThresholdBytes = RELAY_UPLOAD_GRAMJS_THRESHOLD_MB * 1024 * 1024;
+    const sendDocumentThresholdBytes = RELAY_UPLOAD_SEND_DOCUMENT_THRESHOLD_MB * 1024 * 1024;
     const useGramjs = fileSize !== undefined && fileSize >= gramjsThresholdBytes;
+    const useDocument = fileSize !== undefined && fileSize >= sendDocumentThresholdBytes;
 
     if (useGramjs) {
       logger.info('[q_relay_upload] 使用 GramJS 上传大文件', {
@@ -200,7 +203,7 @@ export const relayUploadWorker = new Worker(
         stage: 'start',
         mediaAssetId: mediaAssetIdRaw,
         relayChannelId: relayChannelIdRaw,
-        uploadMethod: 'gramjs',
+        uploadMethod: useDocument ? 'gramjs_sendDocument' : 'gramjs_sendVideo',
         fileSize,
       });
 
@@ -214,6 +217,7 @@ export const relayUploadWorker = new Worker(
           fileName,
           caption: mediaAsset.originalName,
           chatId: relayChannel.tgChatId.toString(),
+          forceDocument: useDocument,
           workers: GRAMJS_UPLOAD_WORKERS,
           progressCallback: (progress) => {
             const percent = Number((progress * 100).toFixed(2));
@@ -361,8 +365,6 @@ export const relayUploadWorker = new Worker(
     formData.append('chat_id', relayChannel.tgChatId.toString());
     formData.append('caption', mediaAsset.originalName);
 
-    const useDocument =
-      mediaAsset.fileSize && mediaAsset.fileSize >= BigInt(900 * 1024 * 1024);
     const streamStart = Date.now();
     const fileStream = createReadStream(mediaAsset.localPath);
     const streamWithProgress = new PassThrough();

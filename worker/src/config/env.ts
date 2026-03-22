@@ -28,6 +28,9 @@ export const GRAMJS_UPLOAD_WORKERS = Number(
 export const RELAY_UPLOAD_GRAMJS_THRESHOLD_MB = Number(
   process.env.RELAY_UPLOAD_GRAMJS_THRESHOLD_MB || '1024',
 );
+export const RELAY_UPLOAD_SEND_DOCUMENT_THRESHOLD_MB = Number(
+  process.env.RELAY_UPLOAD_SEND_DOCUMENT_THRESHOLD_MB || '900',
+);
 
 export const RELAY_MIN_STABLE_CHECKS = Number(
   process.env.RELAY_MIN_STABLE_CHECKS || '3',

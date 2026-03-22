@@ -7,6 +7,7 @@ export async function sendViaGramjs(args: {
   fileName?: string;
   caption?: string;
   chatId: string;
+  forceDocument?: boolean;
   workers?: number;
   progressCallback?: (progress: number) => void;
 }): Promise<GramjsSendResult> {
@@ -16,7 +17,7 @@ export async function sendViaGramjs(args: {
   const message = await client.sendFile(args.chatId, {
     file: args.filePath,
     caption: args.caption ?? fileName,
-    forceDocument: true,
+    forceDocument: args.forceDocument ?? true,
     workers: args.workers,
     progressCallback: args.progressCallback,
   });
