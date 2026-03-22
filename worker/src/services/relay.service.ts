@@ -1,4 +1,4 @@
-import { stat } from 'node:fs/promises';
+import { stat, unlink } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { MediaStatus } from '@prisma/client';
 import { TYPEA_MAX_UPLOAD_SIZE_MB } from '../config/env';
@@ -6,6 +6,24 @@ import { prisma, getTaskDefinitionModel } from '../infra/prisma';
 import { logger } from '../logger';
 import { hashFile, scanChannelVideos, waitForFileStable } from '../shared/file-utils';
 import { TYPEA_INGEST_ERROR_CODE, TYPEA_INGEST_FINAL_REASON } from '../shared/metrics';
+
+async function removeLocalDuplicateFile(filePath: string, mediaAssetId: string) {
+  try {
+    await unlink(filePath);
+    logger.warn('[relay] 检测到重复上传资源，已删除本地文件避免重复扫描', {
+      filePath,
+      mediaAssetId,
+      action: 'delete_local_duplicate_file',
+    });
+  } catch (error) {
+    logger.warn('[relay] 检测到重复上传资源，但删除本地文件失败', {
+      filePath,
+      mediaAssetId,
+      error: error instanceof Error ? error.message : String(error),
+      action: 'delete_local_duplicate_file_failed',
+    });
+  }
+}
 
 export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
   const definition = await getTaskDefinitionModel().findUnique({
@@ -169,7 +187,13 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
             fileSize: s.size,
           },
         },
-        select: { id: true, status: true, sourceMeta: true },
+        select: {
+          id: true,
+          status: true,
+          sourceMeta: true,
+          telegramFileId: true,
+          relayMessageId: true,
+        },
       });
 
       if (!asset) {
@@ -190,7 +214,13 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
               ingestRetryCount: 0,
             },
           },
-          select: { id: true, status: true, sourceMeta: true },
+          select: {
+            id: true,
+            status: true,
+            sourceMeta: true,
+            telegramFileId: true,
+            relayMessageId: true,
+          },
         });
         createdAssets += 1;
       }
@@ -211,8 +241,77 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
         asset.status === MediaStatus.failed &&
         ingestFinalReason === TYPEA_INGEST_FINAL_REASON.retryable;
 
-      if (
+      const isAlreadyUploadedDuplicate =
         asset.status === MediaStatus.relay_uploaded ||
+        Boolean(asset.telegramFileId) ||
+        Boolean(asset.relayMessageId);
+
+      if (isAlreadyUploadedDuplicate) {
+        const duplicateName = basename(filePath);
+        const duplicateError = `DUPLICATE_ALREADY_UPLOADED: 本地重复文件已跳过 ${duplicateName}`;
+
+        const existingDuplicateFailed = await prisma.mediaAsset.findFirst({
+          where: {
+            localPath: filePath,
+            status: MediaStatus.failed,
+            sourceMeta: {
+              path: ['ingestFinalReason'],
+              equals: 'duplicate_already_uploaded',
+            },
+          },
+          select: { id: true, sourceMeta: true },
+        });
+
+        if (existingDuplicateFailed) {
+          const failedMeta =
+            existingDuplicateFailed.sourceMeta && typeof existingDuplicateFailed.sourceMeta === 'object'
+              ? (existingDuplicateFailed.sourceMeta as Record<string, unknown>)
+              : {};
+
+          await prisma.mediaAsset.update({
+            where: { id: existingDuplicateFailed.id },
+            data: {
+              ingestError: duplicateError,
+              sourceMeta: {
+                ...failedMeta,
+                relayChannelId: definition.relayChannelId.toString(),
+                taskDefinitionId: definition.id.toString(),
+                ingestFinalReason: 'duplicate_already_uploaded',
+                duplicateDetectedAt: new Date().toISOString(),
+                duplicateLocalPath: filePath,
+                duplicateOfMediaAssetId: asset.id.toString(),
+              },
+            },
+          });
+        } else {
+          const dedupFileHash = `${fileHash}:dup:${Date.now().toString(36)}`;
+          await prisma.mediaAsset.create({
+            data: {
+              channelId: channel.id,
+              originalName: duplicateName,
+              localPath: filePath,
+              fileSize: BigInt(s.size),
+              fileHash: dedupFileHash,
+              status: MediaStatus.failed,
+              ingestError: duplicateError,
+              sourceMeta: {
+                relayChannelId: definition.relayChannelId.toString(),
+                taskDefinitionId: definition.id.toString(),
+                ingestErrorCode: 'DUPLICATE_ALREADY_UPLOADED',
+                ingestFinalReason: 'duplicate_already_uploaded',
+                duplicateDetectedAt: new Date().toISOString(),
+                duplicateLocalPath: filePath,
+                duplicateOfMediaAssetId: asset.id.toString(),
+              },
+            },
+          });
+        }
+
+        await removeLocalDuplicateFile(filePath, asset.id.toString());
+        continue;
+      }
+
+      if (
         asset.status === MediaStatus.ingesting ||
         (asset.status === MediaStatus.failed && !isRetryableFailed)
       ) {

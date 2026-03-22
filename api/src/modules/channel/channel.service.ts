@@ -383,6 +383,150 @@ export class ChannelService {
     return { updated: validIds.length };
   }
 
+  async getCatalogPreview(id: string, userId?: string, role?: string) {
+    const channel = await this.prisma.channel.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
+      select: {
+        id: true,
+        name: true,
+        tgChatId: true,
+        navTemplateText: true,
+      },
+    });
+
+    if (!channel) throw new NotFoundException('channel not found');
+
+    const dispatchTasks = await this.prisma.dispatchTask.findMany({
+      where: {
+        channelId: channel.id,
+        status: 'success',
+        telegramMessageLink: { not: null },
+      },
+      orderBy: { finishedAt: 'desc' },
+      take: 60,
+      select: {
+        id: true,
+        mediaAssetId: true,
+        caption: true,
+        telegramMessageLink: true,
+        mediaAsset: {
+          select: {
+            sourceMeta: true,
+          },
+        },
+      },
+    });
+
+    const videos = [...dispatchTasks].reverse().map((t, idx) => {
+      const parts = (t.caption || '')
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+      let shortTitle = '未命名视频';
+      if (parts.length >= 2) shortTitle = `${parts[0]} ${parts[1]}`;
+      else if (parts.length === 1) shortTitle = parts[0];
+
+      const sourceMeta =
+        t.mediaAsset?.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
+          ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
+          : {};
+      const customCatalogTitle =
+        typeof sourceMeta.catalogCustomTitle === 'string' ? sourceMeta.catalogCustomTitle.trim() : '';
+
+      const link = t.telegramMessageLink || '';
+      return {
+        id: t.id.toString(),
+        mediaAssetId: t.mediaAssetId.toString(),
+        title: customCatalogTitle || shortTitle,
+        link,
+        readonlyLink: link,
+        order: idx + 1,
+      };
+    });
+
+    const titleLineRaw = (channel.navTemplateText || '').split('\n').find((line) => line.trim()) || '';
+    const defaultTitle = `${channel.name} 知识库/资源大全`;
+    const title = titleLineRaw
+      .replace(/{{channel_name}}/g, channel.name)
+      .trim() || defaultTitle;
+
+    return this.serializeBigInt({
+      channelId: channel.id,
+      channelName: channel.name,
+      tgChatId: channel.tgChatId,
+      title,
+      videos,
+    });
+  }
+
+  async updateCatalogTitle(
+    id: string,
+    payload: { mediaAssetId?: string; title?: string },
+    userId?: string,
+    role?: string,
+  ) {
+    const channel = await this.prisma.channel.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
+      select: {
+        id: true,
+      },
+    });
+
+    if (!channel) throw new NotFoundException('channel not found');
+
+    const mediaAssetIdRaw = (payload.mediaAssetId || '').trim();
+    const nextTitle = (payload.title || '').trim();
+
+    if (!mediaAssetIdRaw) throw new BadRequestException('mediaAssetId 不能为空');
+    if (!nextTitle) throw new BadRequestException('目录标题不能为空');
+
+    const mediaAssetId = BigInt(mediaAssetIdRaw);
+
+    const mediaAsset = await this.prisma.mediaAsset.findFirst({
+      where: {
+        id: mediaAssetId,
+        channelId: channel.id,
+      },
+      select: {
+        id: true,
+        sourceMeta: true,
+      },
+    });
+
+    if (!mediaAsset) throw new NotFoundException('mediaAsset not found');
+
+    const sourceMeta =
+      mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
+        ? (mediaAsset.sourceMeta as Record<string, unknown>)
+        : {};
+
+    const updated = await this.prisma.mediaAsset.update({
+      where: { id: mediaAsset.id },
+      data: {
+        sourceMeta: {
+          ...sourceMeta,
+          catalogCustomTitle: nextTitle,
+          catalogCustomTitleUpdatedAt: new Date().toISOString(),
+        },
+      },
+      select: {
+        id: true,
+      },
+    });
+
+    return this.serializeBigInt({
+      id: updated.id,
+      mediaAssetId: updated.id,
+      title: nextTitle,
+    });
+  }
+
   async update(id: string, dto: UpdateChannelDto, userId?: string, role?: string) {
     const existing = await this.prisma.channel.findFirst({
       where:

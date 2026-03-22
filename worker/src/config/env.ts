@@ -16,6 +16,11 @@ export const TASK_DEFINITION_ERROR_RETRY_SEC = Number(
   process.env.TASK_DEFINITION_ERROR_RETRY_SEC || '300',
 );
 
+export const DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED = true;
+export const CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED = true;
+export const CHANNEL_LOCK_ENABLED = true;
+export const CHANNEL_LOCK_TTL_MS = Number(process.env.CHANNEL_LOCK_TTL_MS || '60000');
+
 export const GRAMJS_API_ID = Number(process.env.GRAMJS_API_ID || '0');
 export const GRAMJS_API_HASH = process.env.GRAMJS_API_HASH || '';
 export const GRAMJS_BOT_TOKEN = process.env.GRAMJS_BOT_TOKEN || '';

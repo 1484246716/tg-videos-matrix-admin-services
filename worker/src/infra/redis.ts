@@ -4,6 +4,10 @@ import { redisUrl } from '../config/env';
 
 export const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
 
+connection.on('error', (error) => {
+  console.error('[redis] worker connection error:', error?.message ?? error);
+});
+
 export const dispatchQueue = new Queue('q_dispatch', {
   connection: connection as any,
 });

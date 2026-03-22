@@ -1,9 +1,10 @@
-import { generateTextWithAiProfile } from '../ai-provider';
-import { logger, logError } from '../logger';
-import { prisma } from '../infra/prisma';
-import { sendVideoByTelegram, TelegramError } from '../shared/telegram';
-import { getBackoffSeconds } from '../shared/dispatch-utils';
 import { TaskStatus } from '@prisma/client';
+import { generateTextWithAiProfile } from '../ai-provider';
+import { DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED } from '../config/env';
+import { prisma } from '../infra/prisma';
+import { logger, logError } from '../logger';
+import { getBackoffSeconds } from '../shared/dispatch-utils';
+import { sendVideoByTelegram, TelegramError } from '../shared/telegram';
 
 export async function handleDispatchJob(
   dispatchTaskIdRaw: string,
@@ -24,6 +25,8 @@ export async function handleDispatchJob(
           aiModelProfileId: true,
           aiSystemPromptTemplate: true,
           aiReplyMarkup: true,
+          postIntervalSec: true,
+          lastPostAt: true,
         },
       },
       mediaAsset: {
@@ -164,6 +167,53 @@ export async function handleDispatchJob(
       );
     }
 
+    if (DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED) {
+      const now = new Date();
+      const intervalSec = Math.max(0, task.channel.postIntervalSec ?? 0);
+      const nextAllowedAt = task.channel.lastPostAt
+        ? new Date(task.channel.lastPostAt.getTime() + intervalSec * 1000)
+        : now;
+
+      if (nextAllowedAt.getTime() > now.getTime()) {
+        await prisma.dispatchTask.update({
+          where: { id: dispatchTaskId },
+          data: {
+            status: TaskStatus.scheduled,
+            nextRunAt: nextAllowedAt,
+            finishedAt: now,
+          },
+        });
+
+        await prisma.dispatchTaskLog.create({
+          data: {
+            dispatchTaskId,
+            action: 'task_deferred_by_channel_interval',
+            detail: {
+              channelId: task.channelId.toString(),
+              postIntervalSec: intervalSec,
+              lastPostAt: task.channel.lastPostAt?.toISOString() ?? null,
+              nextAllowedAt: nextAllowedAt.toISOString(),
+            },
+          },
+        });
+
+        logger.info('[q_dispatch] 任务延后（未到频道发送窗口）', {
+          dispatchTaskId: dispatchTaskIdRaw,
+          channelId: task.channelId.toString(),
+          postIntervalSec: intervalSec,
+          lastPostAt: task.channel.lastPostAt?.toISOString() ?? null,
+          nextAllowedAt: nextAllowedAt.toISOString(),
+        });
+
+        return {
+          ok: true,
+          skipped: true,
+          reason: 'channel_interval_not_due',
+          dispatchTaskId: dispatchTaskIdRaw,
+        };
+      }
+    }
+
     const sendResult = await sendVideoByTelegram({
       botToken: bot.tokenEncrypted,
       chatId: task.channel.tgChatId,
@@ -173,7 +223,8 @@ export async function handleDispatchJob(
       replyMarkup: task.replyMarkup ?? task.channel.aiReplyMarkup ?? undefined,
     });
 
-    await prisma.dispatchTask.update({
+    await prisma.$transaction([
+      prisma.dispatchTask.update({
       where: { id: dispatchTaskId },
       data: {
         status: TaskStatus.success,
@@ -184,7 +235,12 @@ export async function handleDispatchJob(
         telegramErrorCode: null,
         telegramErrorMessage: null,
       },
-    });
+      }),
+      prisma.channel.update({
+        where: { id: task.channelId },
+        data: { lastPostAt: new Date() },
+      }),
+    ]);
 
     await prisma.dispatchTaskLog.create({
       data: {

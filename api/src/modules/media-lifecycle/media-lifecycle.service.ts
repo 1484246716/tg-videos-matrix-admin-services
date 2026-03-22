@@ -16,6 +16,9 @@ function getMediaLifecycleRedis() {
   if (mediaLifecycleRedis) return mediaLifecycleRedis;
   const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
   mediaLifecycleRedis = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+  mediaLifecycleRedis.on('error', (error) => {
+    console.error('[redis] media-lifecycle redis error:', error?.message ?? error);
+  });
   return mediaLifecycleRedis;
 }
 

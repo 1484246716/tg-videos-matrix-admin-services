@@ -76,6 +76,22 @@ export class ChannelController {
     return this.channelService.batchUpdate(body.ids, body.data, req.user.userId, req.user.role);
   }
 
+  @Permissions('channels:view')
+  @Get(':id/catalog-preview')
+  getCatalogPreview(@Param('id') id: string, @Request() req: AuthRequest) {
+    return this.channelService.getCatalogPreview(id, req.user.userId, req.user.role);
+  }
+
+  @Permissions('channels:update')
+  @Patch(':id/catalog-title')
+  updateCatalogTitle(
+    @Param('id') id: string,
+    @Body() body: { mediaAssetId?: string; title?: string },
+    @Request() req: AuthRequest,
+  ) {
+    return this.channelService.updateCatalogTitle(id, body, req.user.userId, req.user.role);
+  }
+
   @Permissions('channels:update')
   @Patch(':id')
   update(

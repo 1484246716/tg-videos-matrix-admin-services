@@ -1,11 +1,12 @@
 import { TaskStatus, CatalogTaskStatus } from '@prisma/client';
+import { CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED } from '../config/env';
 import { prisma } from '../infra/prisma';
+import { logError } from '../logger';
 import {
   editMessageTextByTelegram,
   pinMessageByTelegram,
   sendTextByTelegram,
 } from '../shared/telegram';
-import { logError } from '../logger';
 
 export async function handleCatalogJob(channelIdRaw: string) {
   let catalogTaskId: bigint | null = null;
@@ -29,6 +30,24 @@ export async function handleCatalogJob(channelIdRaw: string) {
   }
   if (channel.defaultBot.status !== 'active') {
     throw new Error(`频道机器人未启用: ${channelIdRaw}`);
+  }
+
+  if (CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED) {
+    const guardNow = new Date();
+    const intervalSec = Math.max(0, channel.navIntervalSec ?? 0);
+    const nextAllowedAt = channel.lastNavUpdateAt
+      ? new Date(channel.lastNavUpdateAt.getTime() + intervalSec * 1000)
+      : guardNow;
+
+    if (nextAllowedAt.getTime() > guardNow.getTime()) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: 'nav_interval_not_due',
+        channelId: channelIdRaw,
+        nextAllowedAt: nextAllowedAt.toISOString(),
+      };
+    }
   }
 
   const bot = channel.defaultBot;
@@ -91,6 +110,11 @@ export async function handleCatalogJob(channelIdRaw: string) {
     select: {
       caption: true,
       telegramMessageLink: true,
+      mediaAsset: {
+        select: {
+          sourceMeta: true,
+        },
+      },
     },
   });
 
@@ -116,16 +140,24 @@ export async function handleCatalogJob(channelIdRaw: string) {
     } else if (parts.length === 1) {
       shortTitle = parts[0];
     }
+
+    const sourceMeta =
+      t.mediaAsset?.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
+        ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
+        : {};
+    const customCatalogTitle =
+      typeof sourceMeta.catalogCustomTitle === 'string' ? sourceMeta.catalogCustomTitle.trim() : '';
+
     return {
       message_url: t.telegramMessageLink || '',
-      short_title: shortTitle,
+      short_title: customCatalogTitle || shortTitle,
     };
   });
 
   let content = channel.navTemplateText;
   content = content.replace(/{{channel_name}}/g, channel.name);
   const eachRegex = /{{#each\s+videos}}([\s\S]*?){{\/each}}/g;
-  content = content.replace(eachRegex, (match, body) => {
+  content = content.replace(eachRegex, (_match, body) => {
     return videos
       .map((v) => {
         let text = body.replace(/{{this\.message_url}}/g, v.message_url);

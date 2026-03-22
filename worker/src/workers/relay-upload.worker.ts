@@ -653,70 +653,81 @@ relayUploadWorker.on('failed', async (job, err) => {
   const mediaAssetIdRaw = job?.data?.mediaAssetId as string | undefined;
 
   if (mediaAssetIdRaw) {
+    try {
       const asset = await prisma.mediaAsset.findUnique({
         where: { id: BigInt(mediaAssetIdRaw) },
-      select: { status: true, sourceMeta: true },
+        select: { status: true, sourceMeta: true },
       });
 
-    const sourceMeta =
-      asset?.sourceMeta && typeof asset.sourceMeta === 'object'
-        ? (asset.sourceMeta as Record<string, unknown>)
-        : {};
+      const sourceMeta =
+        asset?.sourceMeta && typeof asset.sourceMeta === 'object'
+          ? (asset.sourceMeta as Record<string, unknown>)
+          : {};
 
-    const ingestRetryCountRaw = sourceMeta.ingestRetryCount;
-    const ingestRetryCount =
-      typeof ingestRetryCountRaw === 'number'
-        ? ingestRetryCountRaw
-        : typeof ingestRetryCountRaw === 'string' && /^\d+$/.test(ingestRetryCountRaw)
-          ? Number(ingestRetryCountRaw)
-          : 0;
+      const ingestRetryCountRaw = sourceMeta.ingestRetryCount;
+      const ingestRetryCount =
+        typeof ingestRetryCountRaw === 'number'
+          ? ingestRetryCountRaw
+          : typeof ingestRetryCountRaw === 'string' && /^\d+$/.test(ingestRetryCountRaw)
+            ? Number(ingestRetryCountRaw)
+            : 0;
 
-    const message = err instanceof Error ? err.message : String(err);
-    const isFileMissing = message.includes('ENOENT');
-    const exceeded = ingestRetryCount >= TYPEA_INGEST_MAX_RETRIES;
-    const finalOnMissing = TYPEA_FAIL_ON_FILE_MISSING && isFileMissing;
+      const message = err instanceof Error ? err.message : String(err);
+      const isFileMissing = message.includes('ENOENT');
+      const exceeded = ingestRetryCount >= TYPEA_INGEST_MAX_RETRIES;
+      const finalOnMissing = TYPEA_FAIL_ON_FILE_MISSING && isFileMissing;
 
-    if (asset?.status !== MediaStatus.relay_uploaded) {
-    await prisma.mediaAsset.update({
-      where: { id: BigInt(mediaAssetIdRaw) },
-      data: {
-        status: MediaStatus.failed,
-          ingestError: isFileMissing
-            ? 'SRC_FILE_MISSING: source file not found'
-            : message || '未知错误',
-          sourceMeta: {
-            ...sourceMeta,
-            ingestRetryCount,
-            ingestErrorCode: isFileMissing
-              ? TYPEA_INGEST_ERROR_CODE.srcFileMissing
-              : TYPEA_INGEST_ERROR_CODE.ingestRuntimeError,
-            ingestFinalReason: exceeded || finalOnMissing
-              ? TYPEA_INGEST_FINAL_REASON.failedFinal
-              : TYPEA_INGEST_FINAL_REASON.retryable,
-            ingestLeaseUntil: null,
-            ingestWorkerJobId: null,
-            ingestLastHeartbeatAt: new Date().toISOString(),
-            ingestStage: 'failed',
+      if (!asset) {
+        logger.warn('[q_relay_upload] 任务失败回写跳过：mediaAsset 不存在', {
+          mediaAssetId: mediaAssetIdRaw,
+        });
+      } else if (asset.status !== MediaStatus.relay_uploaded) {
+        await prisma.mediaAsset.updateMany({
+          where: { id: BigInt(mediaAssetIdRaw) },
+          data: {
+            status: MediaStatus.failed,
+            ingestError: isFileMissing
+              ? 'SRC_FILE_MISSING: source file not found'
+              : message || '未知错误',
+            sourceMeta: {
+              ...sourceMeta,
+              ingestRetryCount,
+              ingestErrorCode: isFileMissing
+                ? TYPEA_INGEST_ERROR_CODE.srcFileMissing
+                : TYPEA_INGEST_ERROR_CODE.ingestRuntimeError,
+              ingestFinalReason: exceeded || finalOnMissing
+                ? TYPEA_INGEST_FINAL_REASON.failedFinal
+                : TYPEA_INGEST_FINAL_REASON.retryable,
+              ingestLeaseUntil: null,
+              ingestWorkerJobId: null,
+              ingestLastHeartbeatAt: new Date().toISOString(),
+              ingestStage: 'failed',
+            },
           },
+        });
+      }
+
+      logger.info('[typea_metrics] relay upload failed', {
+        mediaAssetId: mediaAssetIdRaw,
+        typea_file_missing_total: isFileMissing ? 1 : 0,
+        typea_failed_final_total: exceeded || finalOnMissing ? 1 : 0,
+        task_run_total: 1,
+        task_failed_total: 1,
+        task_dead_total: exceeded || finalOnMissing ? 1 : 0,
+        ingestRetryCount,
+        maxRetries: TYPEA_INGEST_MAX_RETRIES,
+        failOnFileMissing: TYPEA_FAIL_ON_FILE_MISSING,
+        metric_labels: {
+          typea_file_missing_total: 'TypeA 源文件缺失总数',
+          typea_failed_final_total: 'TypeA 失败终态总数',
         },
       });
+    } catch (writeBackErr) {
+      logError('[q_relay_upload] 任务失败状态回写异常', {
+        mediaAssetId: mediaAssetIdRaw,
+        error: writeBackErr,
+      });
     }
-
-    logger.info('[typea_metrics] relay upload failed', {
-      mediaAssetId: mediaAssetIdRaw,
-      typea_file_missing_total: isFileMissing ? 1 : 0,
-      typea_failed_final_total: exceeded || finalOnMissing ? 1 : 0,
-      task_run_total: 1,
-      task_failed_total: 1,
-      task_dead_total: exceeded || finalOnMissing ? 1 : 0,
-      ingestRetryCount,
-      maxRetries: TYPEA_INGEST_MAX_RETRIES,
-      failOnFileMissing: TYPEA_FAIL_ON_FILE_MISSING,
-      metric_labels: {
-        typea_file_missing_total: 'TypeA 源文件缺失总数',
-        typea_failed_final_total: 'TypeA 失败终态总数',
-      },
-    });
   }
 
   let errorJson: string | null = null;

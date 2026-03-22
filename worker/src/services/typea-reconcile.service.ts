@@ -31,8 +31,16 @@ export async function reconcileTypeAStuckAssets() {
           telegramFileId: null,
         },
         {
-          status: { in: [MediaStatus.ready, MediaStatus.failed, MediaStatus.ingesting] },
+          status: MediaStatus.ready,
           telegramFileId: null,
+        },
+        {
+          status: MediaStatus.failed,
+          telegramFileId: null,
+          sourceMeta: {
+            path: ['ingestFinalReason'],
+            equals: TYPEA_INGEST_FINAL_REASON.retryable,
+          },
         },
       ],
     },
@@ -120,23 +128,30 @@ export async function reconcileTypeAStuckAssets() {
       continue;
     }
 
-    await prisma.mediaAsset.update({
-      where: { id: asset.id },
-      data: {
-        status: MediaStatus.failed,
-        ingestError: 'SRC_FILE_MISSING_FINAL: source file missing and unrecoverable',
-        sourceMeta: {
-          ...sourceMeta,
-          ingestErrorCode: TYPEA_INGEST_ERROR_CODE.srcFileMissing,
-          ingestFinalReason: TYPEA_INGEST_FINAL_REASON.failedFinal,
-          ingestLeaseUntil: null,
-          ingestWorkerJobId: null,
-          ingestLastHeartbeatAt: new Date().toISOString(),
-        },
-      },
-    });
+    const isAlreadyFinalMissing =
+      asset.status === MediaStatus.failed &&
+      sourceMeta.ingestFinalReason === TYPEA_INGEST_FINAL_REASON.failedFinal &&
+      sourceMeta.ingestErrorCode === TYPEA_INGEST_ERROR_CODE.srcFileMissing;
 
-    missingFinal += 1;
+    if (!isAlreadyFinalMissing) {
+      await prisma.mediaAsset.update({
+        where: { id: asset.id },
+        data: {
+          status: MediaStatus.failed,
+          ingestError: 'SRC_FILE_MISSING_FINAL: source file missing and unrecoverable',
+          sourceMeta: {
+            ...sourceMeta,
+            ingestErrorCode: TYPEA_INGEST_ERROR_CODE.srcFileMissing,
+            ingestFinalReason: TYPEA_INGEST_FINAL_REASON.failedFinal,
+            ingestLeaseUntil: null,
+            ingestWorkerJobId: null,
+            ingestLastHeartbeatAt: new Date().toISOString(),
+          },
+        },
+      });
+
+      missingFinal += 1;
+    }
   }
 
   logger.info('[typea_metrics] reconcile tick', {

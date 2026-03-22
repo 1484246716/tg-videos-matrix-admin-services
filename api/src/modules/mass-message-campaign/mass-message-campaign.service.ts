@@ -17,6 +17,9 @@ function getMassMessageQueue() {
 
   const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
   const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+  connection.on('error', (error) => {
+    console.error('[redis] mass-message redis error:', error?.message ?? error);
+  });
   massMessageQueue = new Queue('q_mass_message', {
     connection: connection as any,
   });

@@ -1,8 +1,18 @@
-import { MAX_SCHEDULE_BATCH } from '../config/env';
+import { CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED } from '../config/env';
 import { prisma } from '../infra/prisma';
 import { catalogQueue } from '../infra/redis';
 import { logger } from '../logger';
+import { releaseChannelLock, tryAcquireChannelLock } from '../shared/channel-lock';
 import { updateTaskDefinitionRunStatus } from '../services/task-definition.service';
+
+function computeCatalogNextAllowedAt(args: {
+  lastNavUpdateAt: Date | null;
+  navIntervalSec: number;
+  now: Date;
+}) {
+  if (!args.lastNavUpdateAt) return args.now;
+  return new Date(args.lastNavUpdateAt.getTime() + Math.max(0, args.navIntervalSec) * 1000);
+}
 
 export async function scheduleDueCatalogTasks() {
   const now = new Date();
@@ -27,11 +37,33 @@ export async function scheduleDueCatalogTasks() {
   for (const channel of channels) {
     if (!channel.navTemplateText || !channel.defaultBotId) continue;
 
-    if (channel.lastNavUpdateAt) {
-      const dueTime = channel.lastNavUpdateAt.getTime() + channel.navIntervalSec * 1000;
-      if (now.getTime() < dueTime) continue;
+    if (CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED) {
+      const nextAllowedAt = computeCatalogNextAllowedAt({
+        lastNavUpdateAt: channel.lastNavUpdateAt,
+        navIntervalSec: channel.navIntervalSec,
+        now,
+      });
+      if (nextAllowedAt.getTime() > now.getTime()) {
+        logger.info('[scheduler] 目录任务未到频道更新窗口，跳过', {
+          channelId: channel.id.toString(),
+          navIntervalSec: channel.navIntervalSec,
+          lastNavUpdateAt: channel.lastNavUpdateAt?.toISOString() ?? null,
+          nextAllowedAt: nextAllowedAt.toISOString(),
+        });
+        continue;
+      }
     }
 
+    const lock = await tryAcquireChannelLock({ scope: 'catalog', channelId: channel.id });
+    if (!lock.acquired) {
+      logger.info('[scheduler] 目录任务跳过（频道锁未获取）', {
+        channelId: channel.id.toString(),
+        lockKey: lock.lockKey,
+      });
+      continue;
+    }
+
+    try {
     const jobId = `catalog-${channel.id.toString()}`;
     const existingJob = await catalogQueue.getJob(jobId);
     if (existingJob) {
@@ -56,6 +88,9 @@ export async function scheduleDueCatalogTasks() {
     );
 
     queuedCount += 1;
+    } finally {
+      await releaseChannelLock({ lockKey: lock.lockKey, lockToken: lock.lockToken });
+    }
   }
 
   if (queuedCount > 0) {

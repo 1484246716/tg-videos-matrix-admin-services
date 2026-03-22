@@ -1,9 +1,22 @@
 import { MediaStatus, TaskStatus } from '@prisma/client';
-import { MAX_SCHEDULE_BATCH } from '../config/env';
+import {
+  DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED,
+  MAX_SCHEDULE_BATCH,
+} from '../config/env';
 import { prisma, getTaskDefinitionModel } from '../infra/prisma';
 import { dispatchQueue } from '../infra/redis';
 import { logger } from '../logger';
+import { releaseChannelLock, tryAcquireChannelLock } from '../shared/channel-lock';
 import { updateTaskDefinitionRunStatus } from '../services/task-definition.service';
+
+function computeDispatchNextAllowedAt(args: {
+  lastPostAt: Date | null;
+  postIntervalSec: number;
+  now: Date;
+}) {
+  if (!args.lastPostAt) return args.now;
+  return new Date(args.lastPostAt.getTime() + Math.max(0, args.postIntervalSec) * 1000);
+}
 
 export async function scheduleDueDispatchTasks() {
   const now = new Date();
@@ -21,10 +34,67 @@ export async function scheduleDueDispatchTasks() {
       channelId: true,
       mediaAssetId: true,
       retryCount: true,
+      channel: {
+        select: {
+          postIntervalSec: true,
+          lastPostAt: true,
+        },
+      },
     },
   });
 
+  const queuedChannelIds = new Set<string>();
+  let queuedCount = 0;
+
   for (const task of dueTasks) {
+    const channelIdStr = task.channelId.toString();
+
+    if (queuedChannelIds.has(channelIdStr)) {
+      continue;
+    }
+
+    if (DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED) {
+      const nextAllowedAt = computeDispatchNextAllowedAt({
+        lastPostAt: task.channel.lastPostAt,
+        postIntervalSec: task.channel.postIntervalSec,
+        now,
+      });
+
+      if (nextAllowedAt.getTime() > now.getTime()) {
+        await prisma.dispatchTask.update({
+          where: { id: task.id },
+          data: {
+            status: TaskStatus.scheduled,
+            nextRunAt: nextAllowedAt,
+          },
+        });
+
+        logger.info('[scheduler] 分发任务未到频道发送窗口，已延后', {
+          taskId: task.id.toString(),
+          channelId: channelIdStr,
+          postIntervalSec: task.channel.postIntervalSec,
+          lastPostAt: task.channel.lastPostAt?.toISOString() ?? null,
+          nextAllowedAt: nextAllowedAt.toISOString(),
+        });
+        continue;
+      }
+    }
+
+    const lock = await tryAcquireChannelLock({
+      scope: 'dispatch',
+      channelId: task.channelId,
+    });
+
+    if (!lock.acquired) {
+      logger.info('[scheduler] 分发任务跳过（频道锁未获取）', {
+        taskId: task.id.toString(),
+        channelId: channelIdStr,
+        lockKey: lock.lockKey,
+      });
+      continue;
+    }
+
+    try {
     const updated = await prisma.dispatchTask.updateMany({
       where: {
         id: task.id,
@@ -53,10 +123,16 @@ export async function scheduleDueDispatchTasks() {
         removeOnFail: 200,
       },
     );
+
+      queuedChannelIds.add(channelIdStr);
+      queuedCount += 1;
+    } finally {
+      await releaseChannelLock({ lockKey: lock.lockKey, lockToken: lock.lockToken });
+    }
   }
 
-  if (dueTasks.length > 0) {
-    logger.info('[scheduler] 已入队分发任务', { count: dueTasks.length });
+  if (queuedCount > 0) {
+    logger.info('[scheduler] 已入队分发任务', { count: queuedCount });
   }
 }
 
