@@ -134,23 +134,23 @@ export async function reconcileTypeAStuckAssets() {
       sourceMeta.ingestErrorCode === TYPEA_INGEST_ERROR_CODE.srcFileMissing;
 
     if (!isAlreadyFinalMissing) {
-      await prisma.mediaAsset.update({
-        where: { id: asset.id },
-        data: {
-          status: MediaStatus.failed,
-          ingestError: 'SRC_FILE_MISSING_FINAL: source file missing and unrecoverable',
-          sourceMeta: {
-            ...sourceMeta,
-            ingestErrorCode: TYPEA_INGEST_ERROR_CODE.srcFileMissing,
-            ingestFinalReason: TYPEA_INGEST_FINAL_REASON.failedFinal,
-            ingestLeaseUntil: null,
-            ingestWorkerJobId: null,
-            ingestLastHeartbeatAt: new Date().toISOString(),
-          },
+    await prisma.mediaAsset.update({
+      where: { id: asset.id },
+      data: {
+        status: MediaStatus.failed,
+        ingestError: 'SRC_FILE_MISSING_FINAL: source file missing and unrecoverable',
+        sourceMeta: {
+          ...sourceMeta,
+          ingestErrorCode: TYPEA_INGEST_ERROR_CODE.srcFileMissing,
+          ingestFinalReason: TYPEA_INGEST_FINAL_REASON.failedFinal,
+          ingestLeaseUntil: null,
+          ingestWorkerJobId: null,
+          ingestLastHeartbeatAt: new Date().toISOString(),
         },
-      });
+      },
+    });
 
-      missingFinal += 1;
+    missingFinal += 1;
     }
   }
 
