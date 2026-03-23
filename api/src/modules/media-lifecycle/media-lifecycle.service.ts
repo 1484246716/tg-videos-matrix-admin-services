@@ -67,6 +67,8 @@ export class MediaLifecycleService {
     keyword?: string;
     stage?: string;
     limit?: number;
+    userId?: string;
+    role?: string;
   }) {
     const stageFilter = params.stage ? STAGE_FILTER_MAP[params.stage] : undefined;
     const tfid = (params.telegramFileId || '').trim();
@@ -94,11 +96,17 @@ export class MediaLifecycleService {
           : {}),
         originalName: params.keyword ? { contains: params.keyword, mode: 'insensitive' } : undefined,
         status: stageFilter?.mediaStatus ? stageFilter.mediaStatus : undefined,
+        channel:
+          params.role === 'admin'
+            ? undefined
+            : {
+                createdBy: params.userId ? BigInt(params.userId) : undefined,
+              },
       },
       orderBy: { updatedAt: 'desc' },
       take: params.limit ?? 50,
       include: {
-        channel: { select: { id: true, name: true } },
+        channel: { select: { id: true, name: true, createdBy: true } },
       },
     });
 
@@ -133,6 +141,7 @@ export class MediaLifecycleService {
         originalName: asset.originalName,
         channelId: asset.channelId.toString(),
         channelName: (asset as any).channel?.name ?? null,
+        channelCreatedBy: (asset as any).channel?.createdBy ? (asset as any).channel.createdBy.toString() : null,
         status: asset.status,
         relayMessageId: asset.relayMessageId ? asset.relayMessageId.toString() : null,
         telegramFileId: asset.telegramFileId,
@@ -199,9 +208,17 @@ export class MediaLifecycleService {
     return result;
   }
 
-  async getDetail(id: string) {
-    const asset = await this.prisma.mediaAsset.findUnique({
-      where: { id: BigInt(id) },
+  async getDetail(id: string, userId?: string, role?: string) {
+    const asset = await this.prisma.mediaAsset.findFirst({
+      where: {
+        id: BigInt(id),
+        channel:
+          role === 'admin'
+            ? undefined
+            : {
+                createdBy: userId ? BigInt(userId) : undefined,
+              },
+      },
       include: { channel: { select: { id: true, name: true } } },
     });
 
@@ -270,9 +287,17 @@ export class MediaLifecycleService {
     return Date.now() - failedAt.getTime() >= cooldownMs;
   }
 
-  async retryRelay(id: string) {
-    const asset = await this.prisma.mediaAsset.findUnique({
-      where: { id: BigInt(id) },
+  async retryRelay(id: string, userId?: string, role?: string) {
+    const asset = await this.prisma.mediaAsset.findFirst({
+      where: {
+        id: BigInt(id),
+        channel:
+          role === 'admin'
+            ? undefined
+            : {
+                createdBy: userId ? BigInt(userId) : undefined,
+              },
+      },
       select: { id: true, status: true, updatedAt: true, ingestError: true },
     });
 
@@ -300,12 +325,18 @@ export class MediaLifecycleService {
     return { ok: true };
   }
 
-  async retryRelayBatch(ids: string[]) {
+  async retryRelayBatch(ids: string[], userId?: string, role?: string) {
     if (!ids.length) return { ok: true, updated: 0, skipped: 0, skippedIds: [] as string[] };
 
     const assets = await this.prisma.mediaAsset.findMany({
       where: {
         id: { in: ids.map((id) => BigInt(id)) },
+        channel:
+          role === 'admin'
+            ? undefined
+            : {
+                createdBy: userId ? BigInt(userId) : undefined,
+              },
       },
       select: { id: true, status: true, updatedAt: true },
     });
@@ -342,11 +373,19 @@ export class MediaLifecycleService {
     };
   }
 
-  async remove(id: string, force = false) {
+  async remove(id: string, force = false, userId?: string, role?: string) {
     const mediaAssetId = BigInt(id);
 
-    const existing = await this.prisma.mediaAsset.findUnique({
-      where: { id: mediaAssetId },
+    const existing = await this.prisma.mediaAsset.findFirst({
+      where: {
+        id: mediaAssetId,
+        channel:
+          role === 'admin'
+            ? undefined
+            : {
+                createdBy: userId ? BigInt(userId) : undefined,
+              },
+      },
       select: {
         id: true,
         status: true,
