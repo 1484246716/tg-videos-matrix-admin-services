@@ -13,7 +13,6 @@ import { MediaStatus } from '@prisma/client';
 import {
   GRAMJS_FORWARD_TARGET_CHAT_ID,
   GRAMJS_UPLOAD_WORKERS,
-  RELAY_UPLOAD_SEND_DOCUMENT_THRESHOLD_MB,
   RELAY_UPLOAD_GRAMJS_THRESHOLD_MB,
   TYPEA_FAIL_ON_FILE_MISSING,
   TYPEA_INGEST_LEASE_MS,
@@ -212,9 +211,7 @@ export const relayUploadWorker = new Worker(
     const fileName = basename(mediaAsset.localPath);
     const fileSize = mediaAsset.fileSize ? Number(mediaAsset.fileSize) : undefined;
     const gramjsThresholdBytes = RELAY_UPLOAD_GRAMJS_THRESHOLD_MB * 1024 * 1024;
-    const sendDocumentThresholdBytes = RELAY_UPLOAD_SEND_DOCUMENT_THRESHOLD_MB * 1024 * 1024;
     const useGramjs = fileSize !== undefined && fileSize >= gramjsThresholdBytes;
-    const useDocument = fileSize !== undefined && fileSize >= sendDocumentThresholdBytes;
 
     if (useGramjs) {
       logger.info('[q_relay_upload] 使用 GramJS 上传大文件', {
@@ -222,7 +219,7 @@ export const relayUploadWorker = new Worker(
         stage: 'start',
         mediaAssetId: mediaAssetIdRaw,
         relayChannelId: relayChannelIdRaw,
-        uploadMethod: useDocument ? 'gramjs_sendDocument' : 'gramjs_sendVideo',
+        uploadMethod: 'gramjs_sendVideo',
         fileSize,
       });
 
@@ -236,7 +233,7 @@ export const relayUploadWorker = new Worker(
           fileName,
           caption: mediaAsset.originalName,
           chatId: relayChannel.tgChatId.toString(),
-          forceDocument: useDocument,
+          forceDocument: false,
           workers: GRAMJS_UPLOAD_WORKERS,
           progressCallback: (progress) => {
             const percent = Number((progress * 100).toFixed(2));
@@ -430,18 +427,11 @@ export const relayUploadWorker = new Worker(
 
     fileStream.pipe(streamWithProgress);
 
-    if (useDocument) {
-      formData.append('document', streamWithProgress, {
-        filename: fileName,
-        knownLength: fileSize,
-      });
-    } else {
-      formData.append('video', streamWithProgress, {
-        filename: fileName,
-        knownLength: fileSize,
-      });
-      formData.append('supports_streaming', 'true');
-    }
+    formData.append('video', streamWithProgress, {
+      filename: fileName,
+      knownLength: fileSize,
+    });
+    formData.append('supports_streaming', 'true');
     const streamDurationMs = Date.now() - streamStart;
     if (streamDurationMs > 500) {
       logger.info('[q_relay_upload] 文件读取/封装耗时', {
@@ -457,7 +447,7 @@ export const relayUploadWorker = new Worker(
       stage: 'start',
       mediaAssetId: mediaAssetIdRaw,
       relayChannelId: relayChannelIdRaw,
-      uploadMethod: useDocument ? 'sendDocument' : 'sendVideo',
+      uploadMethod: 'sendVideo',
     });
 
     const uploadStart = Date.now();
@@ -481,7 +471,7 @@ export const relayUploadWorker = new Worker(
     try {
       sendResult = await sendTelegramRequest({
         botToken: relayChannel.bot.tokenEncrypted,
-        method: useDocument ? 'sendDocument' : 'sendVideo',
+        method: 'sendVideo',
         payload: formData,
       });
     } catch (err: any) {
