@@ -86,6 +86,8 @@ services:
         condition: service_started
       tg-bot-api-v2:
         condition: service_started
+      ffmpeg:
+        condition: service_started
     environment:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
@@ -101,6 +103,7 @@ services:
       RELAY_ENABLE_FFPROBE_CHECK: ${RELAY_ENABLE_FFPROBE_CHECK}
       RELAY_FFPROBE_TIMEOUT_MS: ${RELAY_FFPROBE_TIMEOUT_MS}
       RELAY_FFPROBE_MIN_DURATION_SEC: ${RELAY_FFPROBE_MIN_DURATION_SEC}
+      RELAY_LOCAL_PATH_LOCK_TTL_MS: ${RELAY_LOCAL_PATH_LOCK_TTL_MS}
       GRAMJS_API_ID: ${GRAMJS_API_ID}
       GRAMJS_API_HASH: ${GRAMJS_API_HASH}
       GRAMJS_BOT_TOKEN: ${GRAMJS_BOT_TOKEN}
@@ -113,6 +116,12 @@ services:
       - ./data/tg-crm:/data
       # 👇 映射 Worker 服务日志到宿主机
       - ./worker/logs:/app/worker/logs
+
+  ffmpeg:
+    image: jrottenberg/ffmpeg:6.1-alpine
+    container_name: tg-crm-ffmpeg
+    restart: unless-stopped
+    command: ["sh", "-c", "sleep infinity"]
 
   tg-bot-api-v2:
     image: aiogram/telegram-bot-api:latest

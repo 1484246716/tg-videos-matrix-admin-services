@@ -1,5 +1,6 @@
 import { Worker } from 'bullmq';
 import { createReadStream } from 'node:fs';
+import { unlink } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { PassThrough } from 'node:stream';
 import FormData from 'form-data';
@@ -7,6 +8,7 @@ import { connection } from '../infra/redis';
 import { prisma } from '../infra/prisma';
 import { logger, logError } from '../logger';
 import {
+  createVideoThumbnail,
   ensureMp4Faststart,
   getVideoProbeMeta,
   moveToArchive,
@@ -200,9 +202,12 @@ export const relayUploadWorker = new Worker(
       pickMode: 'fixed_by_channel_bot',
     });
 
-    const stableCheckStart = Date.now();
-    await heartbeat({ ingestStage: 'wait_for_stable' });
-    await waitForFileStable(mediaAsset.localPath);
+    let thumbnailPath: string | null = null;
+
+    try {
+      const stableCheckStart = Date.now();
+      await heartbeat({ ingestStage: 'wait_for_stable' });
+      await waitForFileStable(mediaAsset.localPath);
 
     try {
       await ensureMp4Faststart(mediaAsset.localPath);
@@ -230,6 +235,22 @@ export const relayUploadWorker = new Worker(
         reason: error instanceof Error ? error.message : String(error),
       });
     }
+
+    const normalizedDurationSec =
+      typeof videoMeta.durationSec === 'number' && Number.isFinite(videoMeta.durationSec) && videoMeta.durationSec > 0
+        ? Math.floor(videoMeta.durationSec)
+        : null;
+
+    try {
+      thumbnailPath = await createVideoThumbnail(mediaAsset.localPath);
+    } catch (error) {
+      logger.warn('[q_relay_upload] 视频封面生成失败，继续上传', {
+        traceId,
+        mediaAssetId: mediaAssetIdRaw,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+
     const stableCheckDurationMs = Date.now() - stableCheckStart;
     if (stableCheckDurationMs > 1000) {
       logger.info('[q_relay_upload] 文件稳定性检查耗时', {
@@ -268,6 +289,7 @@ export const relayUploadWorker = new Worker(
           forceDocument: false,
           workers: GRAMJS_UPLOAD_WORKERS,
           videoMeta,
+          thumbnailPath: thumbnailPath ?? undefined,
           progressCallback: (progress) => {
             const percent = Number((progress * 100).toFixed(2));
             logger.info('[q_relay_upload] GramJS 上传进度', {
@@ -370,6 +392,7 @@ export const relayUploadWorker = new Worker(
           telegramFileId: forwardFileId,
           telegramFileUniqueId: forwardFileUniqueId,
           ingestError: null,
+          durationSec: normalizedDurationSec,
           ingestFinishedAt,
           ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
           sourceMeta: {
@@ -457,6 +480,11 @@ export const relayUploadWorker = new Worker(
       filename: fileName,
       knownLength: fileSize,
     });
+    if (thumbnailPath) {
+      formData.append('thumbnail', createReadStream(thumbnailPath), {
+        filename: 'thumb.jpg',
+      });
+    }
     formData.append('supports_streaming', 'true');
     const streamDurationMs = Date.now() - streamStart;
     if (streamDurationMs > 500) {
@@ -540,6 +568,7 @@ export const relayUploadWorker = new Worker(
               telegramFileId: fallbackResult.telegramFileId,
               telegramFileUniqueId: fallbackResult.telegramFileUniqueId,
               ingestError: null,
+              durationSec: normalizedDurationSec,
               ingestFinishedAt,
               ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
               sourceMeta: {
@@ -632,6 +661,7 @@ export const relayUploadWorker = new Worker(
           telegramFileId: directFileId,
           telegramFileUniqueId: directFileUniqueId,
           ingestError: null,
+          durationSec: normalizedDurationSec,
           ingestFinishedAt,
           ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
           sourceMeta: {
@@ -678,7 +708,17 @@ export const relayUploadWorker = new Worker(
 
       throw new Error('中转上传成功但未返回 video_file_id');
     }
-  },
+  } finally {
+    if (thumbnailPath) {
+      try {
+        await unlink(thumbnailPath);
+      } catch {
+        // ignore
+      }
+      thumbnailPath = null;
+    }
+  }
+},
   {
     connection: connection as any,
     concurrency: 1,
@@ -718,8 +758,11 @@ relayUploadWorker.on('failed', async (job, err) => {
       const message = err instanceof Error ? err.message : String(err);
       const isCommandMissing = /spawn\s+(ffmpeg|ffprobe)\s+ENOENT/i.test(message);
       const isFileMissing = message.includes('ENOENT: no such file or directory') && !isCommandMissing;
+      // Telegram RPC 确定性错误（参数非法），重试无效，直接标记 failedFinal
+      const isTelegramRpcFatal = /DOUBLE_VALUE_INVALID|INTEGER_VALUE_INVALID|PHOTO_INVALID_DIMENSIONS|FILE_PARTS_INVALID|MSG_ID_INVALID/i.test(message);
       const exceeded = ingestRetryCount >= TYPEA_INGEST_MAX_RETRIES;
       const finalOnMissing = TYPEA_FAIL_ON_FILE_MISSING && isFileMissing;
+      const isFinal = exceeded || finalOnMissing || isTelegramRpcFatal;
 
       if (!asset) {
         logger.warn('[q_relay_upload] 任务失败回写跳过：mediaAsset 不存在', {
@@ -735,7 +778,9 @@ relayUploadWorker.on('failed', async (job, err) => {
               ? 'SRC_FILE_MISSING: source file not found'
               : isCommandMissing
                 ? 'TOOL_MISSING: ffmpeg/ffprobe not found in PATH'
-                : message || '未知错误',
+                : isTelegramRpcFatal
+                  ? `TG_RPC_FATAL: ${message}`
+                  : message || '未知错误',
             ingestFinishedAt,
             ingestDurationSec: null,
             sourceMeta: {
@@ -744,7 +789,7 @@ relayUploadWorker.on('failed', async (job, err) => {
               ingestErrorCode: isFileMissing
                 ? TYPEA_INGEST_ERROR_CODE.srcFileMissing
                 : TYPEA_INGEST_ERROR_CODE.ingestRuntimeError,
-              ingestFinalReason: exceeded || finalOnMissing
+              ingestFinalReason: isFinal
                 ? TYPEA_INGEST_FINAL_REASON.failedFinal
                 : TYPEA_INGEST_FINAL_REASON.retryable,
               ingestLeaseUntil: null,
@@ -759,10 +804,10 @@ relayUploadWorker.on('failed', async (job, err) => {
       logger.info('[typea_metrics] relay upload failed', {
         mediaAssetId: mediaAssetIdRaw,
         typea_file_missing_total: isFileMissing ? 1 : 0,
-        typea_failed_final_total: exceeded || finalOnMissing ? 1 : 0,
+        typea_failed_final_total: isFinal ? 1 : 0,
         task_run_total: 1,
         task_failed_total: 1,
-        task_dead_total: exceeded || finalOnMissing ? 1 : 0,
+        task_dead_total: isFinal ? 1 : 0,
         ingestRetryCount,
         maxRetries: TYPEA_INGEST_MAX_RETRIES,
         failOnFileMissing: TYPEA_FAIL_ON_FILE_MISSING,

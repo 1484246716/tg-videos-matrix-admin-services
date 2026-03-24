@@ -50,6 +50,7 @@ export async function handleDispatchJob(
           status: true,
           originalName: true,
           aiGeneratedCaption: true,
+          durationSec: true,
           sourceMeta: true,
         },
       },
@@ -89,6 +90,10 @@ export async function handleDispatchJob(
         ? (task.mediaAsset.sourceMeta as Record<string, unknown>)
         : null;
     const originalNameStem = getFileStem(task.mediaAsset.originalName);
+    const runtimeHint =
+      typeof task.mediaAsset.durationSec === 'number' && task.mediaAsset.durationSec > 0
+        ? `视频实测时长约 ${Math.floor(task.mediaAsset.durationSec / 60)} 分 ${task.mediaAsset.durationSec % 60} 秒（请据此填写“单集片长”，不要瞎编）`
+        : '未探测到可靠视频时长（“单集片长”请谨慎表述为未知或约略，不要乱填具体分钟数）';
 
     let finalCaption = task.caption || task.mediaAsset.aiGeneratedCaption;
     if (isAiFailureText(finalCaption)) {
@@ -128,7 +133,7 @@ export async function handleDispatchJob(
           finalCaption = await generateTextWithAiProfile(
             profile,
             task.channel.aiSystemPromptTemplate,
-            `请为这个视频生成文案，原名：${task.mediaAsset.originalName}`,
+            `请为这个视频生成文案，原名：${task.mediaAsset.originalName}\n${runtimeHint}`,
           );
 
           if (isAiFailureText(finalCaption)) {

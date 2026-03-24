@@ -200,6 +200,31 @@ export async function ensureMp4Faststart(filePath: string): Promise<string> {
   }
 }
 
+export async function createVideoThumbnail(filePath: string): Promise<string> {
+  const thumbnailPath = `${filePath}.tg-thumb.jpg`;
+
+  await execFileAsync(
+    'ffmpeg',
+    [
+      '-y',
+      '-ss',
+      '1',
+      '-i',
+      filePath,
+      '-frames:v',
+      '1',
+      '-vf',
+      'scale=320:-1',
+      '-q:v',
+      '3',
+      thumbnailPath,
+    ],
+    { timeout: Math.max(RELAY_FFPROBE_TIMEOUT_MS * 3, 45000) },
+  );
+
+  return thumbnailPath;
+}
+
 export async function waitForFileStable(filePath: string) {
   const stableStart = Date.now();
   logger.info('[relay] 文件稳定性检查开始', {

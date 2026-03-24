@@ -3,6 +3,7 @@ FROM node:25-bookworm-slim
 WORKDIR /app
 
 ENV NODE_ENV=development
+ENV RELAY_LOCAL_PATH_LOCK_TTL_MS=120000
 
 # 1. 配置 Debian 镜像源并安装运行依赖（openssl + ffmpeg/ffprobe）
 RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources && \

@@ -52,6 +52,10 @@ export const RELAY_ENABLE_FFPROBE_CHECK = process.env.RELAY_ENABLE_FFPROBE_CHECK
 export const RELAY_FFPROBE_TIMEOUT_MS = parseInt(process.env.RELAY_FFPROBE_TIMEOUT_MS || '15000', 10);
 export const RELAY_FFPROBE_MIN_DURATION_SEC = parseInt(process.env.RELAY_FFPROBE_MIN_DURATION_SEC || '1', 10);
 
+export const RELAY_LOCAL_PATH_LOCK_TTL_MS = Number(
+  process.env.RELAY_LOCAL_PATH_LOCK_TTL_MS || '120000',
+);
+
 export const TYPEA_INGEST_MAX_RETRIES = Number(
   process.env.TYPEA_INGEST_MAX_RETRIES || '3',
 );

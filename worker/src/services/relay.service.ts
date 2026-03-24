@@ -5,6 +5,7 @@ import { TYPEA_MAX_UPLOAD_SIZE_MB } from '../config/env';
 import { prisma, getTaskDefinitionModel } from '../infra/prisma';
 import { logger } from '../logger';
 import { hashFile, scanChannelVideos, waitForFileStable } from '../shared/file-utils';
+import { tryAcquireRelayPathLock, releaseRelayPathLock } from '../shared/relay-path-lock';
 import { TYPEA_INGEST_ERROR_CODE, TYPEA_INGEST_FINAL_REASON } from '../shared/metrics';
 
 async function removeLocalDuplicateFile(filePath: string, mediaAssetId: string) {
@@ -80,6 +81,16 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
     for (const filePath of files) {
       scannedFiles += 1;
 
+      const pathLock = await tryAcquireRelayPathLock(filePath);
+      if (!pathLock.acquired) {
+        logger.info('[relay] 扫描跳过：localPath 锁被占用', {
+          filePath,
+          lockKey: pathLock.lockKey,
+          reason: 'path_lock_busy_skip',
+        });
+        continue;
+      }
+
       try {
         await waitForFileStable(filePath);
       } catch (error) {
@@ -87,10 +98,30 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
           filePath,
           reason: error instanceof Error ? error.message : String(error),
         });
+        await releaseRelayPathLock(pathLock);
         continue;
       }
 
-      const s = await stat(filePath);
+      try {
+        const s = await stat(filePath);
+
+      const existedByPath = await prisma.mediaAsset.findFirst({
+        where: {
+          localPath: filePath,
+          status: { in: [MediaStatus.ready, MediaStatus.ingesting, MediaStatus.relay_uploaded] },
+        },
+        select: { id: true, status: true },
+      });
+
+      if (existedByPath) {
+        logger.info('[relay] 扫描跳过：localPath 已存在活跃记录', {
+          filePath,
+          existedMediaAssetId: existedByPath.id.toString(),
+          existedStatus: existedByPath.status,
+          reason: 'path_dedup_skip',
+        });
+        continue;
+      }
 
       if (s.size > maxUploadSizeBytes) {
         const ingestError = `FILE_TOO_LARGE: file size ${s.size} exceeds ${maxUploadSizeBytes} bytes (${TYPEA_MAX_UPLOAD_SIZE_MB}MB policy)`;
@@ -345,6 +376,9 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
       });
 
       enqueuedTasks += 1;
+      } finally {
+        await releaseRelayPathLock(pathLock);
+      }
     }
   }
 
