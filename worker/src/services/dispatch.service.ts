@@ -6,6 +6,22 @@ import { logger, logError } from '../logger';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
 import { sendVideoByTelegram, TelegramError } from '../shared/telegram';
 
+const AI_FALLBACK_PATTERNS = [/无法识别/, /不好意思/, /请提供更多/, /无法根据.*生成/, /未能识别/];
+
+function getFileNameWithoutExtension(fileName: string) {
+  const trimmed = fileName.trim();
+  const withoutExt = trimmed.replace(/\.[^./\\]+$/, '');
+  return withoutExt || trimmed;
+}
+
+function isUnusableAiText(text: string | null | undefined) {
+  if (!text) return true;
+  const normalized = text.trim();
+  if (!normalized) return true;
+
+  return AI_FALLBACK_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
 export async function handleDispatchJob(
   dispatchTaskIdRaw: string,
   jobId: string,
@@ -75,7 +91,12 @@ export async function handleDispatchJob(
         ? (task.mediaAsset.sourceMeta as Record<string, unknown>)
         : null;
 
+    const fallbackFileName = getFileNameWithoutExtension(task.mediaAsset.originalName);
+
     let finalCaption = task.caption || task.mediaAsset.aiGeneratedCaption;
+    if (isUnusableAiText(finalCaption)) {
+      finalCaption = fallbackFileName;
+    }
 
     if (!finalCaption && task.channel.aiSystemPromptTemplate) {
       let profile = task.channel.aiModelProfileId
@@ -113,6 +134,10 @@ export async function handleDispatchJob(
             `请为这个视频生成文案，原名：${task.mediaAsset.originalName}`,
           );
 
+          if (isUnusableAiText(finalCaption)) {
+            finalCaption = fallbackFileName;
+          }
+
           await prisma.dispatchTask.update({
             where: { id: task.id },
             data: { caption: finalCaption },
@@ -126,13 +151,13 @@ export async function handleDispatchJob(
             dispatchTaskId: task.id.toString(),
             error: aiErr,
           });
-          finalCaption = task.mediaAsset.originalName;
+          finalCaption = fallbackFileName;
         }
       } else {
-        finalCaption = task.mediaAsset.originalName;
+        finalCaption = fallbackFileName;
       }
     } else if (!finalCaption) {
-      finalCaption = task.mediaAsset.originalName;
+      finalCaption = fallbackFileName;
     }
 
     if (!task.mediaAsset.aiGeneratedCaption && finalCaption) {

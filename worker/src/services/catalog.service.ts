@@ -8,6 +8,22 @@ import {
   sendTextByTelegram,
 } from '../shared/telegram';
 
+const AI_FALLBACK_PATTERNS = [/无法识别/, /不好意思/, /请提供更多/, /无法根据.*生成/, /未能识别/];
+
+function getFileNameWithoutExtension(fileName: string) {
+  const trimmed = fileName.trim();
+  const withoutExt = trimmed.replace(/\.[^./\\]+$/, '');
+  return withoutExt || trimmed;
+}
+
+function isUnusableAiText(text: string | null | undefined) {
+  if (!text) return true;
+  const normalized = text.trim();
+  if (!normalized) return true;
+
+  return AI_FALLBACK_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
 export async function handleCatalogJob(channelIdRaw: string) {
   let catalogTaskId: bigint | null = null;
   const channelId = BigInt(channelIdRaw);
@@ -113,6 +129,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
       mediaAsset: {
         select: {
           sourceMeta: true,
+          originalName: true,
         },
       },
     },
@@ -133,8 +150,15 @@ export async function handleCatalogJob(channelIdRaw: string) {
   }
 
   const videos = [...dispatchTasks].reverse().map((t) => {
-    const parts = (t.caption || '').split('\n').map((l) => l.trim()).filter(Boolean);
-    let shortTitle = '未命名视频';
+    const fallbackFileName = getFileNameWithoutExtension(t.mediaAsset?.originalName?.trim() || '未命名视频');
+    const safeCaption = isUnusableAiText(t.caption) ? fallbackFileName : (t.caption || '');
+
+    const parts = safeCaption
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    let shortTitle = fallbackFileName;
     if (parts.length >= 2) {
       shortTitle = `${parts[0]} ${parts[1]}`;
     } else if (parts.length === 1) {
@@ -145,12 +169,13 @@ export async function handleCatalogJob(channelIdRaw: string) {
       t.mediaAsset?.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
         ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
         : {};
-    const customCatalogTitle =
+    const customCatalogTitleRaw =
       typeof sourceMeta.catalogCustomTitle === 'string' ? sourceMeta.catalogCustomTitle.trim() : '';
+    const customCatalogTitle = isUnusableAiText(customCatalogTitleRaw) ? '' : customCatalogTitleRaw;
 
     return {
       message_url: t.telegramMessageLink || '',
-      short_title: customCatalogTitle || shortTitle,
+      short_title: customCatalogTitle || shortTitle || fallbackFileName,
     };
   });
 
