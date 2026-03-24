@@ -8,6 +8,20 @@ import {
   sendTextByTelegram,
 } from '../shared/telegram';
 
+function getFileStem(fileName: string) {
+  const trimmed = fileName.trim();
+  const stem = trimmed.replace(/\.[^./\\]+$/, '').trim();
+  return stem || trimmed;
+}
+
+function isAiFailureText(text?: string | null) {
+  if (!text) return false;
+  const normalized = text.trim();
+  if (!normalized) return false;
+
+  return /无法识别|抱歉|如果可以提供更多|视频的内容简介|主要角色|生成相关文案/.test(normalized);
+}
+
 export async function handleCatalogJob(channelIdRaw: string) {
   let catalogTaskId: bigint | null = null;
   const channelId = BigInt(channelIdRaw);
@@ -112,6 +126,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
       telegramMessageLink: true,
       mediaAsset: {
         select: {
+          originalName: true,
           sourceMeta: true,
         },
       },
@@ -133,20 +148,26 @@ export async function handleCatalogJob(channelIdRaw: string) {
   }
 
   const videos = [...dispatchTasks].reverse().map((t) => {
-    const parts = (t.caption || '').split('\n').map((l) => l.trim()).filter(Boolean);
-    let shortTitle = '未命名视频';
-    if (parts.length >= 2) {
-      shortTitle = `${parts[0]} ${parts[1]}`;
-    } else if (parts.length === 1) {
-      shortTitle = parts[0];
-    }
-
     const sourceMeta =
       t.mediaAsset?.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
         ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
         : {};
     const customCatalogTitle =
       typeof sourceMeta.catalogCustomTitle === 'string' ? sourceMeta.catalogCustomTitle.trim() : '';
+    const fallbackTitle = getFileStem(t.mediaAsset?.originalName || '未命名视频');
+    const safeCaption = isAiFailureText(t.caption) ? fallbackTitle : (t.caption || '').trim();
+
+    const parts = safeCaption.split('\n').map((l) => l.trim()).filter(Boolean);
+    let shortTitle = fallbackTitle;
+    if (parts.length >= 2) {
+      shortTitle = `${parts[0]} ${parts[1]}`;
+    } else if (parts.length === 1) {
+      shortTitle = parts[0];
+    }
+
+    if (isAiFailureText(shortTitle)) {
+      shortTitle = fallbackTitle;
+    }
 
     return {
       message_url: t.telegramMessageLink || '',

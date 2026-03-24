@@ -6,6 +6,20 @@ import { logger, logError } from '../logger';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
 import { sendVideoByTelegram, TelegramError } from '../shared/telegram';
 
+function getFileStem(fileName: string) {
+  const trimmed = fileName.trim();
+  const stem = trimmed.replace(/\.[^./\\]+$/, '').trim();
+  return stem || trimmed;
+}
+
+function isAiFailureText(text?: string | null) {
+  if (!text) return false;
+  const normalized = text.trim();
+  if (!normalized) return false;
+
+  return /无法识别|抱歉|如果可以提供更多|视频的内容简介|主要角色|生成相关文案/.test(normalized);
+}
+
 export async function handleDispatchJob(
   dispatchTaskIdRaw: string,
   jobId: string,
@@ -74,8 +88,12 @@ export async function handleDispatchJob(
       task.mediaAsset.sourceMeta && typeof task.mediaAsset.sourceMeta === 'object'
         ? (task.mediaAsset.sourceMeta as Record<string, unknown>)
         : null;
+    const originalNameStem = getFileStem(task.mediaAsset.originalName);
 
     let finalCaption = task.caption || task.mediaAsset.aiGeneratedCaption;
+    if (isAiFailureText(finalCaption)) {
+      finalCaption = originalNameStem;
+    }
 
     if (!finalCaption && task.channel.aiSystemPromptTemplate) {
       let profile = task.channel.aiModelProfileId
@@ -113,6 +131,10 @@ export async function handleDispatchJob(
             `请为这个视频生成文案，原名：${task.mediaAsset.originalName}`,
           );
 
+          if (isAiFailureText(finalCaption)) {
+            finalCaption = originalNameStem;
+          }
+
           await prisma.dispatchTask.update({
             where: { id: task.id },
             data: { caption: finalCaption },
@@ -126,13 +148,17 @@ export async function handleDispatchJob(
             dispatchTaskId: task.id.toString(),
             error: aiErr,
           });
-          finalCaption = task.mediaAsset.originalName;
+          finalCaption = originalNameStem;
         }
       } else {
-        finalCaption = task.mediaAsset.originalName;
+        finalCaption = originalNameStem;
       }
     } else if (!finalCaption) {
-      finalCaption = task.mediaAsset.originalName;
+      finalCaption = originalNameStem;
+    }
+
+    if (isAiFailureText(finalCaption)) {
+      finalCaption = originalNameStem;
     }
 
     if (!task.mediaAsset.aiGeneratedCaption && finalCaption) {
@@ -225,16 +251,16 @@ export async function handleDispatchJob(
 
     await prisma.$transaction([
       prisma.dispatchTask.update({
-      where: { id: dispatchTaskId },
-      data: {
-        status: TaskStatus.success,
-        finishedAt: new Date(),
-        botId: bot.id,
-        telegramMessageId: BigInt(sendResult.messageId),
-        telegramMessageLink: sendResult.messageLink,
-        telegramErrorCode: null,
-        telegramErrorMessage: null,
-      },
+        where: { id: dispatchTaskId },
+        data: {
+          status: TaskStatus.success,
+          finishedAt: new Date(),
+          botId: bot.id,
+          telegramMessageId: BigInt(sendResult.messageId),
+          telegramMessageLink: sendResult.messageLink,
+          telegramErrorCode: null,
+          telegramErrorMessage: null,
+        },
       }),
       prisma.channel.update({
         where: { id: task.channelId },
