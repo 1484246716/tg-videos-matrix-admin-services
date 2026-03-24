@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { mkdir, readdir, rename, stat } from 'node:fs/promises';
+import { mkdir, readdir, rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, extname, join, normalize, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -30,6 +30,13 @@ const SUPPORTED_VIDEO_EXT = new Set([
 
 const execFileAsync = promisify(execFile);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export type VideoProbeMeta = {
+  durationSec: number | null;
+  width: number | null;
+  height: number | null;
+  supportsStreaming: boolean;
+};
 
 export async function moveToArchive(localPath: string): Promise<string> {
   if (localPath.includes(`${join('archived')}`)) {
@@ -100,6 +107,97 @@ async function probeVideoByFfprobe(filePath: string) {
     streamCount: streams.length,
     elapsedMs: Date.now() - probeStart,
   });
+}
+
+export async function getVideoProbeMeta(filePath: string): Promise<VideoProbeMeta> {
+  const { stdout } = await execFileAsync(
+    'ffprobe',
+    [
+      '-v',
+      'error',
+      '-show_streams',
+      '-show_format',
+      '-of',
+      'json',
+      filePath,
+    ],
+    { timeout: RELAY_FFPROBE_TIMEOUT_MS },
+  );
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(stdout || '{}');
+  } catch {
+    throw new Error('ffprobe 输出非 JSON，无法解析');
+  }
+
+  const streams = Array.isArray(parsed?.streams) ? parsed.streams : [];
+  const videoStream = streams.find((s: any) => s?.codec_type === 'video') ?? null;
+  if (!videoStream) {
+    throw new Error('ffprobe 未检测到视频流');
+  }
+
+  const durationRaw = videoStream?.duration ?? parsed?.format?.duration;
+  const durationNum = Number(durationRaw);
+  const widthNum = Number(videoStream?.width);
+  const heightNum = Number(videoStream?.height);
+  const formatName = String(parsed?.format?.format_name || '').toLowerCase();
+  const majorBrand = String(parsed?.format?.tags?.major_brand || '').toLowerCase();
+  const compatibleBrands = String(parsed?.format?.tags?.compatible_brands || '').toLowerCase();
+  const codecName = String(videoStream?.codec_name || '').toLowerCase();
+
+  return {
+    durationSec: Number.isFinite(durationNum) && durationNum > 0 ? Math.floor(durationNum) : null,
+    width: Number.isFinite(widthNum) && widthNum > 0 ? widthNum : null,
+    height: Number.isFinite(heightNum) && heightNum > 0 ? heightNum : null,
+    supportsStreaming:
+      formatName.includes('mov,mp4') ||
+      majorBrand.includes('mp4') ||
+      compatibleBrands.includes('mp4') ||
+      codecName === 'h264' ||
+      codecName === 'hevc',
+  };
+}
+
+export async function ensureMp4Faststart(filePath: string): Promise<string> {
+  const ext = extname(filePath).toLowerCase();
+  if (ext !== '.mp4') {
+    return filePath;
+  }
+
+  const tempPath = `${filePath}.faststart.tmp.mp4`;
+
+  try {
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-i',
+        filePath,
+        '-c',
+        'copy',
+        '-movflags',
+        '+faststart',
+        tempPath,
+      ],
+      { timeout: Math.max(RELAY_FFPROBE_TIMEOUT_MS * 4, 60000) },
+    );
+
+    await unlink(filePath);
+    await rename(tempPath, filePath);
+    logger.info('[relay] MP4 faststart 预处理完成', {
+      stage: 'faststart_done',
+      filePath,
+    });
+    return filePath;
+  } catch (error) {
+    try {
+      await unlink(tempPath);
+    } catch {
+      // ignore cleanup failure
+    }
+    throw error instanceof Error ? error : new Error(String(error));
+  }
 }
 
 export async function waitForFileStable(filePath: string) {

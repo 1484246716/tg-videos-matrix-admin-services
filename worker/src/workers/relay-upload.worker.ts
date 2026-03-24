@@ -6,7 +6,12 @@ import FormData from 'form-data';
 import { connection } from '../infra/redis';
 import { prisma } from '../infra/prisma';
 import { logger, logError } from '../logger';
-import { moveToArchive, waitForFileStable } from '../shared/file-utils';
+import {
+  ensureMp4Faststart,
+  getVideoProbeMeta,
+  moveToArchive,
+  waitForFileStable,
+} from '../shared/file-utils';
 import { sendViaGramjs } from '../shared/gramjs/upload';
 import { getTelegramUpdates, sendTelegramRequest } from '../shared/telegram';
 import { MediaStatus } from '@prisma/client';
@@ -198,6 +203,33 @@ export const relayUploadWorker = new Worker(
     const stableCheckStart = Date.now();
     await heartbeat({ ingestStage: 'wait_for_stable' });
     await waitForFileStable(mediaAsset.localPath);
+
+    try {
+      await ensureMp4Faststart(mediaAsset.localPath);
+    } catch (error) {
+      logger.warn('[q_relay_upload] faststart 预处理跳过（不阻断上传）', {
+        traceId,
+        mediaAssetId: mediaAssetIdRaw,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    let videoMeta = {
+      durationSec: null as number | null,
+      width: null as number | null,
+      height: null as number | null,
+      supportsStreaming: true,
+    };
+
+    try {
+      videoMeta = await getVideoProbeMeta(mediaAsset.localPath);
+    } catch (error) {
+      logger.warn('[q_relay_upload] ffprobe 视频元数据探测跳过（不阻断上传）', {
+        traceId,
+        mediaAssetId: mediaAssetIdRaw,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
     const stableCheckDurationMs = Date.now() - stableCheckStart;
     if (stableCheckDurationMs > 1000) {
       logger.info('[q_relay_upload] 文件稳定性检查耗时', {
@@ -235,6 +267,7 @@ export const relayUploadWorker = new Worker(
           chatId: relayChannel.tgChatId.toString(),
           forceDocument: false,
           workers: GRAMJS_UPLOAD_WORKERS,
+          videoMeta,
           progressCallback: (progress) => {
             const percent = Number((progress * 100).toFixed(2));
             logger.info('[q_relay_upload] GramJS 上传进度', {
@@ -292,15 +325,8 @@ export const relayUploadWorker = new Worker(
         throw forwardErr instanceof Error ? forwardErr : new Error('forwardMessage 失败');
       }
 
-      const forwardFileId =
-        forwardResult.videoFileId ??
-        forwardResult.documentFileId ??
-        forwardResult.animationFileId;
-      const forwardFileUniqueId =
-        forwardResult.videoFileUniqueId ??
-        forwardResult.documentFileUniqueId ??
-        forwardResult.animationFileUniqueId ??
-        null;
+      const forwardFileId = forwardResult.videoFileId;
+      const forwardFileUniqueId = forwardResult.videoFileUniqueId ?? null;
 
       if (!forwardFileId) {
         const ingestFinishedAt = new Date();
@@ -309,13 +335,13 @@ export const relayUploadWorker = new Worker(
           data: {
             status: MediaStatus.failed,
             relayMessageId: BigInt(gramjsMessageId),
-            ingestError: 'GramJS 上传成功但 forwardMessage 未返回 file_id',
+            ingestError: 'GramJS 上传成功但 forwardMessage 未返回 video_file_id（疑似被识别为 document）',
             ingestFinishedAt,
             ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
           } as any,
         });
 
-        throw new Error('GramJS 上传成功但 forwardMessage 未返回 file_id');
+        throw new Error('GramJS 上传成功但 forwardMessage 未返回 video_file_id');
       }
 
       const archiveStart = Date.now();
@@ -593,15 +619,8 @@ export const relayUploadWorker = new Worker(
       });
     }
 
-    const directFileId =
-      sendResult.videoFileId ??
-      sendResult.documentFileId ??
-      sendResult.animationFileId;
-    const directFileUniqueId =
-      sendResult.videoFileUniqueId ??
-      sendResult.documentFileUniqueId ??
-      sendResult.animationFileUniqueId ??
-      null;
+    const directFileId = sendResult.videoFileId;
+    const directFileUniqueId = sendResult.videoFileUniqueId ?? null;
 
     if (directFileId) {
       const ingestFinishedAt = new Date();
@@ -650,14 +669,14 @@ export const relayUploadWorker = new Worker(
         data: {
           status: MediaStatus.failed,
           relayMessageId: BigInt(sendResult.messageId),
-          ingestError: '中转上传成功但未返回 file_id',
+          ingestError: '中转上传成功但未返回 video_file_id（疑似被识别为 document）',
           ingestFinishedAt,
           ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
           ...(archivePath ? { archivePath, localPath: archivePath } : {}),
         } as any,
       });
 
-      throw new Error('中转上传成功但未返回 file_id');
+      throw new Error('中转上传成功但未返回 video_file_id');
     }
   },
   {
@@ -697,7 +716,8 @@ relayUploadWorker.on('failed', async (job, err) => {
             : 0;
 
       const message = err instanceof Error ? err.message : String(err);
-      const isFileMissing = message.includes('ENOENT');
+      const isCommandMissing = /spawn\s+(ffmpeg|ffprobe)\s+ENOENT/i.test(message);
+      const isFileMissing = message.includes('ENOENT: no such file or directory') && !isCommandMissing;
       const exceeded = ingestRetryCount >= TYPEA_INGEST_MAX_RETRIES;
       const finalOnMissing = TYPEA_FAIL_ON_FILE_MISSING && isFileMissing;
 
@@ -713,7 +733,9 @@ relayUploadWorker.on('failed', async (job, err) => {
             status: MediaStatus.failed,
             ingestError: isFileMissing
               ? 'SRC_FILE_MISSING: source file not found'
-              : message || '未知错误',
+              : isCommandMissing
+                ? 'TOOL_MISSING: ffmpeg/ffprobe not found in PATH'
+                : message || '未知错误',
             ingestFinishedAt,
             ingestDurationSec: null,
             sourceMeta: {
@@ -808,11 +830,10 @@ async function tryRecoverAfterHangUp(args: {
     if (!post?.chat?.id) return false;
     if (String(post.chat.id) !== channelId) return false;
 
-    const doc = post.document;
     const video = post.video;
-    const fileName = doc?.file_name ?? video?.file_name;
-    const fileSize = doc?.file_size ?? video?.file_size;
-    const fileId = doc?.file_id ?? video?.file_id;
+    const fileName = video?.file_name;
+    const fileSize = video?.file_size;
+    const fileId = video?.file_id;
 
     if (!fileName || !fileSize || !fileId) return false;
     if (fileName !== args.originalName) return false;
@@ -824,14 +845,14 @@ async function tryRecoverAfterHangUp(args: {
     return true;
   });
 
-  if (!matched?.channel_post) return null;
+  if (!matched?.channel_post?.video) return null;
 
-  const matchedDoc = matched.channel_post.document ?? matched.channel_post.video;
-  if (!matchedDoc?.file_id || !matchedDoc?.file_unique_id) return null;
+  const matchedVideo = matched.channel_post.video;
+  if (!matchedVideo?.file_id || !matchedVideo?.file_unique_id) return null;
 
   return {
     messageId: matched.channel_post.message_id,
-    telegramFileId: matchedDoc.file_id,
-    telegramFileUniqueId: matchedDoc.file_unique_id,
+    telegramFileId: matchedVideo.file_id,
+    telegramFileUniqueId: matchedVideo.file_unique_id,
   };
 }
