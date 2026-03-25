@@ -421,13 +421,28 @@ export class ChannelService {
     });
 
     const videos = [...dispatchTasks].reverse().map((t, idx) => {
-      const parts = (t.caption || '')
+      const caption = (t.caption || '').trim();
+      const titleMatch = caption.match(/(?:^|\n)\s*📺?\s*片名\s*[：:]\s*(.+)/);
+      const actorMatch = caption.match(/(?:^|\n)\s*(?:👥\s*)?主演\s*[：:]\s*(.+)/);
+
+      const parts = caption
         .split('\n')
         .map((l) => l.trim())
         .filter(Boolean);
+
       let shortTitle = '未命名视频';
-      if (parts.length >= 2) shortTitle = `${parts[0]} ${parts[1]}`;
-      else if (parts.length === 1) shortTitle = parts[0];
+      if (titleMatch?.[1]?.trim()) {
+        const rawTitle = titleMatch[1].trim();
+        const wrapped = rawTitle.match(/《[^》]+》/);
+        const displayTitle = wrapped ? wrapped[0] : `《${rawTitle.replace(/^《|》$/g, '').trim()}》`;
+        shortTitle = actorMatch?.[1]?.trim()
+          ? `📺片名：${displayTitle} 👥主演: ${actorMatch[1].trim()}`
+          : `📺片名：${displayTitle}`;
+      } else if (parts.length >= 2) {
+        shortTitle = `${parts[0]} ${parts[1]}`;
+      } else if (parts.length === 1) {
+        shortTitle = parts[0];
+      }
 
       const sourceMeta =
         t.mediaAsset?.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'

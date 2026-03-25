@@ -11,6 +11,11 @@ import { logger } from '../logger';
 const AUDIT_SAMPLE_LIMIT = 20;
 
 let queueStuckSinceAt: number | null = null;
+let lastAlertState = {
+  stale: false,
+  failedFinalSpike: false,
+  queueStuck: false,
+};
 
 export async function auditTypeAHealth() {
   const stale10Min = new Date(Date.now() - 10 * 60 * 1000);
@@ -129,8 +134,27 @@ export async function auditTypeAHealth() {
     },
   });
 
+  const alertChanged =
+    staleAlert !== lastAlertState.stale ||
+    failedFinalSpikeAlert !== lastAlertState.failedFinalSpike ||
+    queueStuckAlert !== lastAlertState.queueStuck;
+
   if (staleAlert || failedFinalSpikeAlert || queueStuckAlert) {
-    logger.warn('[typea_alert] threshold triggered', {
+    if (alertChanged) {
+      logger.warn('[typea_alert] threshold triggered', {
+        task_stale_total: ingestingStaleAssets.length,
+        task_dead_total: failedFinalAssets.length,
+        typea_queue_waiting: waitingCount,
+        typea_queue_active: activeCount,
+        queue_stuck_minutes: queueStuckMinutes,
+        alert_stale_triggered: staleAlert,
+        alert_failed_final_spike_triggered: failedFinalSpikeAlert,
+        alert_queue_stuck_triggered: queueStuckAlert,
+        topChannels,
+      });
+    }
+  } else if (alertChanged) {
+    logger.info('[typea_alert] recovered', {
       task_stale_total: ingestingStaleAssets.length,
       task_dead_total: failedFinalAssets.length,
       typea_queue_waiting: waitingCount,
@@ -142,4 +166,10 @@ export async function auditTypeAHealth() {
       topChannels,
     });
   }
+
+  lastAlertState = {
+    stale: staleAlert,
+    failedFinalSpike: failedFinalSpikeAlert,
+    queueStuck: queueStuckAlert,
+  };
 }

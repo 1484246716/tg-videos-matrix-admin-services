@@ -6,6 +6,31 @@ import { logger, logError } from '../logger';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
 import { sendVideoByTelegram, TelegramError } from '../shared/telegram';
 
+function isParseEntitiesError(error: { code?: string; message?: string } | null | undefined) {
+  const message = (error?.message ?? '').toLowerCase();
+  const code = error?.code ?? '';
+
+  return (
+    code === 'TG_400' &&
+    (message.includes("can't parse entities") ||
+      message.includes('unsupported start tag') ||
+      message.includes('unsupported end tag') ||
+      message.includes('entity not found') ||
+      (message.includes('tag') && message.includes('not closed')))
+  );
+}
+
+function isDeterministicDispatchError(error: { code?: string; message?: string } | null | undefined) {
+  const message = (error?.message ?? '').toLowerCase();
+
+  return (
+    isParseEntitiesError(error) ||
+    message.includes('媒体资源缺少 telegramfileid') ||
+    message.includes('分发任务或频道未配置机器人') ||
+    message.includes('未找到可用机器人')
+  );
+}
+
 function getFileStem(fileName: string) {
   const trimmed = fileName.trim();
   const stem = trimmed.replace(/\.[^./\\]+$/, '').trim();
@@ -245,14 +270,41 @@ export async function handleDispatchJob(
       }
     }
 
-    const sendResult = await sendVideoByTelegram({
-      botToken: bot.tokenEncrypted,
-      chatId: task.channel.tgChatId,
-      fileId: task.mediaAsset.telegramFileId,
-      caption: finalCaption,
-      parseMode: task.parseMode,
-      replyMarkup: task.replyMarkup ?? task.channel.aiReplyMarkup ?? undefined,
-    });
+    let sendResult;
+    try {
+      sendResult = await sendVideoByTelegram({
+        botToken: bot.tokenEncrypted,
+        chatId: task.channel.tgChatId,
+        fileId: task.mediaAsset.telegramFileId,
+        caption: finalCaption,
+        parseMode: task.parseMode,
+        replyMarkup: task.replyMarkup ?? task.channel.aiReplyMarkup ?? undefined,
+      });
+    } catch (sendError) {
+      const errorObj = sendError as TelegramError;
+      if (
+        task.parseMode?.toUpperCase() === 'HTML' &&
+        isParseEntitiesError({ code: errorObj.code, message: errorObj.message })
+      ) {
+        logger.warn('[q_dispatch] HTML 解析失败，回退纯文本重发', {
+          dispatchTaskId: dispatchTaskIdRaw,
+          channelId: task.channelId.toString(),
+          errorCode: errorObj.code,
+          errorMessage: errorObj.message,
+        });
+
+        sendResult = await sendVideoByTelegram({
+          botToken: bot.tokenEncrypted,
+          chatId: task.channel.tgChatId,
+          fileId: task.mediaAsset.telegramFileId,
+          caption: finalCaption,
+          parseMode: null,
+          replyMarkup: task.replyMarkup ?? task.channel.aiReplyMarkup ?? undefined,
+        });
+      } else {
+        throw sendError;
+      }
+    }
 
     await prisma.$transaction([
       prisma.dispatchTask.update({
@@ -304,15 +356,16 @@ export async function handleDispatchJob(
     const nextRunAt = new Date(Date.now() + finalBackoffSec * 1000);
 
     const exceeded = nextRetryCount > task.maxRetries;
+    const deterministic = isDeterministicDispatchError({ code, message });
 
-    const nextStatus = exceeded ? TaskStatus.dead : TaskStatus.failed;
+    const nextStatus = exceeded || deterministic ? TaskStatus.dead : TaskStatus.failed;
 
     await prisma.dispatchTask.update({
       where: { id: dispatchTaskId },
       data: {
         status: nextStatus,
         retryCount: nextRetryCount,
-        nextRunAt: exceeded ? task.nextRunAt : nextRunAt,
+        nextRunAt: nextStatus === TaskStatus.dead ? task.nextRunAt : nextRunAt,
         telegramErrorCode: code,
         telegramErrorMessage: message,
         finishedAt: now,
@@ -327,7 +380,8 @@ export async function handleDispatchJob(
           errorCode: code,
           errorMessage: message,
           retryCount: nextRetryCount,
-          nextRunAt: exceeded ? null : nextRunAt,
+          nextRunAt: nextStatus === TaskStatus.dead ? null : nextRunAt,
+          deterministic,
         },
       },
     });

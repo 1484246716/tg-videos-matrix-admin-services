@@ -11,7 +11,6 @@ import {
   createVideoThumbnail,
   ensureMp4Faststart,
   getVideoProbeMeta,
-  moveToArchive,
   waitForFileStable,
 } from '../shared/file-utils';
 import { sendViaGramjs } from '../shared/gramjs/upload';
@@ -61,6 +60,35 @@ async function writeProgress(params: {
     'EX',
     PROGRESS_TTL_SECONDS,
   );
+}
+
+async function removeUploadedSourceFile(filePath: string, context: {
+  traceId: string;
+  mediaAssetId: string;
+  relayChannelId: string;
+  uploadMethod: 'gramjs_sendVideo' | 'sendVideo' | 'recover_after_hang_up';
+}) {
+  try {
+    await unlink(filePath);
+    logger.info('[q_relay_upload] 上传成功后已删除源文件', {
+      traceId: context.traceId,
+      stage: 'delete_source_after_success',
+      mediaAssetId: context.mediaAssetId,
+      relayChannelId: context.relayChannelId,
+      uploadMethod: context.uploadMethod,
+      filePath,
+    });
+  } catch (error) {
+    logger.warn('[q_relay_upload] 上传成功后删除源文件失败（不阻断成功状态）', {
+      traceId: context.traceId,
+      stage: 'delete_source_after_success_failed',
+      mediaAssetId: context.mediaAssetId,
+      relayChannelId: context.relayChannelId,
+      uploadMethod: context.uploadMethod,
+      filePath,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 export const relayUploadWorker = new Worker(
@@ -366,23 +394,6 @@ export const relayUploadWorker = new Worker(
         throw new Error('GramJS 上传成功但 forwardMessage 未返回 video_file_id');
       }
 
-      const archiveStart = Date.now();
-      let archivePath: string | null = null;
-      try {
-        archivePath = await moveToArchive(mediaAsset.localPath);
-      } catch (moveErr) {
-        logError('[q_relay_upload] 归档文件失败', moveErr);
-      }
-      const archiveDurationMs = Date.now() - archiveStart;
-      if (archiveDurationMs > 500) {
-        logger.info('[q_relay_upload] 归档耗时', {
-          traceId,
-          stage: 'archive',
-          mediaAssetId: mediaAssetIdRaw,
-          durationMs: archiveDurationMs,
-        });
-      }
-
       const ingestFinishedAt = new Date();
       await prisma.mediaAsset.update({
         where: { id: mediaAssetId },
@@ -395,6 +406,7 @@ export const relayUploadWorker = new Worker(
           durationSec: normalizedDurationSec,
           ingestFinishedAt,
           ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
+          archivePath: null,
           sourceMeta: {
             ...(mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
               ? (mediaAsset.sourceMeta as Record<string, unknown>)
@@ -405,8 +417,14 @@ export const relayUploadWorker = new Worker(
             ingestWorkerJobId: null,
             ingestStage: 'done',
           },
-          ...(archivePath ? { archivePath, localPath: archivePath } : {}),
         } as any,
+      });
+
+      await removeUploadedSourceFile(mediaAsset.localPath, {
+        traceId,
+        mediaAssetId: mediaAssetIdRaw,
+        relayChannelId: relayChannelIdRaw,
+        uploadMethod: 'gramjs_sendVideo',
       });
 
       await writeProgress({
@@ -571,6 +589,7 @@ export const relayUploadWorker = new Worker(
               durationSec: normalizedDurationSec,
               ingestFinishedAt,
               ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
+              archivePath: null,
               sourceMeta: {
                 ...(mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
                   ? (mediaAsset.sourceMeta as Record<string, unknown>)
@@ -582,6 +601,13 @@ export const relayUploadWorker = new Worker(
                 ingestStage: 'done',
               },
             } as any,
+          });
+
+          await removeUploadedSourceFile(mediaAsset.localPath, {
+            traceId,
+            mediaAssetId: mediaAssetIdRaw,
+            relayChannelId: relayChannelIdRaw,
+            uploadMethod: 'recover_after_hang_up',
           });
 
           logger.info('[q_relay_upload] 终极兜底补偿成功', {
@@ -631,23 +657,6 @@ export const relayUploadWorker = new Worker(
       durationMs: Date.now() - uploadStart,
     });
 
-    const archiveStart = Date.now();
-    let archivePath: string | null = null;
-    try {
-      archivePath = await moveToArchive(mediaAsset.localPath);
-    } catch (moveErr) {
-      logError('[q_relay_upload] 归档文件失败', moveErr);
-    }
-    const archiveDurationMs = Date.now() - archiveStart;
-    if (archiveDurationMs > 500) {
-      logger.info('[q_relay_upload] 归档耗时', {
-        traceId,
-        stage: 'archive',
-        mediaAssetId: mediaAssetIdRaw,
-        durationMs: archiveDurationMs,
-      });
-    }
-
     const directFileId = sendResult.videoFileId;
     const directFileUniqueId = sendResult.videoFileUniqueId ?? null;
 
@@ -664,6 +673,7 @@ export const relayUploadWorker = new Worker(
           durationSec: normalizedDurationSec,
           ingestFinishedAt,
           ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
+          archivePath: null,
           sourceMeta: {
             ...(mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
               ? (mediaAsset.sourceMeta as Record<string, unknown>)
@@ -674,8 +684,14 @@ export const relayUploadWorker = new Worker(
             ingestWorkerJobId: null,
             ingestStage: 'done',
           },
-          ...(archivePath ? { archivePath, localPath: archivePath } : {}),
         } as any,
+      });
+
+      await removeUploadedSourceFile(mediaAsset.localPath, {
+        traceId,
+        mediaAssetId: mediaAssetIdRaw,
+        relayChannelId: relayChannelIdRaw,
+        uploadMethod: 'sendVideo',
       });
 
       await writeProgress({
@@ -702,7 +718,6 @@ export const relayUploadWorker = new Worker(
           ingestError: '中转上传成功但未返回 video_file_id（疑似被识别为 document）',
           ingestFinishedAt,
           ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
-          ...(archivePath ? { archivePath, localPath: archivePath } : {}),
         } as any,
       });
 

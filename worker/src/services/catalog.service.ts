@@ -22,6 +22,45 @@ function isAiFailureText(text?: string | null) {
   return /无法识别|抱歉|如果可以提供更多|视频的内容简介|主要角色|生成相关文案/.test(normalized);
 }
 
+function extractFieldValue(caption: string, fieldPattern: RegExp) {
+  const match = caption.match(fieldPattern);
+  if (!match) return '';
+  return (match[1] || '').trim();
+}
+
+function normalizeDisplayTitle(rawTitle: string, fallbackTitle: string) {
+  const title = rawTitle.trim();
+  if (!title || title === '未知' || title === '待考') return fallbackTitle;
+
+  const wrappedMatch = title.match(/《[^》]+》/);
+  if (wrappedMatch) return wrappedMatch[0];
+
+  return `《${title.replace(/^《|》$/g, '').trim()}》`;
+}
+
+function buildCatalogShortTitle(caption: string, fallbackTitle: string) {
+  const parsedTitle = extractFieldValue(caption, /(?:^|\n)\s*📺?\s*片名\s*[：:]\s*(.+)/);
+  const parsedActor = extractFieldValue(caption, /(?:^|\n)\s*(?:👥\s*)?主演\s*[：:]\s*(.+)/);
+
+  if (parsedTitle) {
+    const displayTitle = normalizeDisplayTitle(parsedTitle, fallbackTitle);
+    if (parsedActor) {
+      return `📺片名：${displayTitle} 👥主演: ${parsedActor}`;
+    }
+    return `📺片名：${displayTitle}`;
+  }
+
+  const parts = caption
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  if (parts.length >= 2) return `${parts[0]} ${parts[1]}`;
+  if (parts.length === 1) return parts[0];
+
+  return fallbackTitle;
+}
+
 export async function handleCatalogJob(channelIdRaw: string) {
   let catalogTaskId: bigint | null = null;
   const channelId = BigInt(channelIdRaw);
@@ -157,13 +196,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
     const fallbackTitle = getFileStem(t.mediaAsset?.originalName || '未命名视频');
     const safeCaption = isAiFailureText(t.caption) ? fallbackTitle : (t.caption || '').trim();
 
-    const parts = safeCaption.split('\n').map((l) => l.trim()).filter(Boolean);
-    let shortTitle = fallbackTitle;
-    if (parts.length >= 2) {
-      shortTitle = `${parts[0]} ${parts[1]}`;
-    } else if (parts.length === 1) {
-      shortTitle = parts[0];
-    }
+    let shortTitle = buildCatalogShortTitle(safeCaption, fallbackTitle);
 
     if (isAiFailureText(shortTitle)) {
       shortTitle = fallbackTitle;

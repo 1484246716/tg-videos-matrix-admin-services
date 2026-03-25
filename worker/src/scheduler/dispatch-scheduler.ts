@@ -9,6 +9,9 @@ import { logger } from '../logger';
 import { releaseChannelLock, tryAcquireChannelLock } from '../shared/channel-lock';
 import { updateTaskDefinitionRunStatus } from '../services/task-definition.service';
 
+const DISPATCH_HEAD_BYPASS_RETRY_THRESHOLD = 2;
+const DISPATCH_HEAD_BYPASS_DELAY_SEC = 10 * 60;
+
 function computeDispatchNextAllowedAt(args: {
   lastPostAt: Date | null;
   postIntervalSec: number;
@@ -34,6 +37,7 @@ export async function scheduleDueDispatchTasks() {
       channelId: true,
       mediaAssetId: true,
       retryCount: true,
+      maxRetries: true,
       channel: {
         select: {
           postIntervalSec: true,
@@ -50,6 +54,32 @@ export async function scheduleDueDispatchTasks() {
     const channelIdStr = task.channelId.toString();
 
     if (queuedChannelIds.has(channelIdStr)) {
+      continue;
+    }
+
+    const shouldBypassHead =
+      task.status === TaskStatus.failed &&
+      task.retryCount >= DISPATCH_HEAD_BYPASS_RETRY_THRESHOLD &&
+      task.retryCount < task.maxRetries;
+
+    if (shouldBypassHead) {
+      const bypassNextRunAt = new Date(Date.now() + DISPATCH_HEAD_BYPASS_DELAY_SEC * 1000);
+      await prisma.dispatchTask.update({
+        where: { id: task.id },
+        data: {
+          status: TaskStatus.failed,
+          nextRunAt: bypassNextRunAt,
+        },
+      });
+
+      logger.warn('[scheduler] 分发头阻塞旁路，临时延后高重试任务', {
+        taskId: task.id.toString(),
+        channelId: channelIdStr,
+        retryCount: task.retryCount,
+        maxRetries: task.maxRetries,
+        bypassNextRunAt: bypassNextRunAt.toISOString(),
+      });
+
       continue;
     }
 
@@ -95,34 +125,34 @@ export async function scheduleDueDispatchTasks() {
     }
 
     try {
-    const updated = await prisma.dispatchTask.updateMany({
-      where: {
-        id: task.id,
-        status: {
-          in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed],
+      const updated = await prisma.dispatchTask.updateMany({
+        where: {
+          id: task.id,
+          status: {
+            in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed],
+          },
         },
-      },
-      data: {
-        status: TaskStatus.scheduled,
-      },
-    });
+        data: {
+          status: TaskStatus.scheduled,
+        },
+      });
 
-    if (updated.count === 0) continue;
+      if (updated.count === 0) continue;
 
-    await dispatchQueue.add(
-      'dispatch-send',
-      {
-        dispatchTaskId: task.id.toString(),
-        channelId: task.channelId.toString(),
-        mediaAssetId: task.mediaAssetId.toString(),
-        retryCount: task.retryCount,
-      },
-      {
-        jobId: `dispatch-${task.id.toString()}`,
-        removeOnComplete: true,
-        removeOnFail: 200,
-      },
-    );
+      await dispatchQueue.add(
+        'dispatch-send',
+        {
+          dispatchTaskId: task.id.toString(),
+          channelId: task.channelId.toString(),
+          mediaAssetId: task.mediaAssetId.toString(),
+          retryCount: task.retryCount,
+        },
+        {
+          jobId: `dispatch-${task.id.toString()}`,
+          removeOnComplete: true,
+          removeOnFail: 200,
+        },
+      );
 
       queuedChannelIds.add(channelIdStr);
       queuedCount += 1;
