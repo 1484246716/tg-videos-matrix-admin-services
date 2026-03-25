@@ -54,6 +54,16 @@ export class UpdateChannelDto {
   navIntervalSec?: number;
 
   @IsOptional()
+  @IsBoolean()
+  navPagingEnabled?: boolean;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  navPageSize?: number;
+
+  @IsOptional()
   @IsInt()
   @Min(1)
   @Max(1000)

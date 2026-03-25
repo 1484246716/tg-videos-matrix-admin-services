@@ -31,6 +31,16 @@ export class CreateChannelDto {
   navIntervalSec?: number;
 
   @IsOptional()
+  @IsBoolean()
+  navPagingEnabled?: boolean;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  navPageSize?: number;
+
+  @IsOptional()
   @IsString()
   aiSystemPromptTemplate?: string;
 

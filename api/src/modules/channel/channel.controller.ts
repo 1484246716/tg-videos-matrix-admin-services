@@ -62,6 +62,8 @@ export class ChannelController {
       data: {
         postIntervalSec?: number;
         navIntervalSec?: number;
+        navPagingEnabled?: boolean;
+        navPageSize?: number;
         navEnabled?: boolean;
         defaultBotId?: string | null;
         aiSystemPromptTemplate?: string;

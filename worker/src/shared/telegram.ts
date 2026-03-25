@@ -346,6 +346,7 @@ export async function editMessageTextByTelegram(args: {
   messageId: number;
   text: string;
   parseMode?: string;
+  replyMarkup?: unknown;
 }) {
   const result = await sendTelegramRequest({
     botToken: args.botToken,
@@ -356,6 +357,7 @@ export async function editMessageTextByTelegram(args: {
       text: args.text,
       parse_mode: args.parseMode ?? 'HTML',
       disable_web_page_preview: true,
+      ...(args.replyMarkup ? { reply_markup: args.replyMarkup } : {}),
     },
   });
 

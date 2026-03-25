@@ -249,23 +249,27 @@ export class ChannelService {
 
       await this.ensureFolderCreated(dto.folderPath);
 
+      const createData: any = {
+        name: dto.name,
+        tgChatId: dto.tgChatId,
+        tgUsername: dto.tgUsername,
+        folderPath: dto.folderPath,
+        postIntervalSec: dto.postIntervalSec ?? 120,
+        defaultBotId: dto.defaultBotId ? BigInt(dto.defaultBotId) : undefined,
+        navEnabled: dto.navEnabled ?? false,
+        navPagingEnabled: dto.navPagingEnabled ?? true,
+        navIntervalSec: dto.navIntervalSec ?? 604800,
+        navPageSize: dto.navPageSize ?? 10,
+        aiSystemPromptTemplate: dto.aiSystemPromptTemplate,
+        navTemplateText: dto.navTemplateText,
+        aiReplyMarkup: dto.aiReplyMarkup as Prisma.InputJsonValue,
+        navReplyMarkup: dto.navReplyMarkup as Prisma.InputJsonValue,
+        tags: dto.tags ?? [],
+        createdBy: role === 'admin' ? null : userId ? BigInt(userId) : null,
+      };
+
       const created = await this.prisma.channel.create({
-        data: {
-          name: dto.name,
-          tgChatId: dto.tgChatId,
-          tgUsername: dto.tgUsername,
-          folderPath: dto.folderPath,
-          postIntervalSec: dto.postIntervalSec ?? 120,
-          defaultBotId: dto.defaultBotId ? BigInt(dto.defaultBotId) : undefined,
-          navEnabled: dto.navEnabled ?? false,
-          navIntervalSec: dto.navIntervalSec ?? 604800,
-          aiSystemPromptTemplate: dto.aiSystemPromptTemplate,
-          navTemplateText: dto.navTemplateText,
-          aiReplyMarkup: dto.aiReplyMarkup as Prisma.InputJsonValue,
-          navReplyMarkup: dto.navReplyMarkup as Prisma.InputJsonValue,
-          tags: dto.tags ?? [],
-          createdBy: role === 'admin' ? null : userId ? BigInt(userId) : null,
-        },
+        data: createData,
       });
 
       return this.serializeBigInt(created);
@@ -328,6 +332,8 @@ export class ChannelService {
     data: {
       postIntervalSec?: number;
       navIntervalSec?: number;
+      navPagingEnabled?: boolean;
+      navPageSize?: number;
       navEnabled?: boolean;
       defaultBotId?: string | null;
       aiSystemPromptTemplate?: string;
@@ -362,9 +368,11 @@ export class ChannelService {
 
     await this.prisma.channel.updateMany({
       where: { id: { in: validIds.map((id) => BigInt(id)) } },
-      data: {
+      data: ({
         postIntervalSec: data.postIntervalSec,
         navIntervalSec: data.navIntervalSec,
+        navPagingEnabled: data.navPagingEnabled,
+        navPageSize: data.navPageSize,
         navEnabled: data.navEnabled,
         defaultBotId:
           data.defaultBotId === null
@@ -377,7 +385,7 @@ export class ChannelService {
         aiReplyMarkup: data.aiReplyMarkup,
         navReplyMarkup: data.navReplyMarkup,
         tags: data.tags,
-      },
+      } as any),
     });
 
     return { updated: validIds.length };
@@ -578,6 +586,8 @@ export class ChannelService {
       postJitterMinSec: dto.postJitterMinSec,
       postJitterMaxSec: dto.postJitterMaxSec,
       navIntervalSec: dto.navIntervalSec,
+      navPagingEnabled: dto.navPagingEnabled,
+      ...(dto.navPageSize !== undefined ? ({ navPageSize: dto.navPageSize } as any) : {}),
       navRecentLimit: dto.navRecentLimit,
       adEnabled: dto.adEnabled,
       adPinEnabled: dto.adPinEnabled,

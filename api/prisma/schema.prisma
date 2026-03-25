@@ -221,7 +221,10 @@ model Channel {
 
   navIntervalSec Int     @default(604800) @map("nav_interval_sec")
   navRecentLimit Int     @default(60) @map("nav_recent_limit")
+  navPageSize    Int     @default(10) @map("nav_page_size")
   navEnabled     Boolean @default(false) @map("nav_enabled")
+  navPagingEnabled Boolean @default(true) @map("nav_paging_enabled")
+  navPageMessageIds Json? @map("nav_page_message_ids")
 
   adEnabled    Boolean @default(false) @map("ad_enabled")
   adPinEnabled Boolean @default(false) @map("ad_pin_enabled")

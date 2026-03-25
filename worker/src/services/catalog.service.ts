@@ -5,6 +5,7 @@ import { logError } from '../logger';
 import {
   editMessageTextByTelegram,
   pinMessageByTelegram,
+  sendTelegramRequest,
   sendTextByTelegram,
 } from '../shared/telegram';
 
@@ -59,6 +60,154 @@ function buildCatalogShortTitle(caption: string, fallbackTitle: string) {
   if (parts.length === 1) return parts[0];
 
   return fallbackTitle;
+}
+
+function chunkVideos<T>(items: T[], pageSize: number) {
+  if (!items.length) return [] as T[][];
+
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += pageSize) {
+    chunks.push(items.slice(i, i + pageSize));
+  }
+  return chunks;
+}
+
+type CatalogVideo = {
+  message_url: string;
+  short_title: string;
+};
+
+function renderCatalogPageContent(args: {
+  navTemplateText: string;
+  channelName: string;
+  videos: CatalogVideo[];
+  pageNo: number;
+  totalPages: number;
+}) {
+  let content = args.navTemplateText;
+  content = content.replace(/{{channel_name}}/g, args.channelName);
+
+  const eachRegex = /{{#each\s+videos}}([\s\S]*?){{\/each}}/g;
+  content = content.replace(eachRegex, (_match, body) => {
+    return args.videos
+      .map((v) => {
+        let text = body.replace(/{{this\.message_url}}/g, v.message_url);
+        text = text.replace(/{{this\.short_title}}/g, v.short_title);
+        return text;
+      })
+      .join('');
+  });
+
+  const beijingTimeStr = new Date(Date.now() + 8 * 3600 * 1000)
+    .toISOString()
+    .replace('T', ' ')
+    .slice(0, 19);
+  content = content.replace(/{{update_time}}/g, beijingTimeStr);
+
+  if (args.totalPages > 1) {
+    content = `${content}\n\n—— 第${args.pageNo}/${args.totalPages}页 ——`;
+  }
+
+  return content;
+}
+
+async function publishCatalogMessage(args: {
+  botToken: string;
+  chatId: string;
+  text: string;
+  existingMessageId?: number | null;
+  replyMarkup?: unknown;
+  clearReplyMarkup?: boolean;
+}) {
+  const existing = args.existingMessageId ?? null;
+
+  if (!existing) {
+    const sendResult = await sendTextByTelegram({
+      botToken: args.botToken,
+      chatId: args.chatId,
+      text: args.text,
+      replyMarkup: args.replyMarkup,
+    });
+    return { messageId: sendResult.messageId, isNewMessage: true };
+  }
+
+  try {
+    await editMessageTextByTelegram({
+      botToken: args.botToken,
+      chatId: args.chatId,
+      messageId: existing,
+      text: args.text,
+      replyMarkup: args.clearReplyMarkup ? { inline_keyboard: [] } : args.replyMarkup,
+    });
+    return { messageId: existing, isNewMessage: false };
+  } catch (err) {
+    const errObj = err as { message?: string };
+    if (errObj.message?.includes('message is not modified')) {
+      return { messageId: existing, isNewMessage: false };
+    }
+    if (errObj.message?.includes('message to edit not found')) {
+      const sendResult = await sendTextByTelegram({
+        botToken: args.botToken,
+        chatId: args.chatId,
+        text: args.text,
+        replyMarkup: args.replyMarkup,
+      });
+      return { messageId: sendResult.messageId, isNewMessage: true };
+    }
+    throw err;
+  }
+}
+
+function parseStoredPageMessageIds(raw: unknown) {
+  if (!Array.isArray(raw)) return [] as number[];
+  return raw.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item > 0);
+}
+
+function toTelegramMessageLink(chatIdRaw: string, messageId: number): string | null {
+  if (chatIdRaw.startsWith('-100')) {
+    const internalId = chatIdRaw.slice(4);
+    return `https://t.me/c/${internalId}/${messageId}`;
+  }
+
+  if (chatIdRaw.startsWith('@')) {
+    return `https://t.me/${chatIdRaw.slice(1)}/${messageId}`;
+  }
+
+  return null;
+}
+
+function buildCatalogIndexContent(channelName: string, totalPages: number) {
+  return [
+    `📚 ${channelName} 目录导航`,
+    `共 ${totalPages} 页，点击下方按钮跳转。`,
+    `更新时间：${new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19)}`,
+  ].join('\n');
+}
+
+function buildCatalogPageButtons(args: { chatId: string; pageMessageIds: number[] }) {
+  const buttons = args.pageMessageIds
+    .map((messageId, index) => {
+      const url = toTelegramMessageLink(args.chatId, messageId);
+      if (!url) return null;
+      return { text: `第${index + 1}页`, url };
+    })
+    .filter((button): button is { text: string; url: string } => Boolean(button));
+
+  if (buttons.length === 0) return null;
+
+  const inlineKeyboard: Array<Array<{ text: string; url: string }>> = [];
+  for (let i = 0; i < buttons.length; i += 5) {
+    inlineKeyboard.push(buttons.slice(i, i + 5));
+  }
+
+  if (buttons.length > 1) {
+    inlineKeyboard.push([
+      { text: '⬅️ 上一页', url: buttons[0].url },
+      { text: '下一页 ➡️', url: buttons[1].url },
+    ]);
+  }
+
+  return { inline_keyboard: inlineKeyboard };
 }
 
 export async function handleCatalogJob(channelIdRaw: string) {
@@ -208,94 +357,118 @@ export async function handleCatalogJob(channelIdRaw: string) {
     };
   });
 
-  let content = channel.navTemplateText;
-  content = content.replace(/{{channel_name}}/g, channel.name);
-  const eachRegex = /{{#each\s+videos}}([\s\S]*?){{\/each}}/g;
-  content = content.replace(eachRegex, (_match, body) => {
-    return videos
-      .map((v) => {
-        let text = body.replace(/{{this\.message_url}}/g, v.message_url);
-        text = text.replace(/{{this\.short_title}}/g, v.short_title);
-        return text;
-      })
-      .join('');
-  });
-
-  const beijingTimeStr = new Date(Date.now() + 8 * 3600 * 1000)
-    .toISOString()
-    .replace('T', ' ')
-    .slice(0, 19);
-  content = content.replace(/{{update_time}}/g, beijingTimeStr);
+  const navPageSize = Math.max(1, Math.min(100, (channel as any).navPageSize ?? 10));
+  const navPagingEnabled = typeof (channel as any).navPagingEnabled === 'boolean'
+    ? (channel as any).navPagingEnabled
+    : false;
+  const videoPages = navPagingEnabled ? chunkVideos(videos, navPageSize) : [videos];
+  const pageContents = videoPages.map((pageVideos, index) =>
+    renderCatalogPageContent({
+      navTemplateText: channel.navTemplateText!,
+      channelName: channel.name,
+      videos: pageVideos,
+      pageNo: index + 1,
+      totalPages: videoPages.length,
+    }),
+  );
 
   const botToken = bot.tokenEncrypted;
   let finalMessageId: number | null = null;
+  const content = pageContents.join('\n\n');
   const contentPreview = content.slice(0, 4000);
   let pinAttempted = false;
   let pinSuccess: boolean | null = null;
   let pinErrorMessage: string | null = null;
 
   try {
-    if (channel.navMessageId) {
-      const oldMessageId = Number(channel.navMessageId);
-      try {
-        await editMessageTextByTelegram({
-          botToken,
-          chatId: channel.tgChatId,
-          messageId: oldMessageId,
-          text: content,
-        });
-        finalMessageId = oldMessageId;
-      } catch (err) {
-        const errObj = err as { message?: string };
-        if (
-          errObj.message &&
-          (errObj.message.includes('message to edit not found') ||
-            errObj.message.includes('message is not modified'))
-        ) {
-          if (errObj.message.includes('not modified')) {
-            finalMessageId = oldMessageId;
-          } else {
-            const sendResult = await sendTextByTelegram({
-              botToken,
-              chatId: channel.tgChatId,
-              text: content,
-            });
-            finalMessageId = sendResult.messageId;
-            pinAttempted = true;
-            try {
-              await pinMessageByTelegram({
-                botToken,
-                chatId: channel.tgChatId,
-                messageId: finalMessageId,
-              });
-              pinSuccess = true;
-            } catch (pinErr) {
-              pinSuccess = false;
-              pinErrorMessage = pinErr instanceof Error ? pinErr.message : '置顶失败';
-            }
-          }
-        } else {
-          throw err;
+    const channelAny = channel as any;
+    const storedPageMessageIds = parseStoredPageMessageIds(channelAny.navPageMessageIds);
+    const publishedPageMessageIds: number[] = [];
+
+    if (pageContents.length <= 1) {
+      const publishResult = await publishCatalogMessage({
+        botToken,
+        chatId: channel.tgChatId,
+        text: pageContents[0],
+        existingMessageId: channel.navMessageId ? Number(channel.navMessageId) : null,
+        clearReplyMarkup: true,
+      });
+
+      finalMessageId = publishResult.messageId;
+
+      if (publishResult.isNewMessage) {
+        pinAttempted = true;
+        try {
+          await pinMessageByTelegram({
+            botToken,
+            chatId: channel.tgChatId,
+            messageId: finalMessageId,
+          });
+          pinSuccess = true;
+        } catch (pinErr) {
+          pinSuccess = false;
+          pinErrorMessage = pinErr instanceof Error ? pinErr.message : '置顶失败';
         }
       }
     } else {
-      const sendResult = await sendTextByTelegram({
-        botToken,
-        chatId: channel.tgChatId,
-        text: content,
-      });
-      finalMessageId = sendResult.messageId;
-      pinAttempted = true;
-      try {
-        await pinMessageByTelegram({
+      for (let pageIndex = 0; pageIndex < pageContents.length; pageIndex += 1) {
+        const publishResult = await publishCatalogMessage({
           botToken,
           chatId: channel.tgChatId,
-          messageId: finalMessageId,
+          text: pageContents[pageIndex],
+          existingMessageId: storedPageMessageIds[pageIndex] ?? null,
         });
-        pinSuccess = true;
-      } catch (pinErr) {
-        pinSuccess = false;
-        pinErrorMessage = pinErr instanceof Error ? pinErr.message : '置顶失败';
+        publishedPageMessageIds.push(publishResult.messageId);
+      }
+
+      const indexReplyMarkup = buildCatalogPageButtons({
+        chatId: channel.tgChatId,
+        pageMessageIds: publishedPageMessageIds,
+      });
+
+      const indexPublishResult = await publishCatalogMessage({
+        botToken,
+        chatId: channel.tgChatId,
+        text: buildCatalogIndexContent(channel.name, pageContents.length),
+        existingMessageId: channel.navMessageId ? Number(channel.navMessageId) : null,
+        replyMarkup: indexReplyMarkup,
+      });
+
+      finalMessageId = indexPublishResult.messageId;
+
+      if (indexPublishResult.isNewMessage) {
+        pinAttempted = true;
+        try {
+          await pinMessageByTelegram({
+            botToken,
+            chatId: channel.tgChatId,
+            messageId: finalMessageId,
+          });
+          pinSuccess = true;
+        } catch (pinErr) {
+          pinSuccess = false;
+          pinErrorMessage = pinErr instanceof Error ? pinErr.message : '置顶失败';
+        }
+      }
+    }
+
+    const stalePageMessageIds = storedPageMessageIds.slice(publishedPageMessageIds.length);
+    for (const staleMessageId of stalePageMessageIds) {
+      try {
+        await sendTelegramRequest({
+          botToken,
+          method: 'deleteMessage',
+          payload: {
+            chat_id: channel.tgChatId,
+            message_id: staleMessageId,
+          },
+        });
+      } catch (deleteError) {
+        logError('[q_catalog] 删除旧目录分页消息失败', {
+          channelId: channelIdRaw,
+          staleMessageId,
+          error: deleteError,
+        });
       }
     }
 
@@ -304,7 +477,8 @@ export async function handleCatalogJob(channelIdRaw: string) {
       data: {
         navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
         lastNavUpdateAt: new Date(),
-      },
+        ...({ navPageMessageIds: publishedPageMessageIds } as any),
+      } as any,
     });
 
     await prisma.catalogHistory.create({
@@ -337,6 +511,8 @@ export async function handleCatalogJob(channelIdRaw: string) {
       ok: true,
       channelId: channelIdRaw,
       messageId: finalMessageId,
+      pageCount: pageContents.length,
+      navPageSize,
     };
   } catch (error) {
     if (catalogTaskId) {
