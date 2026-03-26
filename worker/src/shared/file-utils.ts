@@ -344,10 +344,48 @@ export async function scanChannelVideos(folderPath: string) {
     return [];
   }
 
-  const files = entries
+  const rootFiles = entries
     .filter((entry) => entry.isFile())
     .map((entry) => resolve(absolute, entry.name))
     .filter((filePath) => SUPPORTED_VIDEO_EXT.has(extname(filePath).toLowerCase()));
 
-  return files;
+  const collectionDir = entries.find(
+    (entry) => entry.isDirectory() && entry.name.toLowerCase() === 'collection',
+  );
+
+  const collectionFiles: string[] = [];
+  if (collectionDir) {
+    const collectionRoot = resolve(absolute, collectionDir.name);
+    let collectionEntries: Array<import('node:fs').Dirent> = [];
+    try {
+      collectionEntries = await readdir(collectionRoot, { withFileTypes: true, encoding: 'utf8' });
+    } catch (error) {
+      logger.warn('[scan] Collection 目录不可访问，跳过合集扫描', {
+        folderPath,
+        collectionRoot,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    for (const dirent of collectionEntries) {
+      if (!dirent.isDirectory()) continue;
+      const albumDir = resolve(collectionRoot, dirent.name);
+      try {
+        const episodeEntries = await readdir(albumDir, { withFileTypes: true, encoding: 'utf8' });
+        const files = episodeEntries
+          .filter((item) => item.isFile())
+          .map((item) => resolve(albumDir, item.name))
+          .filter((filePath) => SUPPORTED_VIDEO_EXT.has(extname(filePath).toLowerCase()));
+        collectionFiles.push(...files);
+      } catch (error) {
+        logger.warn('[scan] 合集子目录不可访问，已跳过', {
+          folderPath,
+          albumDir,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  return [...rootFiles, ...collectionFiles];
 }

@@ -75,6 +75,16 @@ export const PERMISSION_MODULES: PermissionModule[] = [
     ],
   },
   {
+    key: "collections",
+    name: "合集管理",
+    actions: [
+      { key: "view", name: "查看" },
+      { key: "create", name: "新增" },
+      { key: "update", name: "编辑" },
+      { key: "delete", name: "删除" },
+    ],
+  },
+  {
     key: "relay-channels",
     name: "中转私密频道管理",
     actions: [

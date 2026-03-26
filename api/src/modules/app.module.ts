@@ -16,6 +16,7 @@ import { UserModule } from './user/user.module';
 import { MessageTemplateModule } from './message-template/message-template.module';
 import { MassMessageCampaignModule } from './mass-message-campaign/mass-message-campaign.module';
 import { MassMessageItemModule } from './mass-message-item/mass-message-item.module';
+import { CollectionModule } from './collection/collection.module';
 
 @Module({
   imports: [
@@ -39,6 +40,7 @@ import { MassMessageItemModule } from './mass-message-item/mass-message-item.mod
     MessageTemplateModule,
     MassMessageCampaignModule,
     MassMessageItemModule,
+    CollectionModule,
   ],
 })
 export class AppModule { }

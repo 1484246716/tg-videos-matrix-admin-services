@@ -163,6 +163,88 @@ function parseStoredPageMessageIds(raw: unknown) {
   return raw.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item > 0);
 }
 
+type CollectionNavState = {
+  indexMessageId: number | null;
+  detailMessageIds: Record<string, number>;
+};
+
+function parseCollectionNavState(rawNavReplyMarkup: unknown): CollectionNavState {
+  if (!rawNavReplyMarkup || typeof rawNavReplyMarkup !== 'object' || Array.isArray(rawNavReplyMarkup)) {
+    return { indexMessageId: null, detailMessageIds: {} };
+  }
+
+  const container = rawNavReplyMarkup as Record<string, unknown>;
+  const state =
+    container.__collectionNavState && typeof container.__collectionNavState === 'object'
+      ? (container.__collectionNavState as Record<string, unknown>)
+      : null;
+
+  if (!state) return { indexMessageId: null, detailMessageIds: {} };
+
+  const indexMessageIdRaw = state.indexMessageId;
+  const indexMessageId =
+    typeof indexMessageIdRaw === 'number' && Number.isInteger(indexMessageIdRaw) && indexMessageIdRaw > 0
+      ? indexMessageIdRaw
+      : null;
+
+  const detailRaw = state.detailMessageIds;
+  const detailMessageIds: Record<string, number> = {};
+  if (detailRaw && typeof detailRaw === 'object' && !Array.isArray(detailRaw)) {
+    for (const [key, val] of Object.entries(detailRaw as Record<string, unknown>)) {
+      const n = Number(val);
+      if (Number.isInteger(n) && n > 0) {
+        detailMessageIds[key] = n;
+      }
+    }
+  }
+
+  return { indexMessageId, detailMessageIds };
+}
+
+function sanitizeJsonForPrisma(value: unknown): unknown {
+  if (value === null) return null;
+  if (value === undefined) return undefined;
+
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => sanitizeJsonForPrisma(item))
+      .filter((item) => item !== undefined);
+  }
+
+  if (typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      const sanitized = sanitizeJsonForPrisma(item);
+      if (sanitized !== undefined) {
+        result[key] = sanitized;
+      }
+    }
+    return result;
+  }
+
+  return value;
+}
+
+function mergeCollectionNavStateIntoReplyMarkup(rawNavReplyMarkup: unknown, state: CollectionNavState | null) {
+  const base =
+    rawNavReplyMarkup && typeof rawNavReplyMarkup === 'object' && !Array.isArray(rawNavReplyMarkup)
+      ? { ...(rawNavReplyMarkup as Record<string, unknown>) }
+      : {};
+
+  if (!state) {
+    delete (base as Record<string, unknown>).__collectionNavState;
+    return sanitizeJsonForPrisma(base) as Record<string, unknown>;
+  }
+
+  (base as Record<string, unknown>).__collectionNavState = {
+    indexMessageId: state.indexMessageId ?? null,
+    detailMessageIds: state.detailMessageIds,
+    updatedAt: new Date().toISOString(),
+  };
+
+  return sanitizeJsonForPrisma(base) as Record<string, unknown>;
+}
+
 function toTelegramMessageLink(chatIdRaw: string, messageId: number): string | null {
   if (chatIdRaw.startsWith('-100')) {
     const internalId = chatIdRaw.slice(4);
@@ -208,6 +290,27 @@ function buildCatalogPageButtons(args: { chatId: string; pageMessageIds: number[
   }
 
   return { inline_keyboard: inlineKeyboard };
+}
+
+function parseCollectionMeta(sourceMeta: unknown) {
+  if (!sourceMeta || typeof sourceMeta !== 'object') return null;
+  const meta = sourceMeta as Record<string, unknown>;
+  if (meta.isCollection !== true) return null;
+
+  const collectionName = typeof meta.collectionName === 'string' ? meta.collectionName : '';
+  const episodeNo =
+    typeof meta.episodeNo === 'number'
+      ? meta.episodeNo
+      : typeof meta.episodeNo === 'string' && /^\d+$/.test(meta.episodeNo)
+        ? Number(meta.episodeNo)
+        : null;
+
+  if (!collectionName || episodeNo === null) return null;
+
+  return {
+    collectionName,
+    episodeNo,
+  };
 }
 
 export async function handleCatalogJob(channelIdRaw: string) {
@@ -335,7 +438,9 @@ export async function handleCatalogJob(channelIdRaw: string) {
     return { ok: true, skipped: true, reason: '没有可用的成功分发记录' };
   }
 
-  const videos = [...dispatchTasks].reverse().map((t) => {
+  const orderedDispatchTasks = [...dispatchTasks].reverse();
+
+  const videos = orderedDispatchTasks.map((t) => {
     const sourceMeta =
       t.mediaAsset?.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
         ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
@@ -357,6 +462,30 @@ export async function handleCatalogJob(channelIdRaw: string) {
     };
   });
 
+  const collectionGroups = new Map<string, Array<{ episodeNo: number; title: string; messageUrl: string }>>();
+  for (const task of orderedDispatchTasks) {
+    if (!task.telegramMessageLink) continue;
+    const meta = parseCollectionMeta(task.mediaAsset?.sourceMeta);
+    if (!meta) continue;
+
+    const sourceMeta =
+      task.mediaAsset?.sourceMeta && typeof task.mediaAsset.sourceMeta === 'object'
+        ? (task.mediaAsset.sourceMeta as Record<string, unknown>)
+        : {};
+    const fallbackTitle = getFileStem(task.mediaAsset?.originalName || '未命名视频');
+    const customCatalogTitle =
+      typeof sourceMeta.catalogCustomTitle === 'string' ? sourceMeta.catalogCustomTitle.trim() : '';
+    const safeCaption = isAiFailureText(task.caption) ? fallbackTitle : (task.caption || '').trim();
+
+    const group = collectionGroups.get(meta.collectionName) ?? [];
+    group.push({
+      episodeNo: meta.episodeNo,
+      title: customCatalogTitle || buildCatalogShortTitle(safeCaption, fallbackTitle),
+      messageUrl: task.telegramMessageLink,
+    });
+    collectionGroups.set(meta.collectionName, group);
+  }
+
   const navPageSize = Math.max(1, Math.min(100, (channel as any).navPageSize ?? 10));
   const navPagingEnabled = typeof (channel as any).navPagingEnabled === 'boolean'
     ? (channel as any).navPagingEnabled
@@ -374,7 +503,80 @@ export async function handleCatalogJob(channelIdRaw: string) {
 
   const botToken = bot.tokenEncrypted;
   let finalMessageId: number | null = null;
-  const content = pageContents.join('\n\n');
+
+  const collectionSections: string[] = [];
+  let nextCollectionNavState: CollectionNavState | null = null;
+  if (collectionGroups.size > 0) {
+    const names = [...collectionGroups.keys()].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+    const collectionIndexButtons: Array<Array<{ text: string; url: string }>> = [];
+
+    const existingNavState = parseCollectionNavState(channel.navReplyMarkup);
+    const detailMessageIds: Record<string, number> = {};
+
+    collectionSections.push('📚 合集导航\n点击按钮跳转到对应合集详情');
+
+    for (let idx = 0; idx < names.length; idx += 1) {
+      const name = names[idx];
+      const episodes = (collectionGroups.get(name) ?? []).sort((a, b) => a.episodeNo - b.episodeNo);
+      const lines = episodes.map((ep) => `第${ep.episodeNo}集 ${ep.title}\n${ep.messageUrl}`);
+
+      const detailPublishResult = await publishCatalogMessage({
+        botToken,
+        chatId: channel.tgChatId,
+        text: [`📺 ${name}`, ...lines].join('\n'),
+        existingMessageId: existingNavState.detailMessageIds[name] ?? null,
+      });
+
+      detailMessageIds[name] = detailPublishResult.messageId;
+      const detailLink = toTelegramMessageLink(channel.tgChatId, detailPublishResult.messageId);
+      if (detailLink) {
+        collectionIndexButtons.push([{ text: `${idx + 1}) ${name}`, url: detailLink }]);
+      }
+    }
+
+    let indexMessageId: number | null = null;
+    if (collectionIndexButtons.length > 0) {
+      const indexPublishResult = await publishCatalogMessage({
+        botToken,
+        chatId: channel.tgChatId,
+        text: '📚 合集索引\n请选择合集：',
+        existingMessageId: existingNavState.indexMessageId,
+        replyMarkup: { inline_keyboard: collectionIndexButtons },
+      });
+      indexMessageId = indexPublishResult.messageId;
+    }
+
+    const staleCollectionNames = Object.keys(existingNavState.detailMessageIds).filter(
+      (name) => !Object.prototype.hasOwnProperty.call(detailMessageIds, name),
+    );
+    for (const staleName of staleCollectionNames) {
+      const staleMessageId = existingNavState.detailMessageIds[staleName];
+      try {
+        await sendTelegramRequest({
+          botToken,
+          method: 'deleteMessage',
+          payload: {
+            chat_id: channel.tgChatId,
+            message_id: staleMessageId,
+          },
+        });
+      } catch (deleteError) {
+        logError('[q_catalog] 删除旧合集详情消息失败', {
+          channelId: channelIdRaw,
+          collectionName: staleName,
+          staleMessageId,
+          error: deleteError,
+        });
+      }
+    }
+
+    nextCollectionNavState = {
+      indexMessageId,
+      detailMessageIds,
+    };
+  }
+
+  const content = [pageContents.join('\n\n'), ...collectionSections].filter(Boolean).join('\n\n');
   const contentPreview = content.slice(0, 4000);
   let pinAttempted = false;
   let pinSuccess: boolean | null = null;
@@ -472,14 +674,31 @@ export async function handleCatalogJob(channelIdRaw: string) {
       }
     }
 
-    await prisma.channel.update({
-      where: { id: channelId },
-      data: {
-        navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
-        lastNavUpdateAt: new Date(),
-        ...({ navPageMessageIds: publishedPageMessageIds } as any),
-      } as any,
-    });
+    try {
+      await prisma.channel.update({
+        where: { id: channelId },
+        data: {
+          navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
+          lastNavUpdateAt: new Date(),
+          navReplyMarkup: mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState),
+          ...({ navPageMessageIds: publishedPageMessageIds } as any),
+        } as any,
+      });
+    } catch (updateError) {
+      const updateMessage = updateError instanceof Error ? updateError.message : '';
+      if (updateMessage.includes('Unknown argument `navPageMessageIds`')) {
+        await prisma.channel.update({
+          where: { id: channelId },
+          data: {
+            navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
+            lastNavUpdateAt: new Date(),
+            navReplyMarkup: mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState) as any,
+          },
+        });
+      } else {
+        throw updateError;
+      }
+    }
 
     await prisma.catalogHistory.create({
       data: {
@@ -533,6 +752,9 @@ export async function handleCatalogJob(channelIdRaw: string) {
 
     logError('[q_catalog] 发布频道导航失败', {
       channelId: channelIdRaw,
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+      errorMessage: error instanceof Error ? error.message : String(error),
+      errorStack: error instanceof Error ? error.stack : null,
       error,
     });
     throw error;

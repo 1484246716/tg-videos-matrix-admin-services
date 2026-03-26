@@ -66,12 +66,14 @@ export class MediaLifecycleService {
     telegramFileId?: string;
     keyword?: string;
     stage?: string;
+    mediaType?: string;
     limit?: number;
     userId?: string;
     role?: string;
   }) {
     const stageFilter = params.stage ? STAGE_FILTER_MAP[params.stage] : undefined;
     const tfid = (params.telegramFileId || '').trim();
+    const normalizedMediaType = (params.mediaType || '').trim().toLowerCase();
 
     const mediaAssets = await this.prisma.mediaAsset.findMany({
       where: {
@@ -92,6 +94,14 @@ export class MediaLifecycleService {
                   },
                 },
               ],
+            }
+          : {}),
+        ...(normalizedMediaType === 'collection'
+          ? {
+              sourceMeta: {
+                path: ['isCollection'],
+                equals: true,
+              },
             }
           : {}),
         originalName: params.keyword ? { contains: params.keyword, mode: 'insensitive' } : undefined,
@@ -136,6 +146,12 @@ export class MediaLifecycleService {
       const dispatches = dispatchMap.get(asset.id.toString()) ?? [];
       const latestDispatch = dispatches[0];
 
+      const sourceMeta =
+        asset.sourceMeta && typeof asset.sourceMeta === 'object'
+          ? (asset.sourceMeta as Record<string, unknown>)
+          : {};
+      const isCollection = sourceMeta.isCollection === true;
+
       return {
         id: asset.id.toString(),
         originalName: asset.originalName,
@@ -161,13 +177,22 @@ export class MediaLifecycleService {
             telegramErrorMessage: latestDispatch.telegramErrorMessage,
           }
           : null,
-        ingestErrorCode:
-          asset.sourceMeta && typeof asset.sourceMeta === 'object'
-            ? (() => {
-                const code = (asset.sourceMeta as Record<string, unknown>).ingestErrorCode;
-                return typeof code === 'string' ? code : null;
-              })()
+        mediaType: isCollection ? 'collection' : 'normal',
+        collectionName:
+          isCollection && typeof sourceMeta.collectionName === 'string'
+            ? sourceMeta.collectionName
             : null,
+        episodeNo:
+          isCollection &&
+          (typeof sourceMeta.episodeNo === 'number' ||
+            (typeof sourceMeta.episodeNo === 'string' && /^\d+$/.test(sourceMeta.episodeNo)))
+            ? Number(sourceMeta.episodeNo)
+            : null,
+        ingestErrorCode:
+          (() => {
+            const code = sourceMeta.ingestErrorCode;
+            return typeof code === 'string' ? code : null;
+          })(),
         canForceDelete:
           asset.status === 'ingesting' &&
           (() => {

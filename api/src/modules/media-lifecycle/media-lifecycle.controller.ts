@@ -20,6 +20,7 @@ export class MediaLifecycleController {
     @Query('telegramFileId') telegramFileId?: string,
     @Query('keyword') keyword?: string,
     @Query('stage') stage?: string,
+    @Query('mediaType') mediaType?: string,
     @Query('limit') limit?: string,
     @Request() req?: AuthRequest,
   ) {
@@ -28,6 +29,7 @@ export class MediaLifecycleController {
       telegramFileId,
       keyword,
       stage,
+      mediaType,
       limit: limit ? Number(limit) : undefined,
       userId: req?.user.userId,
       role: req?.user.role,

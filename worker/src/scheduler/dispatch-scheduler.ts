@@ -21,6 +21,123 @@ function computeDispatchNextAllowedAt(args: {
   return new Date(args.lastPostAt.getTime() + Math.max(0, args.postIntervalSec) * 1000);
 }
 
+function parseCollectionMeta(sourceMeta: unknown) {
+  if (!sourceMeta || typeof sourceMeta !== 'object') return null;
+  const meta = sourceMeta as Record<string, unknown>;
+  if (meta.isCollection !== true) return null;
+
+  const collectionName = typeof meta.collectionName === 'string' ? meta.collectionName : '';
+  const episodeNo =
+    typeof meta.episodeNo === 'number'
+      ? meta.episodeNo
+      : typeof meta.episodeNo === 'string' && /^\d+$/.test(meta.episodeNo)
+        ? Number(meta.episodeNo)
+        : null;
+  const episodeParseFailed = meta.episodeParseFailed === true;
+
+  if (!collectionName) return null;
+  return {
+    collectionName,
+    episodeNo,
+    episodeParseFailed,
+  };
+}
+
+function parseCollectionSchedulerConfig(navReplyMarkup: unknown) {
+  const fallback = {
+    collectionDispatchGateEnabled: true,
+    collectionHeadBypassEnabled: false,
+    collectionHeadBypassMinutes: 180,
+  };
+
+  if (!navReplyMarkup || typeof navReplyMarkup !== 'object' || Array.isArray(navReplyMarkup)) {
+    return fallback;
+  }
+
+  const root = navReplyMarkup as Record<string, unknown>;
+  const cfgRaw = root.__collectionConfig;
+  if (!cfgRaw || typeof cfgRaw !== 'object' || Array.isArray(cfgRaw)) {
+    return fallback;
+  }
+
+  const cfg = cfgRaw as Record<string, unknown>;
+  const collectionDispatchGateEnabled =
+    typeof cfg.collectionDispatchGateEnabled === 'boolean'
+      ? cfg.collectionDispatchGateEnabled
+      : fallback.collectionDispatchGateEnabled;
+  const collectionHeadBypassEnabled =
+    typeof cfg.collectionHeadBypassEnabled === 'boolean'
+      ? cfg.collectionHeadBypassEnabled
+      : fallback.collectionHeadBypassEnabled;
+  const collectionHeadBypassMinutes =
+    typeof cfg.collectionHeadBypassMinutes === 'number' && cfg.collectionHeadBypassMinutes > 0
+      ? Math.floor(cfg.collectionHeadBypassMinutes)
+      : fallback.collectionHeadBypassMinutes;
+
+  return {
+    collectionDispatchGateEnabled,
+    collectionHeadBypassEnabled,
+    collectionHeadBypassMinutes,
+  };
+}
+
+async function canDispatchCollectionEpisode(args: {
+  channelId: bigint;
+  collectionName: string;
+  episodeNo: number;
+}) {
+  const collectionAssets = await prisma.mediaAsset.findMany({
+    where: {
+      channelId: args.channelId,
+      sourceMeta: {
+        path: ['collectionName'],
+        equals: args.collectionName,
+      },
+    },
+    select: {
+      id: true,
+      sourceMeta: true,
+    },
+  });
+
+  const prevEpisodes = collectionAssets
+    .map((asset) => ({ id: asset.id, meta: parseCollectionMeta(asset.sourceMeta) }))
+    .filter((item) => item.meta && !item.meta.episodeParseFailed && item.meta.episodeNo !== null)
+    .filter((item) => (item.meta?.episodeNo ?? 0) < args.episodeNo) as Array<{
+    id: bigint;
+    meta: { collectionName: string; episodeNo: number | null; episodeParseFailed: boolean };
+  }>;
+
+  if (prevEpisodes.length === 0) {
+    return { allowed: true as const, blockedByEpisodeNo: null as number | null };
+  }
+
+  const prevEpisodeAssetIds = prevEpisodes.map((item) => item.id);
+
+  const successRows = await prisma.dispatchTask.findMany({
+    where: {
+      mediaAssetId: { in: prevEpisodeAssetIds },
+      status: TaskStatus.success,
+    },
+    select: { mediaAssetId: true },
+    distinct: ['mediaAssetId'],
+  });
+
+  const successSet = new Set(successRows.map((row) => row.mediaAssetId.toString()));
+  const blocked = prevEpisodes
+    .filter((item) => !successSet.has(item.id.toString()))
+    .sort((a, b) => (a.meta.episodeNo ?? 0) - (b.meta.episodeNo ?? 0))[0];
+
+  if (!blocked) {
+    return { allowed: true as const, blockedByEpisodeNo: null as number | null };
+  }
+
+  return {
+    allowed: false as const,
+    blockedByEpisodeNo: blocked.meta.episodeNo ?? null,
+  };
+}
+
 export async function scheduleDueDispatchTasks() {
   const now = new Date();
 
@@ -38,10 +155,17 @@ export async function scheduleDueDispatchTasks() {
       mediaAssetId: true,
       retryCount: true,
       maxRetries: true,
+      nextRunAt: true,
       channel: {
         select: {
           postIntervalSec: true,
           lastPostAt: true,
+          navReplyMarkup: true,
+        },
+      },
+      mediaAsset: {
+        select: {
+          sourceMeta: true,
         },
       },
     },
@@ -57,7 +181,11 @@ export async function scheduleDueDispatchTasks() {
       continue;
     }
 
+    const collectionMeta = parseCollectionMeta(task.mediaAsset.sourceMeta);
+    const collectionCfg = parseCollectionSchedulerConfig(task.channel.navReplyMarkup);
+
     const shouldBypassHead =
+      !collectionMeta &&
       task.status === TaskStatus.failed &&
       task.retryCount >= DISPATCH_HEAD_BYPASS_RETRY_THRESHOLD &&
       task.retryCount < task.maxRetries;
@@ -81,6 +209,87 @@ export async function scheduleDueDispatchTasks() {
       });
 
       continue;
+    }
+
+    if (collectionMeta?.episodeParseFailed) {
+      await prisma.dispatchTask.update({
+        where: { id: task.id },
+        data: {
+          status: TaskStatus.scheduled,
+          nextRunAt: new Date(Date.now() + 10 * 60 * 1000),
+        },
+      });
+
+      logger.warn('[scheduler] 合集集号解析失败，阻塞分发等待人工改名重扫', {
+        taskId: task.id.toString(),
+        channelId: channelIdStr,
+        mediaAssetId: task.mediaAssetId.toString(),
+        collectionName: collectionMeta.collectionName,
+      });
+      continue;
+    }
+
+    if (
+      collectionCfg.collectionDispatchGateEnabled &&
+      collectionMeta &&
+      !collectionMeta.episodeParseFailed &&
+      collectionMeta.episodeNo !== null
+    ) {
+      const gateResult = await canDispatchCollectionEpisode({
+        channelId: task.channelId,
+        collectionName: collectionMeta.collectionName,
+        episodeNo: collectionMeta.episodeNo,
+      });
+
+      if (!gateResult.allowed) {
+        const bypassReady =
+          collectionCfg.collectionHeadBypassEnabled &&
+          task.status === TaskStatus.failed &&
+          task.retryCount >= DISPATCH_HEAD_BYPASS_RETRY_THRESHOLD;
+
+        if (bypassReady) {
+          const bypassNextRunAt = new Date(
+            Date.now() + collectionCfg.collectionHeadBypassMinutes * 60 * 1000,
+          );
+          await prisma.dispatchTask.update({
+            where: { id: task.id },
+            data: {
+              status: TaskStatus.failed,
+              nextRunAt: bypassNextRunAt,
+            },
+          });
+
+          logger.warn('[scheduler] 合集头部阻塞旁路生效，延后重试', {
+            taskId: task.id.toString(),
+            channelId: channelIdStr,
+            mediaAssetId: task.mediaAssetId.toString(),
+            collectionName: collectionMeta.collectionName,
+            episodeNo: collectionMeta.episodeNo,
+            blockedByEpisodeNo: gateResult.blockedByEpisodeNo,
+            collectionHeadBypassMinutes: collectionCfg.collectionHeadBypassMinutes,
+            bypassNextRunAt: bypassNextRunAt.toISOString(),
+          });
+          continue;
+        }
+
+        await prisma.dispatchTask.update({
+          where: { id: task.id },
+          data: {
+            status: TaskStatus.scheduled,
+            nextRunAt: new Date(Date.now() + 60 * 1000),
+          },
+        });
+
+        logger.info('[scheduler] 合集顺序闸门阻塞当前分发任务', {
+          taskId: task.id.toString(),
+          channelId: channelIdStr,
+          mediaAssetId: task.mediaAssetId.toString(),
+          collectionName: collectionMeta.collectionName,
+          episodeNo: collectionMeta.episodeNo,
+          blockedByEpisodeNo: gateResult.blockedByEpisodeNo,
+        });
+        continue;
+      }
     }
 
     if (DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED) {

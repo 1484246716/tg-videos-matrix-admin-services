@@ -26,6 +26,51 @@ async function removeLocalDuplicateFile(filePath: string, mediaAssetId: string) 
   }
 }
 
+function parseCollectionMeta(filePath: string) {
+  const normalizedFile = filePath.replace(/\\/g, '/');
+  const marker = '/collection/';
+  const lowerFile = normalizedFile.toLowerCase();
+  const markerIdx = lowerFile.indexOf(marker);
+  if (markerIdx === -1) return null;
+
+  const rest = normalizedFile.slice(markerIdx + marker.length);
+  const parts = rest.split('/').filter(Boolean);
+  if (parts.length < 2) return null;
+
+  const collectionName = parts[0];
+  const fileName = parts[parts.length - 1];
+
+  const patterns = [
+    /\[第\s*(\d+)\s*集\]/,
+    /第\s*(\d+)\s*集/,
+    /S\d+E(\d+)/i,
+  ];
+
+  let episodeNo: number | null = null;
+  for (const pattern of patterns) {
+    const match = fileName.match(pattern);
+    if (match && match[1]) {
+      const parsed = Number(match[1]);
+      if (Number.isFinite(parsed)) {
+        episodeNo = parsed;
+        break;
+      }
+    }
+  }
+
+  const episodeParseFailed = episodeNo === null;
+  const orderKey = `${collectionName}#${episodeNo ? String(episodeNo).padStart(4, '0') : '0000'}`;
+
+  return {
+    isCollection: true,
+    collectionName,
+    episodeNo,
+    episodeParseFailed,
+    collectionPath: `Collection/${collectionName}`,
+    collectionOrderKey: orderKey,
+  };
+}
+
 export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
   const definition = await getTaskDefinitionModel().findUnique({
     where: { id: taskDefinitionId },
@@ -201,6 +246,127 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
       const hashStart = Date.now();
       const fileHash = await hashFile(filePath);
       const hashDurationMs = Date.now() - hashStart;
+      const collectionMeta = parseCollectionMeta(filePath);
+
+      if (collectionMeta?.episodeParseFailed) {
+        logger.warn('[relay] 合集集号解析失败，等待重命名后重扫', {
+          channelId: channel.id.toString(),
+          filePath,
+          collectionName: collectionMeta.collectionName,
+        });
+      }
+
+      if (collectionMeta && !collectionMeta.episodeParseFailed && collectionMeta.episodeNo !== null) {
+        const sameEpisodeAssets = await prisma.mediaAsset.findMany({
+          where: {
+            channelId: channel.id,
+            sourceMeta: {
+              path: ['collectionName'],
+              equals: collectionMeta.collectionName,
+            },
+          },
+          select: {
+            id: true,
+            localPath: true,
+            sourceMeta: true,
+            status: true,
+          },
+        });
+
+        const conflictAssets = sameEpisodeAssets.filter((asset) => {
+          if (asset.localPath === filePath) return false;
+          const meta =
+            asset.sourceMeta && typeof asset.sourceMeta === 'object'
+              ? (asset.sourceMeta as Record<string, unknown>)
+              : null;
+          if (!meta || meta.isCollection !== true) return false;
+          const epNo =
+            typeof meta.episodeNo === 'number'
+              ? meta.episodeNo
+              : typeof meta.episodeNo === 'string' && /^\d+$/.test(meta.episodeNo)
+                ? Number(meta.episodeNo)
+                : null;
+          return epNo === collectionMeta.episodeNo;
+        });
+
+        if (conflictAssets.length > 0) {
+          const ingestError = `COLLECTION_EPISODE_CONFLICT: ${collectionMeta.collectionName} 第${collectionMeta.episodeNo}集重复`; 
+
+          const fileHash = await hashFile(filePath);
+          const existed = await prisma.mediaAsset.findUnique({
+            where: {
+              fileHash_fileSize: {
+                fileHash,
+                fileSize: s.size,
+              },
+            },
+            select: { id: true, sourceMeta: true },
+          });
+
+          const conflictIds = conflictAssets.map((asset) => asset.id.toString());
+
+          if (existed) {
+            const sourceMetaExisted =
+              existed.sourceMeta && typeof existed.sourceMeta === 'object'
+                ? (existed.sourceMeta as Record<string, unknown>)
+                : {};
+
+            await prisma.mediaAsset.update({
+              where: { id: existed.id },
+              data: {
+                status: MediaStatus.failed,
+                ingestError,
+                sourceMeta: {
+                  ...sourceMetaExisted,
+                  ...(collectionMeta ?? {}),
+                  episodeConflict: true,
+                  episodeConflictPolicy: 'block',
+                  episodeConflictAssetIds: conflictIds,
+                  ingestFinalReason: 'collection_episode_conflict',
+                  ingestErrorCode: 'COLLECTION_EPISODE_CONFLICT',
+                  relayChannelId: definition.relayChannelId.toString(),
+                  taskDefinitionId: definition.id.toString(),
+                },
+              },
+            });
+          } else {
+            await prisma.mediaAsset.create({
+              data: {
+                channelId: channel.id,
+                originalName: basename(filePath),
+                localPath: filePath,
+                fileSize: BigInt(s.size),
+                fileHash,
+                status: MediaStatus.failed,
+                ingestError,
+                sourceMeta: {
+                  ...(collectionMeta ?? {}),
+                  episodeConflict: true,
+                  episodeConflictPolicy: 'block',
+                  episodeConflictAssetIds: conflictIds,
+                  ingestFinalReason: 'collection_episode_conflict',
+                  ingestErrorCode: 'COLLECTION_EPISODE_CONFLICT',
+                  relayChannelId: definition.relayChannelId.toString(),
+                  taskDefinitionId: definition.id.toString(),
+                  relayPriority: definition.priority,
+                  relayMaxRetries: definition.maxRetries,
+                },
+              },
+            });
+            createdAssets += 1;
+          }
+
+          logger.warn('[relay] 合集重复集号冲突，按 block 策略阻塞派发', {
+            channelId: channel.id.toString(),
+            filePath,
+            collectionName: collectionMeta.collectionName,
+            episodeNo: collectionMeta.episodeNo,
+            conflictAssetIds: conflictIds,
+          });
+
+          continue;
+        }
+      }
 
       if (hashDurationMs > 500) {
         logger.info('[relay] hashFile 耗时', {
@@ -243,6 +409,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
               relayPriority: definition.priority,
               relayMaxRetries: definition.maxRetries,
               ingestRetryCount: 0,
+              ...(collectionMeta ?? {}),
             },
           },
           select: {
@@ -371,6 +538,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
             relayEnqueueAt: new Date().toISOString(),
             relayPriority: definition.priority,
             relayMaxRetries: definition.maxRetries,
+            ...(collectionMeta ?? {}),
           },
         },
       });
