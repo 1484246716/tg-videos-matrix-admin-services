@@ -15,6 +15,15 @@ function getFileStem(fileName: string) {
   return stem || trimmed;
 }
 
+function escapeHtml(text: string) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function isAiFailureText(text?: string | null) {
   if (!text) return false;
   const normalized = text.trim();
@@ -142,10 +151,19 @@ async function publishCatalogMessage(args: {
     return { messageId: existing, isNewMessage: false };
   } catch (err) {
     const errObj = err as { message?: string };
-    if (errObj.message?.includes('message is not modified')) {
+    const message = (errObj.message || '').toLowerCase();
+
+    if (message.includes('message is not modified')) {
       return { messageId: existing, isNewMessage: false };
     }
-    if (errObj.message?.includes('message to edit not found')) {
+
+    const shouldFallbackToSend =
+      message.includes('message to edit not found') ||
+      message.includes('message_id_invalid') ||
+      message.includes("message can't be edited") ||
+      message.includes('message can\'t be edited');
+
+    if (shouldFallbackToSend) {
       const sendResult = await sendTextByTelegram({
         botToken: args.botToken,
         chatId: args.chatId,
@@ -154,6 +172,7 @@ async function publishCatalogMessage(args: {
       });
       return { messageId: sendResult.messageId, isNewMessage: true };
     }
+
     throw err;
   }
 }
@@ -165,12 +184,14 @@ function parseStoredPageMessageIds(raw: unknown) {
 
 type CollectionNavState = {
   indexMessageId: number | null;
+  indexPageMessageIds: number[];
   detailMessageIds: Record<string, number>;
+  detailPageMessageIds: Record<string, number[]>;
 };
 
 function parseCollectionNavState(rawNavReplyMarkup: unknown): CollectionNavState {
   if (!rawNavReplyMarkup || typeof rawNavReplyMarkup !== 'object' || Array.isArray(rawNavReplyMarkup)) {
-    return { indexMessageId: null, detailMessageIds: {} };
+    return { indexMessageId: null, indexPageMessageIds: [], detailMessageIds: {}, detailPageMessageIds: {} };
   }
 
   const container = rawNavReplyMarkup as Record<string, unknown>;
@@ -179,13 +200,15 @@ function parseCollectionNavState(rawNavReplyMarkup: unknown): CollectionNavState
       ? (container.__collectionNavState as Record<string, unknown>)
       : null;
 
-  if (!state) return { indexMessageId: null, detailMessageIds: {} };
+  if (!state) return { indexMessageId: null, indexPageMessageIds: [], detailMessageIds: {}, detailPageMessageIds: {} };
 
   const indexMessageIdRaw = state.indexMessageId;
   const indexMessageId =
     typeof indexMessageIdRaw === 'number' && Number.isInteger(indexMessageIdRaw) && indexMessageIdRaw > 0
       ? indexMessageIdRaw
       : null;
+
+  const indexPageMessageIds = parseStoredPageMessageIds(state.indexPageMessageIds);
 
   const detailRaw = state.detailMessageIds;
   const detailMessageIds: Record<string, number> = {};
@@ -198,7 +221,24 @@ function parseCollectionNavState(rawNavReplyMarkup: unknown): CollectionNavState
     }
   }
 
-  return { indexMessageId, detailMessageIds };
+  const detailPageRaw = state.detailPageMessageIds;
+  const detailPageMessageIds: Record<string, number[]> = {};
+  if (detailPageRaw && typeof detailPageRaw === 'object' && !Array.isArray(detailPageRaw)) {
+    for (const [key, val] of Object.entries(detailPageRaw as Record<string, unknown>)) {
+      const ids = parseStoredPageMessageIds(val);
+      if (ids.length > 0) {
+        detailPageMessageIds[key] = ids;
+      }
+    }
+  }
+
+  for (const [key, firstId] of Object.entries(detailMessageIds)) {
+    if (!detailPageMessageIds[key] || detailPageMessageIds[key].length === 0) {
+      detailPageMessageIds[key] = [firstId];
+    }
+  }
+
+  return { indexMessageId, indexPageMessageIds, detailMessageIds, detailPageMessageIds };
 }
 
 function sanitizeJsonForPrisma(value: unknown): unknown {
@@ -238,7 +278,9 @@ function mergeCollectionNavStateIntoReplyMarkup(rawNavReplyMarkup: unknown, stat
 
   (base as Record<string, unknown>).__collectionNavState = {
     indexMessageId: state.indexMessageId ?? null,
+    indexPageMessageIds: state.indexPageMessageIds,
     detailMessageIds: state.detailMessageIds,
+    detailPageMessageIds: state.detailPageMessageIds,
     updatedAt: new Date().toISOString(),
   };
 
@@ -290,6 +332,156 @@ function buildCatalogPageButtons(args: { chatId: string; pageMessageIds: number[
   }
 
   return { inline_keyboard: inlineKeyboard };
+}
+
+function buildCatalogContentPageReplyMarkup(args: {
+  chatId: string;
+  currentPage: number;
+  totalPages: number;
+  pageMessageIds: number[];
+}) {
+  if (args.totalPages <= 1) return null;
+
+  const inlineKeyboard: Array<Array<{ text: string; url: string }>> = [];
+
+  const pageStart = Math.max(1, Math.min(args.currentPage - 2, args.totalPages - 4));
+  const pageEnd = Math.min(args.totalPages, pageStart + 4);
+  const pageNoRow: Array<{ text: string; url: string }> = [];
+
+  for (let page = pageStart; page <= pageEnd; page += 1) {
+    const messageId = args.pageMessageIds[page - 1];
+    const url = messageId ? toTelegramMessageLink(args.chatId, messageId) : null;
+    if (!url) continue;
+
+    pageNoRow.push({
+      text: page === args.currentPage ? `·${page}·` : String(page),
+      url,
+    });
+  }
+
+  if (pageNoRow.length > 0) {
+    inlineKeyboard.push(pageNoRow);
+  }
+
+  const navRow: Array<{ text: string; url: string }> = [];
+  if (args.currentPage > 1) {
+    const prevId = args.pageMessageIds[args.currentPage - 2];
+    const prevUrl = prevId ? toTelegramMessageLink(args.chatId, prevId) : null;
+    if (prevUrl) navRow.push({ text: '⬅️ 上一页', url: prevUrl });
+  }
+
+  if (args.currentPage < args.totalPages) {
+    const nextId = args.pageMessageIds[args.currentPage];
+    const nextUrl = nextId ? toTelegramMessageLink(args.chatId, nextId) : null;
+    if (nextUrl) navRow.push({ text: '下一页 ➡️', url: nextUrl });
+  }
+
+  if (navRow.length > 0) {
+    inlineKeyboard.push(navRow);
+  }
+
+  return inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : null;
+}
+
+function buildCollectionIndexReplyMarkup(args: {
+  chatId: string;
+  pageItems: Array<{ text: string; url: string }>;
+  currentPage: number;
+  totalPages: number;
+  indexPageMessageIds: number[];
+}) {
+  const inlineKeyboard: Array<Array<{ text: string; url: string }>> = args.pageItems.map((item) => [{
+    text: item.text,
+    url: item.url,
+  }]);
+
+  if (args.totalPages <= 1) {
+    return { inline_keyboard: inlineKeyboard };
+  }
+
+  const pageStart = Math.max(1, Math.min(args.currentPage - 2, args.totalPages - 4));
+  const pageEnd = Math.min(args.totalPages, pageStart + 4);
+  const pageNoRow: Array<{ text: string; url: string }> = [];
+
+  for (let page = pageStart; page <= pageEnd; page += 1) {
+    const messageId = args.indexPageMessageIds[page - 1];
+    const url = messageId ? toTelegramMessageLink(args.chatId, messageId) : null;
+    if (!url) continue;
+
+    pageNoRow.push({
+      text: page === args.currentPage ? `·${page}·` : String(page),
+      url,
+    });
+  }
+
+  if (pageNoRow.length > 0) {
+    inlineKeyboard.push(pageNoRow);
+  }
+
+  const navRow: Array<{ text: string; url: string }> = [];
+
+  const prevMessageId = args.currentPage > 1 ? args.indexPageMessageIds[args.currentPage - 2] : null;
+  const prevUrl = prevMessageId ? toTelegramMessageLink(args.chatId, prevMessageId) : null;
+  if (prevUrl) {
+    navRow.push({ text: '⬅️ 上一页', url: prevUrl });
+  }
+
+  const nextMessageId = args.currentPage < args.totalPages ? args.indexPageMessageIds[args.currentPage] : null;
+  const nextUrl = nextMessageId ? toTelegramMessageLink(args.chatId, nextMessageId) : null;
+  if (nextUrl) {
+    navRow.push({ text: '下一页 ➡️', url: nextUrl });
+  }
+
+  if (navRow.length > 0) {
+    inlineKeyboard.push(navRow);
+  }
+
+  return { inline_keyboard: inlineKeyboard };
+}
+
+function buildCollectionDetailReplyMarkup(args: {
+  chatId: string;
+  currentPage: number;
+  totalPages: number;
+  detailPageMessageIds: number[];
+}) {
+  if (args.totalPages <= 1) return null;
+
+  const inlineKeyboard: Array<Array<{ text: string; url: string }>> = [];
+
+  const pageStart = Math.max(1, Math.min(args.currentPage - 2, args.totalPages - 4));
+  const pageEnd = Math.min(args.totalPages, pageStart + 4);
+  const pageNoRow: Array<{ text: string; url: string }> = [];
+
+  for (let page = pageStart; page <= pageEnd; page += 1) {
+    const messageId = args.detailPageMessageIds[page - 1];
+    const url = messageId ? toTelegramMessageLink(args.chatId, messageId) : null;
+    if (!url) continue;
+
+    pageNoRow.push({
+      text: page === args.currentPage ? `·${page}·` : String(page),
+      url,
+    });
+  }
+
+  if (pageNoRow.length > 0) inlineKeyboard.push(pageNoRow);
+
+  const navRow: Array<{ text: string; url: string }> = [];
+  if (args.currentPage > 1) {
+    const prevId = args.detailPageMessageIds[args.currentPage - 2];
+    const prevUrl = prevId ? toTelegramMessageLink(args.chatId, prevId) : null;
+    if (prevUrl) navRow.push({ text: '⬅️ 上一页', url: prevUrl });
+  }
+
+  if (args.currentPage < args.totalPages) {
+    const nextId = args.detailPageMessageIds[args.currentPage];
+    const nextUrl = nextId ? toTelegramMessageLink(args.chatId, nextId) : null;
+    if (nextUrl) navRow.push({ text: '下一页 ➡️', url: nextUrl });
+  }
+
+  if (navRow.length > 0) inlineKeyboard.push(navRow);
+
+  return inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : null;
 }
 
 function parseCollectionMeta(sourceMeta: unknown) {
@@ -439,8 +631,15 @@ export async function handleCatalogJob(channelIdRaw: string) {
   }
 
   const orderedDispatchTasks = [...dispatchTasks].reverse();
+  const channelAny = channel as any;
+  const collectionNavEnabled =
+    typeof channelAny.collection_nav_enabled === 'boolean' ? channelAny.collection_nav_enabled : true;
 
-  const videos = orderedDispatchTasks.map((t) => {
+  const regularDispatchTasks = collectionNavEnabled
+    ? orderedDispatchTasks.filter((task) => !parseCollectionMeta(task.mediaAsset?.sourceMeta))
+    : orderedDispatchTasks;
+
+  const videos = regularDispatchTasks.map((t) => {
     const sourceMeta =
       t.mediaAsset?.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
         ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
@@ -468,19 +667,12 @@ export async function handleCatalogJob(channelIdRaw: string) {
     const meta = parseCollectionMeta(task.mediaAsset?.sourceMeta);
     if (!meta) continue;
 
-    const sourceMeta =
-      task.mediaAsset?.sourceMeta && typeof task.mediaAsset.sourceMeta === 'object'
-        ? (task.mediaAsset.sourceMeta as Record<string, unknown>)
-        : {};
-    const fallbackTitle = getFileStem(task.mediaAsset?.originalName || '未命名视频');
-    const customCatalogTitle =
-      typeof sourceMeta.catalogCustomTitle === 'string' ? sourceMeta.catalogCustomTitle.trim() : '';
-    const safeCaption = isAiFailureText(task.caption) ? fallbackTitle : (task.caption || '').trim();
+    const fileNameTitle = getFileStem(task.mediaAsset?.originalName || '未命名视频');
 
     const group = collectionGroups.get(meta.collectionName) ?? [];
     group.push({
       episodeNo: meta.episodeNo,
-      title: customCatalogTitle || buildCatalogShortTitle(safeCaption, fallbackTitle),
+      title: fileNameTitle,
       messageUrl: task.telegramMessageLink,
     });
     collectionGroups.set(meta.collectionName, group);
@@ -505,52 +697,159 @@ export async function handleCatalogJob(channelIdRaw: string) {
   let finalMessageId: number | null = null;
 
   const collectionSections: string[] = [];
+  let collectionIndexLinkInMainCatalog: string | null = null;
   let nextCollectionNavState: CollectionNavState | null = null;
   if (collectionGroups.size > 0) {
     const names = [...collectionGroups.keys()].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
-    const collectionIndexButtons: Array<Array<{ text: string; url: string }>> = [];
-
     const existingNavState = parseCollectionNavState(channel.navReplyMarkup);
     const detailMessageIds: Record<string, number> = {};
+    const detailPageMessageIds: Record<string, number[]> = {};
 
-    collectionSections.push('📚 合集导航\n点击按钮跳转到对应合集详情');
+    const collectionIndexPageSize = Math.max(1, Math.min(50, Number(channelAny.collection_index_page_size ?? 20)));
+    const collectionDetailPageSize = Math.max(1, Math.min(100, navPageSize));
+
+    const collectionIndexItems: Array<{ text: string; url: string }> = [];
 
     for (let idx = 0; idx < names.length; idx += 1) {
       const name = names[idx];
       const episodes = (collectionGroups.get(name) ?? []).sort((a, b) => a.episodeNo - b.episodeNo);
-      const lines = episodes.map((ep) => `第${ep.episodeNo}集 ${ep.title}\n${ep.messageUrl}`);
+      const episodePages = chunkVideos(episodes, collectionDetailPageSize);
+      const existingDetailPages = existingNavState.detailPageMessageIds[name] ?? [];
+      const publishedDetailPages: number[] = [];
 
-      const detailPublishResult = await publishCatalogMessage({
-        botToken,
-        chatId: channel.tgChatId,
-        text: [`📺 ${name}`, ...lines].join('\n'),
-        existingMessageId: existingNavState.detailMessageIds[name] ?? null,
-      });
+      const detailTexts: string[] = [];
 
-      detailMessageIds[name] = detailPublishResult.messageId;
-      const detailLink = toTelegramMessageLink(channel.tgChatId, detailPublishResult.messageId);
+      for (let pageIndex = 0; pageIndex < episodePages.length; pageIndex += 1) {
+        const pageLines = episodePages[pageIndex].map((ep) => {
+          const displayTitle = getFileStem(ep.title).trim();
+          const safeTitle = escapeHtml(displayTitle || `第${ep.episodeNo}集`);
+          const safeUrl = escapeHtml(ep.messageUrl);
+          return `<a href="${safeUrl}">${safeTitle}</a>`;
+        });
+
+        const detailText = [
+          `📺 ${escapeHtml(name)}`,
+          ...pageLines,
+          ...(episodePages.length > 1 ? [`—— 第${pageIndex + 1}/${episodePages.length}页 ——`] : []),
+        ].join('\n');
+
+        detailTexts.push(detailText);
+
+        const detailPublishResult = await publishCatalogMessage({
+          botToken,
+          chatId: channel.tgChatId,
+          text: detailText,
+          existingMessageId: existingDetailPages[pageIndex] ?? null,
+        });
+
+        publishedDetailPages.push(detailPublishResult.messageId);
+      }
+
+      if (episodePages.length > 1) {
+        for (let pageIndex = 0; pageIndex < episodePages.length; pageIndex += 1) {
+          const currentMessageId = publishedDetailPages[pageIndex] ?? null;
+          if (!currentMessageId) continue;
+
+          await publishCatalogMessage({
+            botToken,
+            chatId: channel.tgChatId,
+            text: detailTexts[pageIndex],
+            existingMessageId: currentMessageId,
+            replyMarkup: buildCollectionDetailReplyMarkup({
+              chatId: channel.tgChatId,
+              currentPage: pageIndex + 1,
+              totalPages: episodePages.length,
+              detailPageMessageIds: publishedDetailPages,
+            }) ?? undefined,
+          });
+        }
+      }
+
+      const staleDetailPages = existingDetailPages.slice(publishedDetailPages.length);
+      for (const staleMessageId of staleDetailPages) {
+        try {
+          await sendTelegramRequest({
+            botToken,
+            method: 'deleteMessage',
+            payload: {
+              chat_id: channel.tgChatId,
+              message_id: staleMessageId,
+            },
+          });
+        } catch (deleteError) {
+          logError('[q_catalog] 删除旧合集详情分页消息失败', {
+            channelId: channelIdRaw,
+            collectionName: name,
+            staleMessageId,
+            error: deleteError,
+          });
+        }
+      }
+
+      if (publishedDetailPages.length > 0) {
+        detailMessageIds[name] = publishedDetailPages[0];
+        detailPageMessageIds[name] = publishedDetailPages;
+      }
+
+      const detailLink = publishedDetailPages[0]
+        ? toTelegramMessageLink(channel.tgChatId, publishedDetailPages[0])
+        : null;
       if (detailLink) {
-        collectionIndexButtons.push([{ text: `${idx + 1}) ${name}`, url: detailLink }]);
+        collectionIndexItems.push({ text: `${idx + 1}) ${name}`, url: detailLink });
       }
     }
 
-    let indexMessageId: number | null = null;
-    if (collectionIndexButtons.length > 0) {
+    const indexPages = chunkVideos(collectionIndexItems, collectionIndexPageSize);
+    const existingIndexPages = existingNavState.indexPageMessageIds;
+    const publishedIndexPages: number[] = [];
+
+    for (let pageIndex = 0; pageIndex < indexPages.length; pageIndex += 1) {
+      const text = [
+        '📚 合集索引',
+        '请选择合集：',
+        ...(indexPages.length > 1 ? [`—— 第${pageIndex + 1}/${indexPages.length}页 ——`] : []),
+      ].join('\n');
+
       const indexPublishResult = await publishCatalogMessage({
         botToken,
         chatId: channel.tgChatId,
-        text: '📚 合集索引\n请选择合集：',
-        existingMessageId: existingNavState.indexMessageId,
-        replyMarkup: { inline_keyboard: collectionIndexButtons },
+        text,
+        existingMessageId: existingIndexPages[pageIndex] ?? null,
+        replyMarkup: null,
       });
-      indexMessageId = indexPublishResult.messageId;
+
+      publishedIndexPages.push(indexPublishResult.messageId);
     }
 
-    const staleCollectionNames = Object.keys(existingNavState.detailMessageIds).filter(
-      (name) => !Object.prototype.hasOwnProperty.call(detailMessageIds, name),
-    );
-    for (const staleName of staleCollectionNames) {
-      const staleMessageId = existingNavState.detailMessageIds[staleName];
+    for (let pageIndex = 0; pageIndex < indexPages.length; pageIndex += 1) {
+      const currentMessageId = publishedIndexPages[pageIndex] ?? null;
+      if (!currentMessageId) continue;
+
+      const text = [
+        '📚 合集索引',
+        '请选择合集：',
+        ...(indexPages.length > 1 ? [`—— 第${pageIndex + 1}/${indexPages.length}页 ——`] : []),
+      ].join('\n');
+
+      const replyMarkup = buildCollectionIndexReplyMarkup({
+        chatId: channel.tgChatId,
+        pageItems: indexPages[pageIndex],
+        currentPage: pageIndex + 1,
+        totalPages: indexPages.length,
+        indexPageMessageIds: publishedIndexPages,
+      });
+
+      await publishCatalogMessage({
+        botToken,
+        chatId: channel.tgChatId,
+        text,
+        existingMessageId: currentMessageId,
+        replyMarkup,
+      });
+    }
+
+    const staleIndexPages = existingIndexPages.slice(publishedIndexPages.length);
+    for (const staleMessageId of staleIndexPages) {
       try {
         await sendTelegramRequest({
           botToken,
@@ -561,22 +860,61 @@ export async function handleCatalogJob(channelIdRaw: string) {
           },
         });
       } catch (deleteError) {
-        logError('[q_catalog] 删除旧合集详情消息失败', {
+        logError('[q_catalog] 删除旧合集索引分页消息失败', {
           channelId: channelIdRaw,
-          collectionName: staleName,
           staleMessageId,
           error: deleteError,
         });
       }
     }
 
+    const indexMessageId = publishedIndexPages[0] ?? null;
+    collectionIndexLinkInMainCatalog = indexMessageId
+      ? toTelegramMessageLink(channel.tgChatId, indexMessageId)
+      : null;
+
+    const staleCollectionNames = Object.keys(existingNavState.detailPageMessageIds).filter(
+      (name) => !Object.prototype.hasOwnProperty.call(detailPageMessageIds, name),
+    );
+    for (const staleName of staleCollectionNames) {
+      const stalePages = existingNavState.detailPageMessageIds[staleName] ?? [];
+      for (const staleMessageId of stalePages) {
+        try {
+          await sendTelegramRequest({
+            botToken,
+            method: 'deleteMessage',
+            payload: {
+              chat_id: channel.tgChatId,
+              message_id: staleMessageId,
+            },
+          });
+        } catch (deleteError) {
+          logError('[q_catalog] 删除旧合集详情消息失败', {
+            channelId: channelIdRaw,
+            collectionName: staleName,
+            staleMessageId,
+            error: deleteError,
+          });
+        }
+      }
+    }
+
     nextCollectionNavState = {
       indexMessageId,
+      indexPageMessageIds: publishedIndexPages,
       detailMessageIds,
+      detailPageMessageIds,
     };
   }
 
-  const content = [pageContents.join('\n\n'), ...collectionSections].filter(Boolean).join('\n\n');
+  const mainCatalogContent = (() => {
+    const base = pageContents.join('\n\n');
+    if (!collectionNavEnabled || !collectionIndexLinkInMainCatalog) return base;
+    const safeLink = escapeHtml(collectionIndexLinkInMainCatalog);
+    return `${base}\n\n<a href="${safeLink}">📚 合集索引</a>`;
+  })();
+
+  const content = [mainCatalogContent, ...collectionSections].filter(Boolean).join('\n\n');
   const contentPreview = content.slice(0, 4000);
   let pinAttempted = false;
   let pinSuccess: boolean | null = null;
@@ -591,7 +929,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
       const publishResult = await publishCatalogMessage({
         botToken,
         chatId: channel.tgChatId,
-        text: pageContents[0],
+        text: mainCatalogContent,
         existingMessageId: channel.navMessageId ? Number(channel.navMessageId) : null,
         clearReplyMarkup: true,
       });
@@ -614,13 +952,30 @@ export async function handleCatalogJob(channelIdRaw: string) {
       }
     } else {
       for (let pageIndex = 0; pageIndex < pageContents.length; pageIndex += 1) {
+        const pageText = pageIndex === 0 ? mainCatalogContent : pageContents[pageIndex];
         const publishResult = await publishCatalogMessage({
           botToken,
           chatId: channel.tgChatId,
-          text: pageContents[pageIndex],
+          text: pageText,
           existingMessageId: storedPageMessageIds[pageIndex] ?? null,
         });
         publishedPageMessageIds.push(publishResult.messageId);
+      }
+
+      for (let pageIndex = 0; pageIndex < pageContents.length; pageIndex += 1) {
+        const pageText = pageIndex === 0 ? mainCatalogContent : pageContents[pageIndex];
+        await publishCatalogMessage({
+          botToken,
+          chatId: channel.tgChatId,
+          text: pageText,
+          existingMessageId: publishedPageMessageIds[pageIndex],
+          replyMarkup: buildCatalogContentPageReplyMarkup({
+            chatId: channel.tgChatId,
+            currentPage: pageIndex + 1,
+            totalPages: pageContents.length,
+            pageMessageIds: publishedPageMessageIds,
+          }) ?? undefined,
+        });
       }
 
       const indexReplyMarkup = buildCatalogPageButtons({
