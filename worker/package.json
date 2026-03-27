@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "prisma:generate": "prisma generate --schema ../api/prisma/schema.prisma",
-    "dev": "pnpm run prisma:generate && ts-node-dev --respawn --transpile-only src/main.ts",
+    "prisma:generate:safe": "prisma generate --schema ../api/prisma/schema.prisma || (echo [worker] prisma generate skipped: engine file is locked by another running process. & echo [worker] stop api/worker processes then run pnpm run prisma:generate once.)",
+    "dev": "pnpm run prisma:generate:safe && ts-node-dev --respawn --transpile-only src/main.ts",
     "build": "pnpm run prisma:generate && tsc -p tsconfig.json",
     "start": "pnpm run prisma:generate && node dist/main.js",
     "test": "vitest run",

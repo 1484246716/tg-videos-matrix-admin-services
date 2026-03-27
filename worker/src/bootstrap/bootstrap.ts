@@ -1,6 +1,6 @@
 import '../config/env';
 import { catalogQueue, dispatchQueue, relayUploadQueue, massMessageQueue } from '../infra/redis';
-import { ensureWorkerPrismaModels } from '../infra/prisma';
+import { ensureWorkerPrismaModels, logWorkerDatabaseFingerprint } from '../infra/prisma';
 import { logger, logError } from '../logger';
 import { telegramApiBase } from '../config/env';
 import { scheduleEnabledTaskDefinitions } from '../scheduler/task-definition-scheduler';
@@ -43,6 +43,7 @@ async function drainStaleRelayJobs() {
 }
 
 export async function bootstrapWorker() {
+  logWorkerDatabaseFingerprint();
   ensureWorkerPrismaModels();
 
   await dispatchQueue.add(

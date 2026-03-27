@@ -15,6 +15,13 @@ function getFileStem(fileName: string) {
   return stem || trimmed;
 }
 
+function normalizeCollectionKey(name: string) {
+  return name
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function escapeHtml(text: string) {
   return text
     .replace(/&/g, '&amp;')
@@ -746,6 +753,9 @@ export async function handleCatalogJob(channelIdRaw: string) {
 
     const collectionIndexPageSize = Math.max(1, Math.min(50, Number(channelAny.collection_index_page_size ?? 20)));
 
+    const collectionNameToNormalized = new Map(names.map((name) => [name, normalizeCollectionKey(name)]));
+    const normalizedNames = [...new Set(collectionNameToNormalized.values())];
+
     let collectionConfigs: Array<{ name: string; navPageSize: number | null }> = [];
     const collectionModel = (prisma as any).collection;
     if (!collectionModel) {
@@ -753,26 +763,52 @@ export async function handleCatalogJob(channelIdRaw: string) {
         channelId: channelIdRaw,
       });
     } else {
-      collectionConfigs = await collectionModel.findMany({
-        where: {
-          channelId,
-          name: { in: names },
-        },
+      const allChannelCollections: Array<{ name: string; navPageSize: number | null }> = await collectionModel.findMany({
+        where: { channelId },
         select: {
           name: true,
           navPageSize: true,
         },
       });
+
+      const requestedNameSet = new Set(names);
+      const requestedNormalizedNameSet = new Set(normalizedNames);
+      collectionConfigs = allChannelCollections.filter((item) => {
+        const normalizedItemName = normalizeCollectionKey(item.name);
+        return requestedNameSet.has(item.name) || requestedNormalizedNameSet.has(normalizedItemName);
+      });
+
+      logger.info('[q_catalog] 合集配置原始读取结果(按频道)', {
+        channelId: channelIdRaw,
+        fetchedCount: allChannelCollections.length,
+        fetchedNames: allChannelCollections.map((item) => item.name),
+      });
     }
-    const collectionNavPageSizeMap = new Map(
-      collectionConfigs.map((item) => [item.name, Math.max(1, Math.min(100, Number(item.navPageSize ?? navPageSize)))]),
-    );
+
+    const collectionNavPageSizeMap = new Map<string, number>();
+    for (const item of collectionConfigs) {
+      const pageSize = Math.max(1, Math.min(100, Number(item.navPageSize ?? navPageSize)));
+      collectionNavPageSizeMap.set(item.name, pageSize);
+      collectionNavPageSizeMap.set(normalizeCollectionKey(item.name), pageSize);
+    }
+
     logger.info('[q_catalog] 合集分页配置命中情况', {
       channelId: channelIdRaw,
       collectionCount: names.length,
       matchedConfigCount: collectionConfigs.length,
       channelFallbackPageSize: navPageSize,
+      requestedNames: names,
+      normalizedNames,
       collectionConfigs,
+      querySummary: {
+        model: 'collection',
+        where: {
+          channelId,
+          mode: 'findMany(channelId)->memory_match(name|normalizedName)',
+          namesCount: names.length,
+          normalizedNamesCount: normalizedNames.length,
+        },
+      },
     });
 
     const collectionIndexItems: Array<{ text: string; url: string }> = [];
@@ -780,8 +816,13 @@ export async function handleCatalogJob(channelIdRaw: string) {
     for (let idx = 0; idx < names.length; idx += 1) {
       const name = names[idx];
       const episodes = (collectionGroups.get(name) ?? []).sort((a, b) => a.episodeNo - b.episodeNo);
-      const hasCollectionSpecificPageSize = collectionNavPageSizeMap.has(name);
-      const collectionDetailPageSize = collectionNavPageSizeMap.get(name) ?? Math.max(1, Math.min(100, navPageSize));
+      const normalizedName = collectionNameToNormalized.get(name) ?? normalizeCollectionKey(name);
+      const hasCollectionSpecificPageSize =
+        collectionNavPageSizeMap.has(name) || collectionNavPageSizeMap.has(normalizedName);
+      const collectionDetailPageSize =
+        collectionNavPageSizeMap.get(name) ??
+        collectionNavPageSizeMap.get(normalizedName) ??
+        Math.max(1, Math.min(100, navPageSize));
       logger.info('[q_catalog] 合集详情分页参数', {
         channelId: channelIdRaw,
         collectionName: name,
