@@ -61,6 +61,18 @@ export class MediaLifecycleController {
     return this.mediaLifecycleService.retryRelayBatch(ids ?? [], req.user.userId, req.user.role);
   }
 
+  @Permissions('media-lifecycle:update')
+  @Post(':id/mark-skip-missing')
+  markSkipMissing(@Param('id') id: string, @Request() req: AuthRequest) {
+    return this.mediaLifecycleService.markSkipMissing(id, req.user.userId, req.user.role);
+  }
+
+  @Permissions('media-lifecycle:update')
+  @Post(':id/revoke-skip-missing')
+  revokeSkipMissing(@Param('id') id: string, @Request() req: AuthRequest) {
+    return this.mediaLifecycleService.revokeSkipMissing(id, req.user.userId, req.user.role);
+  }
+
   @Permissions('media-lifecycle:delete')
   @Delete(':id')
   remove(@Param('id') id: string, @Query('force') force?: string, @Request() req?: AuthRequest) {

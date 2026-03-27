@@ -4,6 +4,7 @@ import {
   InternalServerErrorException,
   NotFoundException,
   BadRequestException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 import { access, unlink } from 'node:fs/promises';
@@ -193,6 +194,33 @@ export class MediaLifecycleService {
             const code = sourceMeta.ingestErrorCode;
             return typeof code === 'string' ? code : null;
           })(),
+        skipStatus:
+          (() => {
+            const value = sourceMeta.skipStatus;
+            return typeof value === 'string' ? value : null;
+          })(),
+        skipReason:
+          (() => {
+            const value = sourceMeta.skipReason;
+            return typeof value === 'string' ? value : null;
+          })(),
+        skipAt:
+          (() => {
+            const value = sourceMeta.skipAt;
+            return typeof value === 'string' ? value : null;
+          })(),
+        blockState:
+          (() => {
+            if (!isCollection) return null;
+            const skipStatus = typeof sourceMeta.skipStatus === 'string' ? sourceMeta.skipStatus : null;
+            if (skipStatus === 'skipped_missing') return 'unblocked';
+            if (asset.status === 'failed' || asset.status === 'deleted') {
+              const elapsedMs = Date.now() - new Date(asset.updatedAt).getTime();
+              if (Number.isFinite(elapsedMs) && elapsedMs < 5 * 60 * 1000) return 'waiting';
+              return 'blocked';
+            }
+            return null;
+          })(),
         canForceDelete:
           asset.status === 'ingesting' &&
           (() => {
@@ -332,7 +360,7 @@ export class MediaLifecycleService {
       return { ok: false, reason: 'only_failed_can_retry' };
     }
 
-    if (!this.isCooldownSatisfied(asset.updatedAt)) {
+    if (role !== 'admin' && !this.isCooldownSatisfied(asset.updatedAt)) {
       return { ok: false, reason: 'cooldown_not_reached' };
     }
 
@@ -370,7 +398,11 @@ export class MediaLifecycleService {
     const skippedIds: string[] = [];
 
     for (const asset of assets) {
-      if (asset.status !== 'failed' || !this.isCooldownSatisfied(asset.updatedAt)) {
+      if (asset.status !== 'failed') {
+        skippedIds.push(asset.id.toString());
+        continue;
+      }
+      if (role !== 'admin' && !this.isCooldownSatisfied(asset.updatedAt)) {
         skippedIds.push(asset.id.toString());
         continue;
       }
@@ -396,6 +428,96 @@ export class MediaLifecycleService {
       skipped: skippedIds.length,
       skippedIds,
     };
+  }
+
+  async markSkipMissing(id: string, userId?: string, role?: string) {
+    if (role !== 'admin') {
+      throw new ForbiddenException('仅管理员可执行该操作');
+    }
+
+    const asset = await this.prisma.mediaAsset.findFirst({
+      where: {
+        id: BigInt(id),
+        channel:
+          role === 'admin'
+            ? undefined
+            : {
+                createdBy: userId ? BigInt(userId) : undefined,
+              },
+      },
+      select: {
+        id: true,
+        sourceMeta: true,
+      },
+    });
+
+    if (!asset) throw new NotFoundException('media asset not found');
+
+    const sourceMeta =
+      asset.sourceMeta && typeof asset.sourceMeta === 'object'
+        ? (asset.sourceMeta as Record<string, unknown>)
+        : {};
+
+    if (sourceMeta.isCollection !== true) {
+      throw new BadRequestException('仅支持合集资源设置暂缺');
+    }
+
+    await this.prisma.mediaAsset.update({
+      where: { id: asset.id },
+      data: {
+        sourceMeta: {
+          ...sourceMeta,
+          skipStatus: 'skipped_missing',
+          skipReason: 'manual_skip_missing',
+          skipAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    return { ok: true };
+  }
+
+  async revokeSkipMissing(id: string, userId?: string, role?: string) {
+    if (role !== 'admin') {
+      throw new ForbiddenException('仅管理员可执行该操作');
+    }
+
+    const asset = await this.prisma.mediaAsset.findFirst({
+      where: {
+        id: BigInt(id),
+        channel:
+          role === 'admin'
+            ? undefined
+            : {
+                createdBy: userId ? BigInt(userId) : undefined,
+              },
+      },
+      select: {
+        id: true,
+        sourceMeta: true,
+      },
+    });
+
+    if (!asset) throw new NotFoundException('media asset not found');
+
+    const sourceMeta =
+      asset.sourceMeta && typeof asset.sourceMeta === 'object'
+        ? (asset.sourceMeta as Record<string, unknown>)
+        : {};
+
+    const nextMeta = { ...sourceMeta };
+    delete (nextMeta as Record<string, unknown>).skipStatus;
+    delete (nextMeta as Record<string, unknown>).skipReason;
+    delete (nextMeta as Record<string, unknown>).skipAt;
+
+    await this.prisma.mediaAsset.update({
+      where: { id: asset.id },
+      data: {
+        sourceMeta: nextMeta as any,
+      },
+    });
+
+    return { ok: true };
   }
 
   async remove(id: string, force = false, userId?: string, role?: string) {

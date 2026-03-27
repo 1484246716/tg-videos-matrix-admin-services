@@ -3,9 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/main.js",
+    "prisma:generate": "prisma generate --schema ../api/prisma/schema.prisma",
+    "dev": "pnpm run prisma:generate && ts-node-dev --respawn --transpile-only src/main.ts",
+    "build": "pnpm run prisma:generate && tsc -p tsconfig.json",
+    "start": "pnpm run prisma:generate && node dist/main.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "echo \"lint placeholder\"",

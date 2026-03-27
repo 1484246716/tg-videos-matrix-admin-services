@@ -1,7 +1,7 @@
 import { TaskStatus, CatalogTaskStatus } from '@prisma/client';
 import { CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED } from '../config/env';
 import { prisma } from '../infra/prisma';
-import { logError } from '../logger';
+import { logError, logger } from '../logger';
 import {
   editMessageTextByTelegram,
   pinMessageByTelegram,
@@ -661,7 +661,10 @@ export async function handleCatalogJob(channelIdRaw: string) {
     };
   });
 
-  const collectionGroups = new Map<string, Array<{ episodeNo: number; title: string; messageUrl: string }>>();
+  const collectionGroups = new Map<
+    string,
+    Array<{ episodeNo: number; title: string; messageUrl: string; isMissingPlaceholder?: boolean }>
+  >();
   for (const task of orderedDispatchTasks) {
     if (!task.telegramMessageLink) continue;
     const meta = parseCollectionMeta(task.mediaAsset?.sourceMeta);
@@ -678,10 +681,46 @@ export async function handleCatalogJob(channelIdRaw: string) {
     collectionGroups.set(meta.collectionName, group);
   }
 
+  const skippedCollectionAssets = await prisma.mediaAsset.findMany({
+    where: {
+      channelId,
+      AND: [
+        { sourceMeta: { path: ['isCollection'], equals: true } },
+        { sourceMeta: { path: ['skipStatus'], equals: 'skipped_missing' } },
+      ],
+    },
+    select: {
+      sourceMeta: true,
+    },
+  });
+
+  for (const asset of skippedCollectionAssets) {
+    const meta = parseCollectionMeta(asset.sourceMeta);
+    if (!meta || meta.episodeNo === null) continue;
+
+    const group = collectionGroups.get(meta.collectionName) ?? [];
+    const hasRealEpisode = group.some((item) => item.episodeNo === meta.episodeNo && !item.isMissingPlaceholder);
+    if (!hasRealEpisode) {
+      group.push({
+        episodeNo: meta.episodeNo,
+        title: `第${meta.episodeNo}集（暂缺）`,
+        messageUrl: '',
+        isMissingPlaceholder: true,
+      });
+      collectionGroups.set(meta.collectionName, group);
+    }
+  }
+
   const navPageSize = Math.max(1, Math.min(100, (channel as any).navPageSize ?? 10));
   const navPagingEnabled = typeof (channel as any).navPagingEnabled === 'boolean'
     ? (channel as any).navPagingEnabled
     : false;
+  logger.info('[q_catalog] 主目录分页参数', {
+    channelId: channelIdRaw,
+    navPagingEnabled,
+    channelNavPageSize: navPageSize,
+    regularVideoCount: videos.length,
+  });
   const videoPages = navPagingEnabled ? chunkVideos(videos, navPageSize) : [videos];
   const pageContents = videoPages.map((pageVideos, index) =>
     renderCatalogPageContent({
@@ -706,13 +745,50 @@ export async function handleCatalogJob(channelIdRaw: string) {
     const detailPageMessageIds: Record<string, number[]> = {};
 
     const collectionIndexPageSize = Math.max(1, Math.min(50, Number(channelAny.collection_index_page_size ?? 20)));
-    const collectionDetailPageSize = Math.max(1, Math.min(100, navPageSize));
+
+    let collectionConfigs: Array<{ name: string; navPageSize: number | null }> = [];
+    const collectionModel = (prisma as any).collection;
+    if (!collectionModel) {
+      logger.warn('[q_catalog] Prisma collection 模型缺失，跳过合集配置读取', {
+        channelId: channelIdRaw,
+      });
+    } else {
+      collectionConfigs = await collectionModel.findMany({
+        where: {
+          channelId,
+          name: { in: names },
+        },
+        select: {
+          name: true,
+          navPageSize: true,
+        },
+      });
+    }
+    const collectionNavPageSizeMap = new Map(
+      collectionConfigs.map((item) => [item.name, Math.max(1, Math.min(100, Number(item.navPageSize ?? navPageSize)))]),
+    );
+    logger.info('[q_catalog] 合集分页配置命中情况', {
+      channelId: channelIdRaw,
+      collectionCount: names.length,
+      matchedConfigCount: collectionConfigs.length,
+      channelFallbackPageSize: navPageSize,
+      collectionConfigs,
+    });
 
     const collectionIndexItems: Array<{ text: string; url: string }> = [];
 
     for (let idx = 0; idx < names.length; idx += 1) {
       const name = names[idx];
       const episodes = (collectionGroups.get(name) ?? []).sort((a, b) => a.episodeNo - b.episodeNo);
+      const hasCollectionSpecificPageSize = collectionNavPageSizeMap.has(name);
+      const collectionDetailPageSize = collectionNavPageSizeMap.get(name) ?? Math.max(1, Math.min(100, navPageSize));
+      logger.info('[q_catalog] 合集详情分页参数', {
+        channelId: channelIdRaw,
+        collectionName: name,
+        episodeCount: episodes.length,
+        collectionDetailPageSize,
+        source: hasCollectionSpecificPageSize ? 'collection.navPageSize' : 'channel.navPageSize_fallback',
+      });
       const episodePages = chunkVideos(episodes, collectionDetailPageSize);
       const existingDetailPages = existingNavState.detailPageMessageIds[name] ?? [];
       const publishedDetailPages: number[] = [];
@@ -723,6 +799,11 @@ export async function handleCatalogJob(channelIdRaw: string) {
         const pageLines = episodePages[pageIndex].map((ep) => {
           const displayTitle = getFileStem(ep.title).trim();
           const safeTitle = escapeHtml(displayTitle || `第${ep.episodeNo}集`);
+
+          if (ep.isMissingPlaceholder || !ep.messageUrl) {
+            return safeTitle;
+          }
+
           const safeUrl = escapeHtml(ep.messageUrl);
           return `<a href="${safeUrl}">${safeTitle}</a>`;
         });

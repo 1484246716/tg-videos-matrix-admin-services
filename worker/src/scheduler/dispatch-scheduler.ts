@@ -11,6 +11,8 @@ import { updateTaskDefinitionRunStatus } from '../services/task-definition.servi
 
 const DISPATCH_HEAD_BYPASS_RETRY_THRESHOLD = 2;
 const DISPATCH_HEAD_BYPASS_DELAY_SEC = 10 * 60;
+const COLLECTION_SKIP_GRACE_MS = 5 * 60 * 1000;
+const COLLECTION_SKIP_REASON = 'auto_skip_missing_after_grace';
 
 function computeDispatchNextAllowedAt(args: {
   lastPostAt: Date | null;
@@ -85,6 +87,7 @@ async function canDispatchCollectionEpisode(args: {
   channelId: bigint;
   collectionName: string;
   episodeNo: number;
+  now: Date;
 }) {
   const collectionAssets = await prisma.mediaAsset.findMany({
     where: {
@@ -97,15 +100,19 @@ async function canDispatchCollectionEpisode(args: {
     select: {
       id: true,
       sourceMeta: true,
+      status: true,
+      updatedAt: true,
     },
   });
 
   const prevEpisodes = collectionAssets
-    .map((asset) => ({ id: asset.id, meta: parseCollectionMeta(asset.sourceMeta) }))
+    .map((asset) => ({ id: asset.id, meta: parseCollectionMeta(asset.sourceMeta), status: asset.status, updatedAt: asset.updatedAt }))
     .filter((item) => item.meta && !item.meta.episodeParseFailed && item.meta.episodeNo !== null)
     .filter((item) => (item.meta?.episodeNo ?? 0) < args.episodeNo) as Array<{
     id: bigint;
     meta: { collectionName: string; episodeNo: number | null; episodeParseFailed: boolean };
+    status: MediaStatus;
+    updatedAt: Date;
   }>;
 
   if (prevEpisodes.length === 0) {
@@ -124,8 +131,52 @@ async function canDispatchCollectionEpisode(args: {
   });
 
   const successSet = new Set(successRows.map((row) => row.mediaAssetId.toString()));
+
+  for (const prev of prevEpisodes) {
+    if (successSet.has(prev.id.toString())) continue;
+
+    const isFailedOrDeleted = prev.status === MediaStatus.failed || prev.status === MediaStatus.deleted;
+    if (!isFailedOrDeleted) continue;
+
+    const elapsedMs = args.now.getTime() - prev.updatedAt.getTime();
+    if (Number.isFinite(elapsedMs) && elapsedMs >= COLLECTION_SKIP_GRACE_MS) {
+      const sourceMeta = collectionAssets.find((asset) => asset.id === prev.id)?.sourceMeta;
+      const metaObj = sourceMeta && typeof sourceMeta === 'object'
+        ? (sourceMeta as Record<string, unknown>)
+        : {};
+
+      await prisma.mediaAsset.update({
+        where: { id: prev.id },
+        data: {
+          sourceMeta: {
+            ...metaObj,
+            skipStatus: 'skipped_missing',
+            skipReason: COLLECTION_SKIP_REASON,
+            skipAt: args.now.toISOString(),
+          },
+        },
+      });
+    }
+  }
+
+  const refreshedAssets = await prisma.mediaAsset.findMany({
+    where: { id: { in: prevEpisodeAssetIds } },
+    select: { id: true, sourceMeta: true },
+  });
+
+  const skippedSet = new Set(
+    refreshedAssets
+      .filter((asset) => {
+        const meta = asset.sourceMeta && typeof asset.sourceMeta === 'object'
+          ? (asset.sourceMeta as Record<string, unknown>)
+          : {};
+        return meta.skipStatus === 'skipped_missing';
+      })
+      .map((asset) => asset.id.toString()),
+  );
+
   const blocked = prevEpisodes
-    .filter((item) => !successSet.has(item.id.toString()))
+    .filter((item) => !successSet.has(item.id.toString()) && !skippedSet.has(item.id.toString()))
     .sort((a, b) => (a.meta.episodeNo ?? 0) - (b.meta.episodeNo ?? 0))[0];
 
   if (!blocked) {
@@ -239,6 +290,7 @@ export async function scheduleDueDispatchTasks() {
         channelId: task.channelId,
         collectionName: collectionMeta.collectionName,
         episodeNo: collectionMeta.episodeNo,
+        now,
       });
 
       if (!gateResult.allowed) {

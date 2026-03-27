@@ -55,6 +55,38 @@ export class CollectionService {
   }
 
   private toResponse(row: any) {
+    const episodes = Array.isArray(row.episodes) ? row.episodes : [];
+    const now = Date.now();
+
+    const blockedEpisode = episodes
+      .map((ep: any) => {
+        const sourceMeta = ep?.mediaAsset?.sourceMeta && typeof ep.mediaAsset.sourceMeta === 'object'
+          ? (ep.mediaAsset.sourceMeta as Record<string, unknown>)
+          : {};
+        const skipStatus = typeof sourceMeta.skipStatus === 'string' ? sourceMeta.skipStatus : null;
+        const isSkippedMissing = skipStatus === 'skipped_missing';
+        const dispatchTasks = Array.isArray(ep?.mediaAsset?.dispatchTasks) ? ep.mediaAsset.dispatchTasks : [];
+        const hasSuccess = dispatchTasks.some((t: any) => t.status === 'success');
+        const blocked = !isSkippedMissing && !hasSuccess;
+        return {
+          episodeNo: ep.episodeNo as number,
+          blocked,
+          isSkippedMissing,
+          skipReason: typeof sourceMeta.skipReason === 'string' ? sourceMeta.skipReason : null,
+          skipAt: typeof sourceMeta.skipAt === 'string' ? sourceMeta.skipAt : null,
+          mediaUpdatedAt: ep?.mediaAsset?.updatedAt ? new Date(ep.mediaAsset.updatedAt).getTime() : null,
+          mediaAssetId: ep?.mediaAsset?.id ? String(ep.mediaAsset.id) : null,
+        };
+      })
+      .filter((item) => item.blocked)
+      .sort((a, b) => a.episodeNo - b.episodeNo)[0];
+
+    const blockState = blockedEpisode ? 'blocked' : 'unblocked';
+    const waitingPrevEpisodeNo = blockedEpisode?.episodeNo ?? null;
+    const blockedDurationSec = blockedEpisode?.mediaUpdatedAt
+      ? Math.max(0, Math.floor((now - blockedEpisode.mediaUpdatedAt) / 1000))
+      : null;
+
     return {
       ...row,
       id: row.id.toString(),
@@ -66,6 +98,12 @@ export class CollectionService {
           }
         : undefined,
       _count: row._count,
+      blockState,
+      blockReason: blockedEpisode ? `等待前序集 ${blockedEpisode.episodeNo}` : null,
+      waitingPrevEpisodeNo,
+      currentEpisodeNo: null,
+      blockingTaskId: blockedEpisode?.mediaAssetId ?? null,
+      blockedDurationSec,
     };
   }
 
@@ -75,6 +113,23 @@ export class CollectionService {
       include: {
         channel: { select: { id: true, name: true } },
         _count: { select: { episodes: true } },
+        episodes: {
+          select: {
+            episodeNo: true,
+            mediaAsset: {
+              select: {
+                id: true,
+                updatedAt: true,
+                sourceMeta: true,
+                dispatchTasks: {
+                  select: { status: true },
+                  where: { status: 'success' },
+                  take: 1,
+                },
+              },
+            },
+          },
+        },
       },
     });
 

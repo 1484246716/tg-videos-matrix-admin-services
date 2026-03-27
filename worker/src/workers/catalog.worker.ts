@@ -25,8 +25,14 @@ catalogWorker.on('completed', (job) => {
 });
 
 catalogWorker.on('failed', (job, err) => {
-  logError('[q_catalog] 任务失败', {
+  logger.error('[q_catalog] 任务失败', {
     jobId: job?.id ? String(job.id) : null,
-    error: err,
+    jobName: job?.name ?? null,
+    channelIdRaw: (job?.data as any)?.channelIdRaw ?? null,
+    errName: err?.name ?? null,
+    errMessage: err?.message ?? null,
+    errStack: err?.stack ?? null,
   });
+
+  logError('[q_catalog] 任务失败(兼容日志)', err);
 });
