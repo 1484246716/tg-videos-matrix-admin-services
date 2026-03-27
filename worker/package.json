@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "prisma:generate": "prisma generate --schema ../api/prisma/schema.prisma",
-    "prisma:generate:safe": "prisma generate --schema ../api/prisma/schema.prisma || (echo [worker] prisma generate skipped: engine file is locked by another running process. & echo [worker] stop api/worker processes then run pnpm run prisma:generate once.)",
+    "prisma:generate": "prisma generate --schema ../api/prisma/schema.prisma && node scripts/sync-prisma-client.js",
+    "prisma:generate:safe": "prisma generate --schema ../api/prisma/schema.prisma && node scripts/sync-prisma-client.js || (echo [worker] prisma generate skipped: engine file is locked by another running process. & echo [worker] stop api/worker processes then run pnpm run prisma:generate once.)",
     "dev": "pnpm run prisma:generate:safe && ts-node-dev --respawn --transpile-only src/main.ts",
     "build": "pnpm run prisma:generate && tsc -p tsconfig.json",
     "start": "pnpm run prisma:generate && node dist/main.js",

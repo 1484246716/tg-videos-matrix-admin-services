@@ -1,5 +1,5 @@
 import '../config/env';
-import { catalogQueue, dispatchQueue, relayUploadQueue, massMessageQueue } from '../infra/redis';
+import { catalogQueue, dispatchQueue, relayUploadQueue, massMessageQueue, searchIndexQueue } from '../infra/redis';
 import { ensureWorkerPrismaModels, logWorkerDatabaseFingerprint } from '../infra/prisma';
 import { logger, logError } from '../logger';
 import { telegramApiBase } from '../config/env';
@@ -12,6 +12,7 @@ import '../workers/dispatch.worker';
 import '../workers/relay-upload.worker';
 import '../workers/catalog.worker';
 import '../workers/mass-message.worker';
+import '../workers/search-index.worker';
 
 async function drainStaleRelayJobs() {
   logger.info('[bootstrap] 正在清理过期的中转上传任务...');
@@ -70,6 +71,12 @@ export async function bootstrapWorker() {
     { removeOnComplete: true, removeOnFail: 100 },
   );
 
+  await searchIndexQueue.add(
+    'bootstrap-check',
+    { source: 'worker_startup', timestamp: new Date().toISOString() },
+    { removeOnComplete: true, removeOnFail: 100 },
+  );
+
   await drainStaleRelayJobs();
 
   logger.info('[bootstrap] Telegram API 地址', { telegramApiBase });
@@ -95,6 +102,6 @@ export async function bootstrapWorker() {
   }, 5000);
 
   logger.info(
-    'Worker 已启动，队列：q_dispatch + q_relay_upload + q_catalog + q_mass_message，任务调度已启用',
+    'Worker 已启动，队列：q_dispatch + q_relay_upload + q_catalog + q_mass_message + q_search_index，任务调度已启用',
   );
 }

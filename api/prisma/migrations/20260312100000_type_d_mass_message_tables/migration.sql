@@ -1,0 +1,3 @@
+-- This migration was applied directly to the database.
+-- Placeholder file to keep Prisma migration history in sync.
+-- Original: Type D mass message tables

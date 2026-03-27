@@ -17,6 +17,7 @@ import { MessageTemplateModule } from './message-template/message-template.modul
 import { MassMessageCampaignModule } from './mass-message-campaign/mass-message-campaign.module';
 import { MassMessageItemModule } from './mass-message-item/mass-message-item.module';
 import { CollectionModule } from './collection/collection.module';
+import { SearchModule } from './search/search.module';
 
 @Module({
   imports: [
@@ -41,6 +42,7 @@ import { CollectionModule } from './collection/collection.module';
     MassMessageCampaignModule,
     MassMessageItemModule,
     CollectionModule,
+    SearchModule,
   ],
 })
 export class AppModule { }

@@ -2,6 +2,7 @@ import { TaskStatus } from '@prisma/client';
 import { generateTextWithAiProfile } from '../ai-provider';
 import { DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED } from '../config/env';
 import { prisma } from '../infra/prisma';
+import { searchIndexQueue } from '../infra/redis';
 import { logger, logError } from '../logger';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
 import { sendVideoByTelegram, TelegramError } from '../shared/telegram';
@@ -337,11 +338,28 @@ export async function handleDispatchJob(
       },
     });
 
+    // ── 触发搜索索引更新（延迟2秒等AI caption等后续处理完成）──
+    try {
+      await searchIndexQueue.add('upsert', {
+        sourceType: 'dispatch_task',
+        sourceId: task.id.toString(),
+        mediaAssetId: task.mediaAsset.id.toString(),
+        channelId: task.channelId.toString(),
+      }, {
+        delay: 2000,
+        jobId: `search-index-asset-${task.mediaAsset.id}`,
+      });
+    } catch (indexErr) {
+      // 搜索索引失败不阻塞主流程
+      logError('[q_dispatch] 搜索索引入队失败（不阻塞）', { error: indexErr });
+    }
+
     return {
       ok: true,
       dispatchTaskId: dispatchTaskIdRaw,
       messageId: sendResult.messageId,
     };
+
   } catch (error) {
     const nextRetryCount = task.retryCount + 1;
     const now = new Date();

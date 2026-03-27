@@ -24,3 +24,6 @@ export const massMessageQueue = new Queue('q_mass_message', {
 export const backfillQueue = new Queue('q_relay_fileid_backfill', {
   connection: connection as any,
 });
+export const searchIndexQueue = new Queue('q_search_index', {
+  connection: connection as any,
+});

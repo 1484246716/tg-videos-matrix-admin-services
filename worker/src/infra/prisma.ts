@@ -61,6 +61,10 @@ export function ensureWorkerPrismaModels() {
   if (!(prisma as any).collection) {
     logger.warn('[bootstrap] Prisma collection 模型缺失，合集配置将退回频道级分页');
   }
+
+  if (!(prisma as any).searchDocument) {
+    logger.warn('[bootstrap] Prisma searchDocument 模型缺失，搜索索引功能不可用。请运行 pnpm run prisma:generate');
+  }
 }
 
 export function getTaskDefinitionModel() {

@@ -565,3 +565,72 @@ enum MassMessageItemStatus {
   cancelled
   dead
 }
+
+// ─── 搜索索引层 ─────────────────────────────────────────────────
+
+model SearchDocument {
+  id              BigInt    @id @default(autoincrement())
+  docId           String    @unique @map("doc_id") @db.VarChar(128)
+  docType         String    @map("doc_type") @db.VarChar(32)
+  schemaVersion   Int       @default(1) @map("schema_version")
+
+  channelId       BigInt    @map("channel_id")
+  collectionId    BigInt?   @map("collection_id")
+  mediaAssetId    BigInt?   @map("media_asset_id")
+  episodeId       BigInt?   @map("episode_id")
+
+  title           String    @db.VarChar(255)
+  originalTitle   String?   @map("original_title") @db.VarChar(255)
+  aliases         String[]  @default([])
+  actors          String[]  @default([])
+  directors       String[]  @default([])
+  genres          String[]  @default([])
+  keywords        String[]  @default([])
+
+  year            Int?
+  region          String?   @db.VarChar(64)
+  language        String?   @db.VarChar(64)
+  description     String?
+
+  searchText      String    @map("search_text")
+  // 注意：tsvector 不被 Prisma 原生支持，通过迁移后手动 SQL 追加
+
+  telegramMessageLink String?  @map("telegram_message_link") @db.VarChar(512)
+  telegramMessageId   BigInt?  @map("telegram_message_id")
+  publishedAt         DateTime? @map("published_at") @db.Timestamptz(6)
+
+  qualityScore    Decimal   @default(1.0) @map("quality_score") @db.Decimal(8, 4)
+  popularityScore Decimal   @default(0) @map("popularity_score") @db.Decimal(8, 4)
+  manualWeight    Decimal   @default(1.0) @map("manual_weight") @db.Decimal(8, 4)
+
+  visibility      String    @default("public") @db.VarChar(32)
+  isActive        Boolean   @default(true) @map("is_active")
+  isDeleted       Boolean   @default(false) @map("is_deleted")
+
+  ext             Json?
+
+  sourceUpdatedAt DateTime  @map("source_updated_at") @db.Timestamptz(6)
+  indexedAt       DateTime  @default(now()) @map("indexed_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([channelId, isActive, isDeleted])
+  @@index([updatedAt(sort: Desc)])
+  @@map("search_documents")
+}
+
+model SearchIndexOutbox {
+  id          BigInt    @id @default(autoincrement())
+  docId       String    @map("doc_id") @db.VarChar(128)
+  op          String    @db.VarChar(16)
+  payload     Json?
+  attempt     Int       @default(0)
+  status      String    @default("pending") @db.VarChar(16)
+  nextRetryAt DateTime? @map("next_retry_at") @db.Timestamptz(6)
+  lastError   String?   @map("last_error")
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([status, nextRetryAt, createdAt])
+  @@map("search_index_outbox")
+}

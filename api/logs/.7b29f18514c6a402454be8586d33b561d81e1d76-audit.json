@@ -1,0 +1,55 @@
+{
+    "keep": {
+        "days": true,
+        "amount": 14
+    },
+    "auditLog": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\.7b29f18514c6a402454be8586d33b561d81e1d76-audit.json",
+    "files": [
+        {
+            "date": 1773884458315,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-03-19.log",
+            "hash": "29d64b11d362364fc6d3fb0439091fd7db0667115e853a6aeceb539f01768389"
+        },
+        {
+            "date": 1773998955359,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-03-20.log",
+            "hash": "19003db418331ce931dc6821b3c0b9c5bf7b94c025ea7c8071dc0d06838fe51c"
+        },
+        {
+            "date": 1774055021186,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-03-21.log",
+            "hash": "4299c82777a346295d06e91c71d378641fae3fedebd6ee15d7eadad226518bee"
+        },
+        {
+            "date": 1774142494796,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-03-22.log",
+            "hash": "1770cc76d8fc51144e3103ac55a1179b9d8b050cb7847df3b40c6a92866800ac"
+        },
+        {
+            "date": 1774206608770,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-03-23.log",
+            "hash": "e49a6463a9970f935dcfa6728c4358e328c710d7927b78026242a382b63e0471"
+        },
+        {
+            "date": 1774323254793,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-03-24.log",
+            "hash": "38c29945769b0581782f300c2f5c827d435375f34b249869cc700a6bd9a66b0e"
+        },
+        {
+            "date": 1774405281053,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-03-25.log",
+            "hash": "1a65490034eb110fe1ad15aa204d65c47dba5a8b8c0390ff945c826502a97066"
+        },
+        {
+            "date": 1774489049196,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-03-26.log",
+            "hash": "f389293e6a31fe512e493986780be73f0e2a9410981923a8a01cb8f9d408b3e2"
+        },
+        {
+            "date": 1774573870561,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-03-27.log",
+            "hash": "e0707ccc08ff19e3c2cd454472e54b86f41b7af12c23c6b49cfdeacea9f381fc"
+        }
+    ],
+    "hashType": "sha256"
+}
