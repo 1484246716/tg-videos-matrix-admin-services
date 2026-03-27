@@ -1,4 +1,6 @@
 import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
+import { Queue } from 'bullmq';
+import IORedis from 'ioredis';
 import { mkdir, rm } from 'node:fs/promises';
 import { normalize, resolve } from 'node:path';
 import { PrismaService } from '../prisma/prisma.service';
@@ -14,6 +16,24 @@ type SaveCollectionDto = {
   navPageSize: number;
   templateText?: string;
 };
+
+let searchIndexQueue: Queue | null = null;
+
+function getSearchIndexQueue() {
+  if (searchIndexQueue) return searchIndexQueue;
+
+  const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+  const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+  connection.on('error', (error) => {
+    console.error('[redis] collection search-index redis error:', error?.message ?? error);
+  });
+
+  searchIndexQueue = new Queue('q_search_index', {
+    connection: connection as any,
+  });
+
+  return searchIndexQueue;
+}
 
 @Injectable()
 export class CollectionService {
@@ -166,6 +186,12 @@ export class CollectionService {
       },
     });
 
+    await this.enqueueSearchIndexJob({
+      sourceType: 'collection',
+      sourceId: created.id.toString(),
+      channelId: created.channelId.toString(),
+    });
+
     return this.toResponse(created);
   }
 
@@ -213,6 +239,12 @@ export class CollectionService {
       },
     });
 
+    await this.enqueueSearchIndexJob({
+      sourceType: 'collection',
+      sourceId: updated.id.toString(),
+      channelId: updated.channelId.toString(),
+    });
+
     return this.toResponse(updated);
   }
 
@@ -239,11 +271,35 @@ export class CollectionService {
         collectionName: existing.name,
       });
 
+      await this.enqueueSearchIndexJob({
+        sourceType: 'collection',
+        sourceId: existing.id.toString(),
+        action: 'delete',
+      });
+
       return { ok: true };
     } catch (error) {
       throw new InternalServerErrorException(
         `删除合集失败: ${error instanceof Error ? error.message : 'unknown_error'}`,
       );
+    }
+  }
+
+  private async enqueueSearchIndexJob(payload: {
+    sourceType: string;
+    sourceId: string;
+    channelId?: string;
+    action?: 'upsert' | 'delete';
+  }) {
+    try {
+      const queue = getSearchIndexQueue();
+      await queue.add('upsert', payload, {
+        jobId: `search-index-${payload.sourceType}-${payload.sourceId}`,
+        removeOnComplete: true,
+        removeOnFail: 200,
+      });
+    } catch (error) {
+      console.error('[collection] 搜索索引入队失败（不阻塞）', error);
     }
   }
 }

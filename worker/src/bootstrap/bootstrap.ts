@@ -7,6 +7,7 @@ import { scheduleEnabledTaskDefinitions } from '../scheduler/task-definition-sch
 import { scheduleDueMassMessageItems } from '../scheduler/mass-message-scheduler';
 import { reconcileTypeAStuckAssets } from '../services/typea-reconcile.service';
 import { auditTypeAHealth } from '../services/typea-audit.service';
+import { enqueueChangedCollectionEpisodes } from '../services/search-index-trigger.service';
 import { TYPEA_RECONCILE_ENABLED } from '../config/env';
 import '../workers/dispatch.worker';
 import '../workers/relay-upload.worker';
@@ -99,6 +100,10 @@ export async function bootstrapWorker() {
         logError('[scheduler:typea-audit] 巡检快照异常', err);
       });
     }
+
+    void enqueueChangedCollectionEpisodes().catch((err) => {
+      logError('[scheduler:search-index-episodes] 变更扫描异常', err);
+    });
   }, 5000);
 
   logger.info(

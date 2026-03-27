@@ -1,63 +1,82 @@
 import { Injectable } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { SearchIndexerService } from './search-indexer.service';
 
 export interface SearchQueryDto {
   keyword: string;
   channelIds?: string[];
   limit?: number;
   offset?: number;
-}
-
-export interface SearchResultItem {
-  docId: string;
-  docType: string;
-  title: string;
-  originalTitle: string | null;
-  actors: string[];
-  year: number | null;
-  region: string | null;
-  description: string | null;
-  telegramMessageLink: string | null;
-  telegramMessageId: string | null;
-  publishedAt: Date | null;
-  qualityScore: number;
-  popularityScore: number;
-  collectionId: string | null;
-  channelId: string;
+  userId?: string;
+  role?: string;
+  fallbackToDb?: boolean;
 }
 
 @Injectable()
 export class SearchService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly searchIndexerService: SearchIndexerService,
+  ) {}
 
   async search(query: SearchQueryDto) {
-    const { keyword, channelIds, limit = 20, offset = 0 } = query;
+    const { keyword, channelIds, userId, role, fallbackToDb = true } = query;
+    const limit = this.sanitizeNumber(query.limit, 20, 1, 50);
+    const offset = this.sanitizeNumber(query.offset, 0, 0, 100000);
 
     if (!keyword || keyword.trim().length < 2) {
-      return { results: [], total: 0, hasMore: false };
+      return { results: [], total: 0, hasMore: false, route: 'db' as const };
+    }
+
+    if (!fallbackToDb) {
+      const openSearchResult = await this.searchIndexerService.searchViaReadAlias({
+        keyword: keyword.trim(),
+        channelIds: await this.resolveAllowedChannelIds({ channelIds, userId, role }),
+        limit,
+        offset,
+      });
+
+      if (openSearchResult.enabled) {
+        return {
+          results: openSearchResult.results,
+          total: openSearchResult.total,
+          hasMore: offset + openSearchResult.results.length < openSearchResult.total,
+          route: 'search-engine' as const,
+        };
+      }
+
+      return { results: [], total: 0, hasMore: false, route: 'search-engine' as const };
     }
 
     const trimmed = keyword.trim();
-    const effectiveLimit = Math.min(limit, 50);
+    const effectiveChannelIds = await this.resolveAllowedChannelIds({ channelIds, userId, role });
 
-    // 构建频道过滤
-    const channelFilter = channelIds?.length
-      ? channelIds.map(id => BigInt(id))
-      : null;
-
-    // 如果没有指定频道，搜索所有活跃频道
-    const activeChannelIds = channelFilter ?? (await this.getActiveChannelIds());
-
-    if (activeChannelIds.length === 0) {
-      return { results: [], total: 0, hasMore: false };
+    if (effectiveChannelIds.length === 0) {
+      return { results: [], total: 0, hasMore: false, route: 'db' as const };
     }
 
-    const results = await this.prisma.$queryRaw<any[]>`
+    const titleContains = `%${trimmed}%`;
+
+    const whereSql = Prisma.sql`
+      is_active = true
+      AND is_deleted = false
+      AND channel_id = ANY(${effectiveChannelIds}::bigint[])
+      AND (
+        search_tsv @@ plainto_tsquery('simple', ${trimmed})
+        OR title ILIKE ${titleContains}
+        OR EXISTS (SELECT 1 FROM unnest(aliases) AS alias WHERE alias ILIKE ${titleContains})
+        OR EXISTS (SELECT 1 FROM unnest(actors) AS actor WHERE actor ILIKE ${titleContains})
+      )
+    `;
+
+    const rows = await this.prisma.$queryRaw<any[]>(Prisma.sql`
       SELECT
         doc_id AS "docId",
         doc_type AS "docType",
         title,
         original_title AS "originalTitle",
+        aliases,
         actors,
         year,
         region,
@@ -67,29 +86,17 @@ export class SearchService {
         published_at AS "publishedAt",
         quality_score::float AS "qualityScore",
         popularity_score::float AS "popularityScore",
+        manual_weight::float AS "manualWeight",
         collection_id::text AS "collectionId",
         channel_id::text AS "channelId"
       FROM search_documents
-      WHERE is_active = true
-        AND is_deleted = false
-        AND channel_id = ANY(${activeChannelIds}::bigint[])
-        AND (
-          search_tsv @@ plainto_tsquery('simple', ${trimmed})
-          OR title ILIKE ${'%' + trimmed + '%'}
-          OR EXISTS (
-            SELECT 1 FROM unnest(aliases) AS alias
-            WHERE alias ILIKE ${'%' + trimmed + '%'}
-          )
-          OR EXISTS (
-            SELECT 1 FROM unnest(actors) AS actor
-            WHERE actor ILIKE ${'%' + trimmed + '%'}
-          )
-        )
+      WHERE ${whereSql}
       ORDER BY
-        CASE WHEN title ILIKE ${trimmed} THEN 0
-             WHEN title ILIKE ${trimmed + '%'} THEN 1
-             WHEN title ILIKE ${'%' + trimmed + '%'} THEN 2
-             ELSE 3
+        CASE
+          WHEN title ILIKE ${trimmed} THEN 0
+          WHEN title ILIKE ${`${trimmed}%`} THEN 1
+          WHEN title ILIKE ${titleContains} THEN 2
+          ELSE 3
         END ASC,
         (
           COALESCE(ts_rank(search_tsv, plainto_tsquery('simple', ${trimmed})), 0) * 0.65
@@ -98,72 +105,103 @@ export class SearchService {
           + COALESCE(manual_weight, 1.0) * 0.05
         ) DESC,
         published_at DESC NULLS LAST
-      LIMIT ${effectiveLimit}
+      LIMIT ${limit}
       OFFSET ${offset}
-    `;
+    `);
 
-    const countResult = await this.prisma.$queryRaw<[{ count: bigint }]>`
-      SELECT COUNT(*) as count
+    const countRows = await this.prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+      SELECT COUNT(*)::bigint AS count
       FROM search_documents
-      WHERE is_active = true
-        AND is_deleted = false
-        AND channel_id = ANY(${activeChannelIds}::bigint[])
-        AND (
-          search_tsv @@ plainto_tsquery('simple', ${trimmed})
-          OR title ILIKE ${'%' + trimmed + '%'}
-          OR EXISTS (
-            SELECT 1 FROM unnest(aliases) AS alias
-            WHERE alias ILIKE ${'%' + trimmed + '%'}
-          )
-          OR EXISTS (
-            SELECT 1 FROM unnest(actors) AS actor
-            WHERE actor ILIKE ${'%' + trimmed + '%'}
-          )
-        )
-    `;
+      WHERE ${whereSql}
+    `);
 
-    const total = Number(countResult[0]?.count ?? 0);
+    const total = Number(countRows[0]?.count ?? 0);
 
     return {
-      results,
+      results: rows,
       total,
-      hasMore: offset + results.length < total,
+      hasMore: offset + rows.length < total,
+      route: 'db' as const,
     };
   }
 
-  /** 获取搜索索引统计信息 */
   async getStats() {
     const [totalDocs, activeByType, outboxStats] = await Promise.all([
       this.prisma.searchDocument.count(),
       this.prisma.searchDocument.groupBy({
         by: ['docType'],
         where: { isActive: true, isDeleted: false },
-        _count: true,
+        _count: { _all: true },
       }),
       this.prisma.searchIndexOutbox.groupBy({
         by: ['status'],
-        _count: true,
+        _count: { _all: true },
       }),
     ]);
 
     return {
       totalDocuments: totalDocs,
-      activeByType: activeByType.map(g => ({
+      activeByType: activeByType.map((g) => ({
         docType: g.docType,
-        count: g._count,
+        count: g._count._all,
       })),
-      outbox: outboxStats.map(g => ({
+      outbox: outboxStats.map((g) => ({
         status: g.status,
-        count: g._count,
+        count: g._count._all,
       })),
     };
   }
 
-  private async getActiveChannelIds(): Promise<bigint[]> {
-    const channels = await this.prisma.channel.findMany({
-      where: { status: 'active' },
+  async processOutbox(limit?: number) {
+    return this.searchIndexerService.processBatch(this.sanitizeNumber(limit, 50, 1, 200));
+  }
+
+  async initOpenSearch() {
+    return this.searchIndexerService.initializeOpenSearchIndex();
+  }
+
+  async switchOpenSearchAliases(targetIndex: string) {
+    return this.searchIndexerService.switchAliases(targetIndex);
+  }
+
+  private sanitizeNumber(value: number | undefined, fallback: number, min: number, max: number) {
+    if (typeof value !== 'number' || Number.isNaN(value)) return fallback;
+    return Math.min(max, Math.max(min, Math.trunc(value)));
+  }
+
+  private async resolveAllowedChannelIds(args: {
+    channelIds?: string[];
+    userId?: string;
+    role?: string;
+  }): Promise<bigint[]> {
+    const requested = (args.channelIds || [])
+      .map((id) => id.trim())
+      .filter(Boolean)
+      .map((id) => BigInt(id));
+
+    // admin 可查任意频道（若传 channelIds 则按传入过滤）
+    if (args.role === 'admin') {
+      if (requested.length > 0) return requested;
+      const channels = await this.prisma.channel.findMany({
+        where: { status: 'active' },
+        select: { id: true },
+      });
+      return channels.map((c) => c.id);
+    }
+
+    const userOwned = await this.prisma.channel.findMany({
+      where: {
+        status: 'active',
+        createdBy: args.userId ? BigInt(args.userId) : undefined,
+      },
       select: { id: true },
     });
-    return channels.map(c => c.id);
+
+    const userOwnedSet = new Set(userOwned.map((c) => c.id.toString()));
+    if (requested.length === 0) {
+      return userOwned.map((c) => c.id);
+    }
+
+    return requested.filter((id) => userOwnedSet.has(id.toString()));
   }
 }

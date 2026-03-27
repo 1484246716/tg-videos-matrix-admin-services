@@ -19,6 +19,7 @@
     "@nestjs/jwt": "^11.0.2",
     "@nestjs/passport": "^11.0.5",
     "@nestjs/platform-express": "^10.4.15",
+    "@opensearch-project/opensearch": "^3.5.1",
     "@prisma/client": "6.19.2",
     "bcryptjs": "^3.0.3",
     "bullmq": "^5.8.4",

@@ -148,6 +148,26 @@ services:
       - ./data/tg-bot-api:/var/lib/telegram-bot-api
       - ./data/tg-bot-api-tmp:/var/lib/telegram-bot-api/tmp
 
+  ffprobe:
+    image: jrottenberg/ffmpeg:6.1-alpine
+    container_name: tg-crm-ffprobe
+    restart: unless-stopped
+    command: ["sh", "-c", "sleep infinity"]
+
+  opensearch:
+    image: opensearchproject/opensearch:2.15.0
+    container_name: tg-crm-opensearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      plugins.security.disabled: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+
   alist:
     image: xhofe/alist:latest
     container_name: tg-crm-alistv2
@@ -177,4 +197,6 @@ services:
 
 volumes:
   pg_data:
+  redis_data:
+  opensearch_data:
   redis_data:

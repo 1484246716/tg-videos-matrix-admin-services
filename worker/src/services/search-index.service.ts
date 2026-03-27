@@ -22,7 +22,7 @@ import {
 } from './search-document-builder';
 
 export type SearchIndexJobData = {
-  sourceType: 'collection' | 'episode' | 'media_asset' | 'dispatch_task';
+  sourceType: 'collection' | 'episode' | 'media_asset' | 'dispatch_task' | 'collection_episode';
   sourceId: string;          // BigInt.toString()
   mediaAssetId?: string;     // BigInt.toString()
   channelId?: string;        // BigInt.toString()
@@ -50,6 +50,7 @@ export async function handleSearchIndexJob(data: SearchIndexJobData): Promise<vo
         doc = await buildFromCollection(BigInt(sourceId));
         break;
       case 'episode':
+      case 'collection_episode':
         doc = await buildFromEpisode(BigInt(sourceId));
         break;
       case 'media_asset':
@@ -229,6 +230,7 @@ async function handleDelete(sourceType: string, sourceId: string): Promise<void>
       docId = `collection:${sourceId}`;
       break;
     case 'episode':
+    case 'collection_episode':
       docId = `episode:${sourceId}`;
       break;
     case 'media_asset':
