@@ -467,7 +467,7 @@ export class CollectionService {
         role === 'admin'
           ? { id: BigInt(id) }
           : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
-      select: { id: true, channelId: true },
+      select: { id: true, channelId: true, name: true },
     });
     if (!collection) throw new NotFoundException('collection not found');
 
@@ -504,6 +504,7 @@ export class CollectionService {
         },
         select: {
           mediaAssetId: true,
+          telegramMessageLink: true,
           mediaAsset: {
             select: {
               originalName: true,
