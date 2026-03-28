@@ -99,8 +99,13 @@ export class CollectionService {
           mediaAssetId: ep?.mediaAsset?.id ? String(ep.mediaAsset.id) : null,
         };
       })
-      .filter((item) => item.blocked)
-      .sort((a, b) => a.episodeNo - b.episodeNo)[0];
+      .filter((item: { blocked: boolean }) => item.blocked)
+      .sort(
+        (
+          a: { episodeNo: number },
+          b: { episodeNo: number },
+        ) => a.episodeNo - b.episodeNo,
+      )[0];
 
     const blockState = blockedEpisode ? 'blocked' : 'unblocked';
     const waitingPrevEpisodeNo = blockedEpisode?.episodeNo ?? null;
