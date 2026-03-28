@@ -11,6 +11,7 @@
  * - incoming.source_updated_at >= current.source_updated_at 才更新
  * - doc_id 唯一约束不可放松
  */
+import { Prisma } from '@prisma/client';
 import { prisma } from '../infra/prisma';
 import { logger, logError } from '../logger';
 import {
@@ -193,7 +194,10 @@ async function upsertSearchDocument(doc: SearchDocOutput): Promise<void> {
     visibility: doc.visibility,
     isActive: doc.isActive,
     isDeleted: doc.isDeleted,
-    ext: doc.ext ?? undefined,
+    ext:
+      doc.ext == null
+        ? Prisma.JsonNull
+        : (doc.ext as unknown as Prisma.InputJsonValue),
     sourceUpdatedAt: doc.sourceUpdatedAt,
     indexedAt: doc.indexedAt,
   };
