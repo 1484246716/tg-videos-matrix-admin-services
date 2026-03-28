@@ -217,4 +217,3 @@ volumes:
   pg_data:
   redis_data:
   opensearch_data:
-  redis_data:
