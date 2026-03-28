@@ -80,8 +80,16 @@ export class ChannelController {
 
   @Permissions('channels:view')
   @Get(':id/catalog-preview')
-  getCatalogPreview(@Param('id') id: string, @Request() req: AuthRequest) {
-    return this.channelService.getCatalogPreview(id, req.user.userId, req.user.role);
+  getCatalogPreview(
+    @Param('id') id: string,
+    @Request() req: AuthRequest,
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+  ) {
+    return this.channelService.getCatalogPreview(id, req.user.userId, req.user.role, {
+      page,
+      pageSize,
+    });
   }
 
   @Permissions('channels:update')

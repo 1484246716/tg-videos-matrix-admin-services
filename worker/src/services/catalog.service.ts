@@ -917,7 +917,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
         ? toTelegramMessageLink(channel.tgChatId, publishedDetailPages[0])
         : null;
       if (detailLink) {
-        collectionIndexItems.push({ text: `${idx + 1}) ${name}`, url: detailLink });
+        collectionIndexItems.push({ text: `${idx + 1}: ${name}`, url: detailLink });
       }
     }
 

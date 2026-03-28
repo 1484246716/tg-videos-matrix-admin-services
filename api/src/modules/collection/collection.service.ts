@@ -1,4 +1,4 @@
-import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
@@ -17,6 +17,34 @@ type SaveCollectionDto = {
   navPageSize: number;
   templateText?: string;
 };
+
+function parseCollectionMeta(sourceMeta: unknown) {
+  if (!sourceMeta || typeof sourceMeta !== 'object') return null;
+  const meta = sourceMeta as Record<string, unknown>;
+  if (meta.isCollection !== true) return null;
+
+  const collectionName = typeof meta.collectionName === 'string' ? meta.collectionName.trim() : '';
+  const episodeNo =
+    typeof meta.episodeNo === 'number'
+      ? meta.episodeNo
+      : typeof meta.episodeNo === 'string' && /^\d+$/.test(meta.episodeNo)
+        ? Number(meta.episodeNo)
+        : null;
+
+  if (!collectionName || episodeNo === null) return null;
+
+  return {
+    collectionName,
+    episodeNo,
+  };
+}
+
+function getFileStem(name: string) {
+  if (!name) return '';
+  const base = name.replace(/^.*[\\/]/, '');
+  const idx = base.lastIndexOf('.');
+  return idx > 0 ? base.slice(0, idx) : base;
+}
 
 let searchIndexQueue: Queue | null = null;
 
@@ -276,6 +304,257 @@ export class CollectionService {
     });
 
     return this.toResponse(updated);
+  }
+
+  private formatCollectionEpisodeTitle(args: {
+    episodeNo: number;
+    episodeTitle?: string | null;
+    sourceTitle?: string | null;
+    templateText?: string | null;
+  }) {
+    const safeTitle = (args.episodeTitle || '').trim();
+    if (safeTitle) return safeTitle;
+
+    const fallbackTitle = (args.sourceTitle || '').trim() || `第${args.episodeNo}集`;
+
+    const safeTemplate = (args.templateText || '').trim();
+    if (safeTemplate) {
+      return safeTemplate
+        .replace(/\{episodeNo\}/g, String(args.episodeNo))
+        .replace(/\{title\}/g, fallbackTitle);
+    }
+
+    return fallbackTitle;
+  }
+
+  async getCatalogPreview(
+    id: string,
+    userId?: string,
+    role?: string,
+    pagination?: { page?: string; pageSize?: string },
+  ) {
+    const collection = await this.prisma.collection.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
+      select: {
+        id: true,
+        name: true,
+        templateText: true,
+        navPageSize: true,
+        channelId: true,
+        channel: {
+          select: {
+            name: true,
+            tgChatId: true,
+          },
+        },
+      },
+    });
+
+    if (!collection) throw new NotFoundException('collection not found');
+
+    const safePage = Math.max(1, Number.parseInt((pagination?.page || '').trim(), 10) || 1);
+    const configuredPageSize = Number(collection.navPageSize ?? 20);
+    const safePageSize = Math.min(100, Math.max(1, Number.isFinite(configuredPageSize) ? configuredPageSize : 20));
+
+    const dispatchTasks = await this.prisma.dispatchTask.findMany({
+      where: {
+        channelId: collection.channelId,
+        status: 'success',
+        telegramMessageLink: { not: null },
+      },
+      orderBy: { finishedAt: 'desc' },
+      select: {
+        id: true,
+        mediaAssetId: true,
+        telegramMessageLink: true,
+        mediaAsset: {
+          select: {
+            originalName: true,
+            sourceMeta: true,
+          },
+        },
+      },
+    });
+
+    const episodeOverrideRows = await this.prisma.collectionEpisode.findMany({
+      where: {
+        collectionId: collection.id,
+      },
+      select: {
+        id: true,
+        mediaAssetId: true,
+        episodeNo: true,
+        episodeTitle: true,
+      },
+    });
+
+    const overrideByMediaAssetId = new Map(
+      episodeOverrideRows.map((row) => [row.mediaAssetId.toString(), row]),
+    );
+
+    const mappedEpisodes = dispatchTasks
+      .map((task) => {
+        const sourceMeta = task.mediaAsset?.sourceMeta;
+        const parsed = parseCollectionMeta(sourceMeta);
+        if (!parsed) return null;
+        if (parsed.collectionName !== collection.name) return null;
+
+        const mediaAssetId = task.mediaAssetId.toString();
+        const override = overrideByMediaAssetId.get(mediaAssetId);
+        const sourceTitle = getFileStem(task.mediaAsset?.originalName || '');
+
+        return {
+          id: override?.id?.toString() || `dispatch-${task.id.toString()}`,
+          mediaAssetId,
+          episodeNo: parsed.episodeNo,
+          title: this.formatCollectionEpisodeTitle({
+            episodeNo: parsed.episodeNo,
+            episodeTitle: override?.episodeTitle,
+            sourceTitle,
+            templateText: collection.templateText,
+          }),
+          link: task.telegramMessageLink || '',
+          readonlyLink: task.telegramMessageLink || '',
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+      .sort((a, b) => a.episodeNo - b.episodeNo);
+
+    const total = mappedEpisodes.length;
+    const skip = (safePage - 1) * safePageSize;
+    const paged = mappedEpisodes.slice(skip, skip + safePageSize);
+
+    const videos = paged.map((ep, idx) => ({
+      ...ep,
+      order: skip + idx + 1,
+    }));
+
+    return {
+      collectionId: collection.id.toString(),
+      collectionName: collection.name,
+      channelId: collection.channelId.toString(),
+      channelName: collection.channel?.name || '-',
+      title: `${collection.name} 合集目录`,
+      videos,
+      page: safePage,
+      pageSize: safePageSize,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / safePageSize)),
+    };
+  }
+
+  async updateCatalogTitle(
+    id: string,
+    body: { episodeId?: string; title?: string },
+    userId?: string,
+    role?: string,
+  ) {
+    const episodeId = String(body.episodeId || '').trim();
+    const title = String(body.title || '').trim();
+
+    if (!episodeId) {
+      throw new BadRequestException('episodeId is required');
+    }
+    if (!title) {
+      throw new BadRequestException('title is required');
+    }
+
+    const collection = await this.prisma.collection.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
+      select: { id: true, channelId: true },
+    });
+    if (!collection) throw new NotFoundException('collection not found');
+
+    const episode = await this.prisma.collectionEpisode.findFirst({
+      where: {
+        id: BigInt(episodeId),
+        collectionId: collection.id,
+      },
+      select: {
+        id: true,
+        mediaAssetId: true,
+      },
+    });
+
+    if (episode) {
+      await this.prisma.collectionEpisode.update({
+        where: { id: episode.id },
+        data: {
+          episodeTitle: title,
+        },
+      });
+    } else {
+      const taskIdText = episodeId.startsWith('dispatch-') ? episodeId.slice('dispatch-'.length) : '';
+      if (!taskIdText || !/^\d+$/.test(taskIdText)) {
+        throw new NotFoundException('collection episode not found');
+      }
+
+      const dispatchTask = await this.prisma.dispatchTask.findFirst({
+        where: {
+          id: BigInt(taskIdText),
+          channelId: collection.channelId,
+          status: 'success',
+          telegramMessageLink: { not: null },
+        },
+        select: {
+          mediaAssetId: true,
+          mediaAsset: {
+            select: {
+              originalName: true,
+              sourceMeta: true,
+            },
+          },
+        },
+      });
+
+      if (!dispatchTask) {
+        throw new NotFoundException('collection episode not found');
+      }
+
+      const parsed = parseCollectionMeta(dispatchTask.mediaAsset?.sourceMeta);
+      if (!parsed || parsed.collectionName !== collection.name) {
+        throw new NotFoundException('collection episode not found');
+      }
+
+      const fileNameSnapshot = getFileStem(dispatchTask.mediaAsset?.originalName || '') || `第${parsed.episodeNo}集`;
+
+      await this.prisma.collectionEpisode.upsert({
+        where: {
+          mediaAssetId: dispatchTask.mediaAssetId,
+        },
+        update: {
+          collectionId: collection.id,
+          episodeNo: parsed.episodeNo,
+          fileNameSnapshot,
+          episodeTitle: title,
+        },
+        create: {
+          collectionId: collection.id,
+          mediaAssetId: dispatchTask.mediaAssetId,
+          episodeNo: parsed.episodeNo,
+          fileNameSnapshot,
+          parseStatus: 'ok',
+          sortKey: String(parsed.episodeNo).padStart(6, '0'),
+          telegramMessageLink: dispatchTask.telegramMessageLink,
+          publishedAt: new Date(),
+          episodeTitle: title,
+        },
+      });
+    }
+
+    await this.enqueueSearchIndexJob({
+      sourceType: 'collection',
+      sourceId: collection.id.toString(),
+      channelId: collection.channelId.toString(),
+    });
+
+    return { ok: true };
   }
 
   async remove(id: string, userId?: string, role?: string) {

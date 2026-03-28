@@ -391,7 +391,12 @@ export class ChannelService {
     return { updated: validIds.length };
   }
 
-  async getCatalogPreview(id: string, userId?: string, role?: string) {
+  async getCatalogPreview(
+    id: string,
+    userId?: string,
+    role?: string,
+    pagination?: { page?: string; pageSize?: string },
+  ) {
     const channel = await this.prisma.channel.findFirst({
       where:
         role === 'admin'
@@ -402,19 +407,30 @@ export class ChannelService {
         name: true,
         tgChatId: true,
         navTemplateText: true,
+        navPageSize: true,
       },
     });
 
     if (!channel) throw new NotFoundException('channel not found');
 
+    const safePage = Math.max(1, Number.parseInt((pagination?.page || '').trim(), 10) || 1);
+    const configuredPageSize = Number(channel.navPageSize ?? 20);
+    const safePageSize = Math.min(100, Math.max(1, Number.isFinite(configuredPageSize) ? configuredPageSize : 20));
+
+    const where: Prisma.DispatchTaskWhereInput = {
+      channelId: channel.id,
+      status: 'success',
+      telegramMessageLink: { not: null },
+    };
+
+    const total = await this.prisma.dispatchTask.count({ where });
+
+    const skip = (safePage - 1) * safePageSize;
     const dispatchTasks = await this.prisma.dispatchTask.findMany({
-      where: {
-        channelId: channel.id,
-        status: 'success',
-        telegramMessageLink: { not: null },
-      },
+      where,
       orderBy: { finishedAt: 'desc' },
-      take: 60,
+      skip,
+      take: safePageSize,
       select: {
         id: true,
         mediaAssetId: true,
@@ -482,6 +498,10 @@ export class ChannelService {
       tgChatId: channel.tgChatId,
       title,
       videos,
+      page: safePage,
+      pageSize: safePageSize,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / safePageSize)),
     });
   }
 

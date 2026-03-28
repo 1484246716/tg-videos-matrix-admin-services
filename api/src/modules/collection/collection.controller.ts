@@ -6,6 +6,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   Request,
   UseGuards,
 } from '@nestjs/common';
@@ -33,6 +34,30 @@ export class CollectionController {
   @Post()
   create(@Body() dto: any, @Request() req: AuthRequest) {
     return this.collectionService.create(dto, req.user.userId, req.user.role);
+  }
+
+  @Permissions('collections:view')
+  @Get(':id/catalog-preview')
+  getCatalogPreview(
+    @Param('id') id: string,
+    @Request() req: AuthRequest,
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+  ) {
+    return this.collectionService.getCatalogPreview(id, req.user.userId, req.user.role, {
+      page,
+      pageSize,
+    });
+  }
+
+  @Permissions('collections:update')
+  @Patch(':id/catalog-title')
+  updateCatalogTitle(
+    @Param('id') id: string,
+    @Body() body: { episodeId?: string; title?: string },
+    @Request() req: AuthRequest,
+  ) {
+    return this.collectionService.updateCatalogTitle(id, body, req.user.userId, req.user.role);
   }
 
   @Permissions('collections:update')
