@@ -1,4 +1,5 @@
 import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
 import { mkdir, rm } from 'node:fs/promises';
@@ -111,6 +112,7 @@ export class CollectionService {
       ...row,
       id: row.id.toString(),
       channelId: row.channelId.toString(),
+      createdBy: row.createdBy != null ? row.createdBy.toString() : null,
       channel: row.channel
         ? {
             ...row.channel,
@@ -127,8 +129,16 @@ export class CollectionService {
     };
   }
 
-  async list() {
+  async list(userId?: string, role?: string) {
+    const where: Prisma.CollectionWhereInput =
+      role === 'admin'
+        ? {}
+        : {
+            createdBy: userId ? BigInt(userId) : undefined,
+          };
+
     const rows = await this.prisma.collection.findMany({
+      where,
       orderBy: { updatedAt: 'desc' },
       include: {
         channel: { select: { id: true, name: true } },
@@ -156,9 +166,15 @@ export class CollectionService {
     return rows.map((row) => this.toResponse(row));
   }
 
-  async create(dto: SaveCollectionDto) {
-    const channel = await this.prisma.channel.findUnique({
-      where: { id: BigInt(dto.channelId) },
+  async create(dto: SaveCollectionDto, userId?: string, role?: string) {
+    const channel = await this.prisma.channel.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(dto.channelId) }
+          : {
+              id: BigInt(dto.channelId),
+              createdBy: userId ? BigInt(userId) : undefined,
+            },
       select: { id: true, folderPath: true },
     });
     if (!channel) throw new NotFoundException('channel not found');
@@ -179,6 +195,7 @@ export class CollectionService {
         navEnabled: dto.navEnabled,
         navPageSize: dto.navPageSize,
         templateText: dto.templateText || null,
+        createdBy: role === 'admin' ? null : userId ? BigInt(userId) : null,
       },
       include: {
         channel: { select: { id: true, name: true } },
@@ -195,28 +212,36 @@ export class CollectionService {
     return this.toResponse(created);
   }
 
-  async update(id: string, dto: Partial<SaveCollectionDto>) {
-    const existing = await this.prisma.collection.findUnique({
-      where: { id: BigInt(id) },
+  async update(id: string, dto: Partial<SaveCollectionDto>, userId?: string, role?: string) {
+    const existing = await this.prisma.collection.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
       select: { id: true, channelId: true, channel: { select: { folderPath: true } } },
     });
     if (!existing) throw new NotFoundException('collection not found');
 
     if (dto.name || dto.channelId) {
       const channelId = dto.channelId ? BigInt(dto.channelId) : existing.channelId;
-      const channel = await this.prisma.channel.findUnique({
-        where: { id: channelId },
+      const channel = await this.prisma.channel.findFirst({
+        where:
+          role === 'admin'
+            ? { id: channelId }
+            : { id: channelId, createdBy: userId ? BigInt(userId) : undefined },
         select: { id: true, folderPath: true },
       });
 
-      if (channel) {
-        const collectionName = (dto.name || '').trim();
-        if (collectionName) {
-          await this.ensureCollectionFolderExists({
-            channelFolderPath: channel.folderPath,
-            collectionName,
-          });
-        }
+      if (!channel) {
+        throw new NotFoundException('channel not found');
+      }
+
+      const collectionName = (dto.name || '').trim();
+      if (collectionName) {
+        await this.ensureCollectionFolderExists({
+          channelFolderPath: channel.folderPath,
+          collectionName,
+        });
       }
     }
 
@@ -248,9 +273,12 @@ export class CollectionService {
     return this.toResponse(updated);
   }
 
-  async remove(id: string) {
-    const existing = await this.prisma.collection.findUnique({
-      where: { id: BigInt(id) },
+  async remove(id: string, userId?: string, role?: string) {
+    const existing = await this.prisma.collection.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
       select: {
         id: true,
         name: true,

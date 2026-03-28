@@ -2,7 +2,7 @@ import '../config/env';
 import { catalogQueue, dispatchQueue, relayUploadQueue, massMessageQueue, searchIndexQueue } from '../infra/redis';
 import { ensureWorkerPrismaModels, logWorkerDatabaseFingerprint } from '../infra/prisma';
 import { logger, logError } from '../logger';
-import { telegramApiBase } from '../config/env';
+import { SCHEDULER_POLL_MS, telegramApiBase } from '../config/env';
 import { scheduleEnabledTaskDefinitions } from '../scheduler/task-definition-scheduler';
 import { scheduleDueMassMessageItems } from '../scheduler/mass-message-scheduler';
 import { reconcileTypeAStuckAssets } from '../services/typea-reconcile.service';
@@ -81,6 +81,7 @@ export async function bootstrapWorker() {
   await drainStaleRelayJobs();
 
   logger.info('[bootstrap] Telegram API 地址', { telegramApiBase });
+  logger.info('[bootstrap] 调度轮询间隔', { schedulerPollMs: SCHEDULER_POLL_MS });
 
   setInterval(() => {
     void scheduleEnabledTaskDefinitions().catch((err) => {
@@ -104,7 +105,7 @@ export async function bootstrapWorker() {
     void enqueueChangedCollectionEpisodes().catch((err) => {
       logError('[scheduler:search-index-episodes] 变更扫描异常', err);
     });
-  }, 5000);
+  }, SCHEDULER_POLL_MS);
 
   logger.info(
     'Worker 已启动，队列：q_dispatch + q_relay_upload + q_catalog + q_mass_message + q_search_index，任务调度已启用',

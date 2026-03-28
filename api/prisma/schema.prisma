@@ -19,7 +19,8 @@ model User {
   lastLoginAt     DateTime?  @map("last_login_at") @db.Timestamptz(6)
   createdAt       DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt       DateTime   @updatedAt @map("updated_at") @db.Timestamptz(6)
-  createdChannels Channel[]
+  createdChannels    Channel[]
+  createdCollections Collection[]
 
   @@map("users")
 }
@@ -275,15 +276,18 @@ model Collection {
   navEnabled          Boolean             @default(true) @map("nav_enabled")
   navPageSize         Int                 @default(30) @map("nav_page_size")
   templateText        String?             @map("template_text")
+  createdBy           BigInt?             @map("created_by")
   createdAt           DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt           DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
   episodes            CollectionEpisode[]
   channel             Channel             @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  createdByUser       User?               @relation(fields: [createdBy], references: [id])
 
   @@unique([channelId, name])
   @@unique([channelId, dirPath])
   @@index([channelId, status, sortOrder])
   @@index([channelId, navEnabled])
+  @@index([createdBy, updatedAt(sort: Desc)])
   @@map("collections")
 }
 

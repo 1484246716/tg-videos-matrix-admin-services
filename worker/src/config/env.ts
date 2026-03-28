@@ -7,7 +7,11 @@ export const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
 export const telegramApiBase =
   process.env.TELEGRAM_BOT_API_BASE || 'http://localhost:8081';
 
-export const SCHEDULER_POLL_MS = 25000;
+export const SCHEDULER_POLL_MS = (() => {
+  const n = Number(process.env.SCHEDULER_POLL_MS ?? '10000');
+  if (!Number.isFinite(n) || n < 1000) return 10000;
+  return Math.floor(n);
+})();
 export const MAX_SCHEDULE_BATCH = 100;
 export const TASK_DEFINITION_LOCK_TTL_MS = Number(
   process.env.TASK_DEFINITION_LOCK_TTL_MS || '15000',
@@ -36,6 +40,13 @@ export const RELAY_UPLOAD_GRAMJS_THRESHOLD_MB = Number(
 export const RELAY_UPLOAD_SEND_DOCUMENT_THRESHOLD_MB = Number(
   process.env.RELAY_UPLOAD_SEND_DOCUMENT_THRESHOLD_MB || '900',
 );
+
+/** BullMQ q_relay_upload 并发（同时处理几条中转上传任务），默认 1，上限 32 */
+export const RELAY_UPLOAD_QUEUE_CONCURRENCY = (() => {
+  const n = Number(process.env.RELAY_UPLOAD_QUEUE_CONCURRENCY ?? '1');
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(32, Math.floor(n));
+})();
 
 export const RELAY_MIN_STABLE_CHECKS = Number(
   process.env.RELAY_MIN_STABLE_CHECKS || '3',

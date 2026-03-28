@@ -20,6 +20,7 @@ import {
   GRAMJS_FORWARD_TARGET_CHAT_ID,
   GRAMJS_UPLOAD_WORKERS,
   RELAY_UPLOAD_GRAMJS_THRESHOLD_MB,
+  RELAY_UPLOAD_QUEUE_CONCURRENCY,
   TYPEA_FAIL_ON_FILE_MISSING,
   TYPEA_INGEST_LEASE_MS,
   TYPEA_INGEST_MAX_RETRIES,
@@ -736,7 +737,7 @@ export const relayUploadWorker = new Worker(
 },
   {
     connection: connection as any,
-    concurrency: 1,
+    concurrency: RELAY_UPLOAD_QUEUE_CONCURRENCY,
     lockDuration: 30 * 60 * 1000,
     maxStalledCount: 1,
     stalledInterval: 30000,
