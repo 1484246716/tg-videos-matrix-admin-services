@@ -137,7 +137,8 @@ services:
     image: jrottenberg/ffmpeg:6.1-alpine
     container_name: tg-crm-ffmpeg
     restart: unless-stopped
-    command: ["sh", "-c", "sleep infinity"]
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["tail -f /dev/null"]
 
   tg-bot-api-v2:
     image: aiogram/telegram-bot-api:latest
@@ -168,7 +169,8 @@ services:
     image: jrottenberg/ffmpeg:6.1-alpine
     container_name: tg-crm-ffprobe
     restart: unless-stopped
-    command: ["sh", "-c", "sleep infinity"]
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["tail -f /dev/null"]
 
   opensearch:
     image: opensearchproject/opensearch:2.15.0
@@ -176,8 +178,8 @@ services:
     restart: unless-stopped
     environment:
       discovery.type: single-node
-      plugins.security.disabled: "true"
       OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
     ports:
       - "9200:9200"
       - "9600:9600"
