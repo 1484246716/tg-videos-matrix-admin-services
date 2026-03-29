@@ -233,7 +233,7 @@ services:
 
   # 【新增】：Nginx Proxy Manager 反向代理服务
   nginx-proxy-manager:
-    image: 'jc21/nginx-proxy-manager:2.11.3'
+    image: 'jc21/nginx-proxy-manager:latest'
     container_name: tg-crm-npm
     restart: unless-stopped
     ports:
