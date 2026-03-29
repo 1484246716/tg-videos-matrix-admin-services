@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: tg_crm
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -22,7 +22,7 @@ services:
     container_name: tg-crm-redisv2
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -30,6 +30,27 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  # 【备份】：数据库专属备份 (每天凌晨 3:00 导出 SQL 压缩包)
+  pg-backup:
+    image: prodrigestivill/postgres-backup-local:16-alpine
+    container_name: tg-crm-pg-backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: tg_crm
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      SCHEDULE: "0 3 * * *"
+      BACKUP_KEEP_DAYS: "7"
+      BACKUP_KEEP_WEEKS: "4"
+      BACKUP_KEEP_MONTHS: "6"
+      HEALTHCHECK_PORT: "8080"
+    volumes:
+      - ./data/backups/postgres:/backups
 
   api:
     build:
@@ -60,7 +81,7 @@ services:
       CORS_ORIGIN: ${CORS_ORIGIN}
     command: sh -c "pnpm --filter @tg-crm/api exec prisma generate && pnpm --filter @tg-crm/api run start"
     ports:
-      - "3001:3001" # 如果你配置好反代后，为了安全，可以把这里的对外端口映射删掉
+      - "127.0.0.1:3001:3001" # 如果你配置好反代后，为了安全，可以把这里的对外端口映射删掉
     volumes:
       - ./data/tg-crm:/data
       # 👇 映射 API 服务日志到宿主机
@@ -70,6 +91,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 15
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "7"
 
   worker:
     build:
@@ -132,6 +158,11 @@ services:
       - ./data/tg-crm:/data
       # 👇 映射 Worker 服务日志到宿主机
       - ./worker/logs:/app/worker/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "7"
 
   ffmpeg:
     image: jrottenberg/ffmpeg:6.1-alpine
@@ -141,14 +172,14 @@ services:
     command: ["tail -f /dev/null"]
 
   tg-bot-api-v2:
-    image: aiogram/telegram-bot-api:latest
+    image: aiogram/telegram-bot-api:7.6
     container_name: tg-bot-api-v2
     restart: unless-stopped
     environment:
-      TELEGRAM_API_ID: "6"
-      TELEGRAM_API_HASH: "eb06d4abfb49dc3eeb1aeb98ae0f581e"
-      TELEGRAM_LOCAL: "1"
-      TELEGRAM_VERBOSITY: "4"
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: ${TELEGRAM_LOCAL:-1}
+      TELEGRAM_VERBOSITY: ${TELEGRAM_VERBOSITY:-4}
     command:
       - "--http-timeout"
       - "3600"
@@ -187,7 +218,7 @@ services:
       - opensearch_data:/usr/share/opensearch/data
 
   alist:
-    image: xhofe/alist:latest
+    image: xhofe/alist:v3.45.0
     container_name: tg-crm-alistv2
     restart: unless-stopped
     ports:
@@ -202,7 +233,7 @@ services:
 
   # 【新增】：Nginx Proxy Manager 反向代理服务
   nginx-proxy-manager:
-    image: 'jc21/nginx-proxy-manager:latest'
+    image: 'jc21/nginx-proxy-manager:2.11.3'
     container_name: tg-crm-npm
     restart: unless-stopped
     ports:
@@ -212,6 +243,42 @@ services:
     volumes:
       - ./data/npm/config:/data
       - ./data/npm/letsencrypt:/etc/letsencrypt
+
+  # 【清理】：定时清理 API/Worker 文件日志
+  log-cleaner:
+    image: alpine:3.20
+    container_name: tg-crm-log-cleaner
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      LOG_RETENTION_DAYS: "7"
+      CLEAN_INTERVAL_HOURS: "24"
+    volumes:
+      - ./api/logs:/logs/api
+      - ./worker/logs:/logs/worker
+    command: >-
+      sh -c "while true; do
+      find /logs/api /logs/worker -type f -name '*.log' -mtime +$${LOG_RETENTION_DAYS} -delete;
+      sleep $$((CLEAN_INTERVAL_HOURS * 3600));
+      done"
+
+  # 【备份】：系统级综合备份服务 (每天凌晨 4:00 统一打包核心配置与数据)
+  system-backup:
+    image: offen/docker-volume-backup:v2
+    container_name: tg-crm-system-backup
+    restart: unless-stopped
+    environment:
+      BACKUP_CRON_EXPRESSION: "0 4 * * *"
+      BACKUP_FILENAME: "matrix-system-backup-%Y%m%d_%H%M%S.tar.gz"
+      BACKUP_RETENTION_DAYS: "7"
+    volumes:
+      # --- 源数据 (只读模式 :ro 保障绝对安全) ---
+      - redis_data:/backup/redis:ro
+      - ./data/alist:/backup/alist:ro
+      - ./data/npm:/backup/npm:ro
+      - ./data/backups/postgres:/backup/postgres_dumps:ro
+      # --- 备份输出目录 ---
+      - ./data/backups/system_archive:/archive
 
 volumes:
   pg_data:
