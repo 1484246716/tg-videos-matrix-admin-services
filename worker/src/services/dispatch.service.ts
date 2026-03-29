@@ -46,6 +46,27 @@ function isAiFailureText(text?: string | null) {
   return /无法识别|抱歉|如果可以提供更多|视频的内容简介|主要角色|生成相关文案/.test(normalized);
 }
 
+function getCollectionDisplayName(name: string) {
+  const normalized = name.replace(/合集/g, '').trim();
+  return normalized || name.trim();
+}
+
+function buildCollectionEpisodeTitle(collectionName: string, episodeNo: number) {
+  return `${getCollectionDisplayName(collectionName)}第${episodeNo}集`;
+}
+
+function applyCollectionEpisodeTitle(caption: string, title: string) {
+  const desiredLine = `📺片名：${title}`;
+  const trimmedCaption = caption.trim();
+  if (!trimmedCaption) return desiredLine;
+
+  if (/(?:^|\n)\s*📺?\s*片名\s*[：:]\s*.+/.test(trimmedCaption)) {
+    return trimmedCaption.replace(/(^|\n)\s*📺?\s*片名\s*[：:]\s*.+/, (_match, prefix: string) => `${prefix}${desiredLine}`);
+  }
+
+  return `${desiredLine}\n${trimmedCaption}`;
+}
+
 export async function handleDispatchJob(
   dispatchTaskIdRaw: string,
   jobId: string,
@@ -190,6 +211,21 @@ export async function handleDispatchJob(
 
     if (isAiFailureText(finalCaption)) {
       finalCaption = originalNameStem;
+    }
+
+    const isCollectionAsset = mediaSourceMeta?.isCollection === true;
+    const collectionName = typeof mediaSourceMeta?.collectionName === 'string' ? mediaSourceMeta.collectionName.trim() : '';
+    const episodeNo =
+      typeof mediaSourceMeta?.episodeNo === 'number'
+        ? mediaSourceMeta.episodeNo
+        : typeof mediaSourceMeta?.episodeNo === 'string' && /^\d+$/.test(mediaSourceMeta.episodeNo)
+          ? Number(mediaSourceMeta.episodeNo)
+          : null;
+    if (isCollectionAsset && collectionName && episodeNo !== null) {
+      finalCaption = applyCollectionEpisodeTitle(
+        finalCaption || '',
+        buildCollectionEpisodeTitle(collectionName, episodeNo),
+      );
     }
 
     if (!task.mediaAsset.aiGeneratedCaption && finalCaption) {

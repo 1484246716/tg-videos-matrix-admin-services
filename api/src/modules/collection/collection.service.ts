@@ -18,11 +18,129 @@ type SaveCollectionDto = {
   templateText?: string;
 };
 
+const DEFAULT_COLLECTION_STATUS = 'active' as const;
+
 function normalizeCollectionName(name: string) {
   return name
     .normalize('NFKC')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function parseStoredPageMessageIds(raw: unknown) {
+  if (!Array.isArray(raw)) return [] as number[];
+  return raw.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item > 0);
+}
+
+type CollectionNavState = {
+  indexMessageId: number | null;
+  indexPageMessageIds: number[];
+  detailMessageIds: Record<string, number>;
+  detailPageMessageIds: Record<string, number[]>;
+};
+
+function parseCollectionNavState(rawNavReplyMarkup: unknown): CollectionNavState {
+  if (!rawNavReplyMarkup || typeof rawNavReplyMarkup !== 'object' || Array.isArray(rawNavReplyMarkup)) {
+    return { indexMessageId: null, indexPageMessageIds: [], detailMessageIds: {}, detailPageMessageIds: {} };
+  }
+
+  const container = rawNavReplyMarkup as Record<string, unknown>;
+  const state =
+    container.__collectionNavState && typeof container.__collectionNavState === 'object'
+      ? (container.__collectionNavState as Record<string, unknown>)
+      : null;
+
+  if (!state) return { indexMessageId: null, indexPageMessageIds: [], detailMessageIds: {}, detailPageMessageIds: {} };
+
+  const indexMessageIdRaw = state.indexMessageId;
+  const indexMessageId =
+    typeof indexMessageIdRaw === 'number' && Number.isInteger(indexMessageIdRaw) && indexMessageIdRaw > 0
+      ? indexMessageIdRaw
+      : null;
+
+  const indexPageMessageIds = parseStoredPageMessageIds(state.indexPageMessageIds);
+
+  const detailRaw = state.detailMessageIds;
+  const detailMessageIds: Record<string, number> = {};
+  if (detailRaw && typeof detailRaw === 'object' && !Array.isArray(detailRaw)) {
+    for (const [key, val] of Object.entries(detailRaw as Record<string, unknown>)) {
+      const n = Number(val);
+      if (Number.isInteger(n) && n > 0) {
+        detailMessageIds[key] = n;
+      }
+    }
+  }
+
+  const detailPageRaw = state.detailPageMessageIds;
+  const detailPageMessageIds: Record<string, number[]> = {};
+  if (detailPageRaw && typeof detailPageRaw === 'object' && !Array.isArray(detailPageRaw)) {
+    for (const [key, val] of Object.entries(detailPageRaw as Record<string, unknown>)) {
+      const ids = parseStoredPageMessageIds(val);
+      if (ids.length > 0) {
+        detailPageMessageIds[key] = ids;
+      }
+    }
+  }
+
+  for (const [key, firstId] of Object.entries(detailMessageIds)) {
+    if (!detailPageMessageIds[key] || detailPageMessageIds[key].length === 0) {
+      detailPageMessageIds[key] = [firstId];
+    }
+  }
+
+  return { indexMessageId, indexPageMessageIds, detailMessageIds, detailPageMessageIds };
+}
+
+function sanitizeJsonForPrisma(value: unknown): unknown {
+  if (value === null) return null;
+  if (value === undefined) return undefined;
+
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => sanitizeJsonForPrisma(item))
+      .filter((item) => item !== undefined);
+  }
+
+  if (typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      const sanitized = sanitizeJsonForPrisma(item);
+      if (sanitized !== undefined) {
+        result[key] = sanitized;
+      }
+    }
+    return result;
+  }
+
+  return value;
+}
+
+function mergeCollectionNavStateIntoReplyMarkup(rawNavReplyMarkup: unknown, state: CollectionNavState | null) {
+  const base =
+    rawNavReplyMarkup && typeof rawNavReplyMarkup === 'object' && !Array.isArray(rawNavReplyMarkup)
+      ? { ...(rawNavReplyMarkup as Record<string, unknown>) }
+      : {};
+
+  if (!state) {
+    delete (base as Record<string, unknown>).__collectionNavState;
+    return sanitizeJsonForPrisma(base) as Record<string, unknown>;
+  }
+
+  (base as Record<string, unknown>).__collectionNavState = {
+    indexMessageId: state.indexMessageId ?? null,
+    indexPageMessageIds: state.indexPageMessageIds,
+    detailMessageIds: state.detailMessageIds,
+    detailPageMessageIds: state.detailPageMessageIds,
+    updatedAt: new Date().toISOString(),
+  };
+
+  return sanitizeJsonForPrisma(base) as Record<string, unknown>;
+}
+
+function isTelegramMessageDeleteNotFoundError(error: { code?: string; message?: string } | null | undefined) {
+  const code = error?.code ?? '';
+  const message = (error?.message ?? '').toLowerCase();
+  return code === 'TG_400' && message.includes('message to delete not found');
 }
 
 function parseCollectionMeta(sourceMeta: unknown) {
@@ -75,6 +193,13 @@ function getSearchIndexQueue() {
 export class CollectionService {
   constructor(private readonly prisma: PrismaService) {}
 
+  private getTelegramBotApiBase() {
+    return (
+      (process.env.TELEGRAM_BOT_API_BASE || 'https://api.telegram.org').trim() ||
+      'https://api.telegram.org'
+    ).replace(/\/$/, '');
+  }
+
   private getChannelsRootDir() {
     const raw = (process.env.CHANNELS_ROOT_DIR || './data/channels').trim();
 
@@ -108,6 +233,156 @@ export class CollectionService {
     const targetDir = this.resolveCollectionFolderPath(args);
     await rm(targetDir, { recursive: true, force: true });
     return targetDir;
+  }
+
+  private async deleteTelegramMessage(args: {
+    botToken: string;
+    chatId: string;
+    messageId: number;
+  }) {
+    const response = await fetch(`${this.getTelegramBotApiBase()}/bot${args.botToken}/deleteMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: args.chatId,
+        message_id: args.messageId,
+      }),
+    });
+
+    const json = (await response.json().catch(() => ({}))) as {
+      ok?: boolean;
+      description?: string;
+      error_code?: number;
+    };
+
+    if (!response.ok || !json.ok) {
+      const errorCode = json.error_code ?? response.status;
+      const description = json.description || `Telegram API 请求失败 (${response.status})`;
+      throw {
+        code: `TG_${errorCode}`,
+        message: `Telegram 请求失败：${description}`,
+      };
+    }
+  }
+
+  private async syncDeleteCollectionNavMessages(args: {
+    channelId: bigint;
+    collectionName: string;
+    nameNormalized?: string | null;
+  }) {
+    const channel = await this.prisma.channel.findUnique({
+      where: { id: args.channelId },
+      select: {
+        id: true,
+        tgChatId: true,
+        navReplyMarkup: true,
+        defaultBot: {
+          select: { tokenEncrypted: true },
+        },
+      },
+    });
+
+    if (!channel) return;
+
+    const state = parseCollectionNavState(channel.navReplyMarkup);
+    const targetNormalized = normalizeCollectionName(args.nameNormalized || args.collectionName);
+    const matchedKeys = new Set<string>();
+
+    for (const key of [
+      ...Object.keys(state.detailMessageIds),
+      ...Object.keys(state.detailPageMessageIds),
+      args.collectionName,
+      args.nameNormalized || '',
+    ]) {
+      if (key && normalizeCollectionName(key) === targetNormalized) {
+        matchedKeys.add(key);
+      }
+    }
+
+    const remainingNavCollectionCount = await this.prisma.collection.count({
+      where: {
+        channelId: args.channelId,
+        navEnabled: true,
+      },
+    });
+
+    const messageIds = new Set<number>();
+    const nextDetailMessageIds = { ...state.detailMessageIds };
+    const nextDetailPageMessageIds = { ...state.detailPageMessageIds };
+
+    if (remainingNavCollectionCount === 0) {
+      if (state.indexMessageId) {
+        messageIds.add(state.indexMessageId);
+      }
+      for (const messageId of state.indexPageMessageIds) {
+        messageIds.add(messageId);
+      }
+      for (const messageId of Object.values(state.detailMessageIds)) {
+        messageIds.add(messageId);
+      }
+      for (const pageMessageIds of Object.values(state.detailPageMessageIds)) {
+        for (const messageId of pageMessageIds) {
+          messageIds.add(messageId);
+        }
+      }
+    } else {
+      for (const key of matchedKeys) {
+        const firstMessageId = nextDetailMessageIds[key];
+        if (firstMessageId) {
+          messageIds.add(firstMessageId);
+        }
+        for (const pageMessageId of nextDetailPageMessageIds[key] ?? []) {
+          messageIds.add(pageMessageId);
+        }
+        delete nextDetailMessageIds[key];
+        delete nextDetailPageMessageIds[key];
+      }
+    }
+
+    const nextState =
+      remainingNavCollectionCount === 0
+        ? null
+        : {
+            indexMessageId: state.indexMessageId,
+            indexPageMessageIds: state.indexPageMessageIds,
+            detailMessageIds: nextDetailMessageIds,
+            detailPageMessageIds: nextDetailPageMessageIds,
+          };
+
+    await this.prisma.channel.update({
+      where: { id: args.channelId },
+      data: {
+        navReplyMarkup: mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextState) as Prisma.InputJsonValue,
+      },
+    });
+
+    const botToken = channel.defaultBot?.tokenEncrypted?.trim() || '';
+    const chatId = channel.tgChatId?.trim() || '';
+
+    if (!botToken || !chatId || messageIds.size === 0) {
+      return;
+    }
+
+    for (const messageId of messageIds) {
+      try {
+        await this.deleteTelegramMessage({
+          botToken,
+          chatId,
+          messageId,
+        });
+      } catch (error) {
+        const deleteError = error as { code?: string; message?: string } | null | undefined;
+        if (isTelegramMessageDeleteNotFoundError(deleteError)) {
+          continue;
+        }
+        console.error('[collection] 同步清理 TG 合集目录消息失败（不阻塞）', {
+          channelId: args.channelId.toString(),
+          collectionName: args.collectionName,
+          messageId,
+          error: deleteError?.message ?? deleteError,
+        });
+      }
+    }
   }
 
   private toResponse(row: any) {
@@ -169,6 +444,67 @@ export class CollectionService {
     };
   }
 
+  private async buildCollectionEpisodeCountMap(
+    rows: Array<{
+      id: bigint;
+      channelId: bigint;
+      name: string;
+      nameNormalized?: string | null;
+      _count?: { episodes?: number } | null;
+    }>,
+  ) {
+    const counts = new Map<string, number>();
+    if (rows.length === 0) return counts;
+
+    const collectionIdsByChannelName = new Map<string, string>();
+    const channelIds = [...new Set(rows.map((row) => row.channelId.toString()))];
+
+    for (const row of rows) {
+      const normalizedName = normalizeCollectionName(row.nameNormalized || row.name);
+      collectionIdsByChannelName.set(`${row.channelId.toString()}:${normalizedName}`, row.id.toString());
+      counts.set(row.id.toString(), row._count?.episodes ?? 0);
+    }
+
+    const dispatchTasks = await this.prisma.dispatchTask.findMany({
+      where: {
+        channelId: { in: channelIds.map((item) => BigInt(item)) },
+        status: 'success',
+        telegramMessageLink: { not: null },
+      },
+      select: {
+        channelId: true,
+        mediaAssetId: true,
+        mediaAsset: {
+          select: {
+            sourceMeta: true,
+          },
+        },
+      },
+    });
+
+    const seenMediaAssetIdsByCollection = new Map<string, Set<string>>();
+
+    for (const task of dispatchTasks) {
+      const parsed = parseCollectionMeta(task.mediaAsset?.sourceMeta);
+      if (!parsed) continue;
+
+      const normalizedName = normalizeCollectionName(parsed.collectionName);
+      const collectionId = collectionIdsByChannelName.get(`${task.channelId.toString()}:${normalizedName}`);
+      if (!collectionId) continue;
+
+      const mediaAssetId = task.mediaAssetId.toString();
+      const seen = seenMediaAssetIdsByCollection.get(collectionId) ?? new Set<string>();
+      seen.add(mediaAssetId);
+      seenMediaAssetIdsByCollection.set(collectionId, seen);
+    }
+
+    for (const [collectionId, seen] of seenMediaAssetIdsByCollection.entries()) {
+      counts.set(collectionId, seen.size);
+    }
+
+    return counts;
+  }
+
   async list(userId?: string, role?: string) {
     const where: Prisma.CollectionWhereInput =
       role === 'admin'
@@ -203,7 +539,18 @@ export class CollectionService {
       },
     });
 
-    return rows.map((row) => this.toResponse(row));
+    const episodeCountMap = await this.buildCollectionEpisodeCountMap(rows);
+
+    return rows.map((row) =>
+      this.toResponse({
+        ...row,
+        _count: {
+          ...(row._count ?? {}),
+          episodes: episodeCountMap.get(row.id.toString()) ?? row._count?.episodes ?? 0,
+        },
+        episodeCount: episodeCountMap.get(row.id.toString()) ?? row._count?.episodes ?? 0,
+      }),
+    );
   }
 
   async create(dto: SaveCollectionDto, userId?: string, role?: string) {
@@ -247,7 +594,7 @@ export class CollectionService {
         nameNormalized: normalizedName,
         slug: dto.slug || null,
         dirPath: dto.dirPath,
-        status: dto.status,
+        status: DEFAULT_COLLECTION_STATUS,
         sortOrder: dto.sortOrder,
         navEnabled: dto.navEnabled,
         navPageSize: dto.navPageSize,
@@ -358,7 +705,7 @@ export class CollectionService {
         nameNormalized: nameProvided ? nextNameNormalized : undefined,
         slug: dto.slug || undefined,
         dirPath: dto.dirPath,
-        status: dto.status,
+        status: DEFAULT_COLLECTION_STATUS,
         sortOrder: dto.sortOrder,
         navEnabled: dto.navEnabled,
         navPageSize: dto.navPageSize,
@@ -641,6 +988,7 @@ export class CollectionService {
       select: {
         id: true,
         name: true,
+        nameNormalized: true,
         channel: {
           select: { id: true, folderPath: true },
         },
@@ -691,6 +1039,12 @@ export class CollectionService {
       await this.removeCollectionFolderIfExists({
         channelFolderPath: existing.channel.folderPath,
         collectionName: existing.name,
+      });
+
+      await this.syncDeleteCollectionNavMessages({
+        channelId: existing.channel.id,
+        collectionName: existing.name,
+        nameNormalized: existing.nameNormalized,
       });
 
       await this.enqueueSearchIndexJob({

@@ -188,7 +188,7 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
       retryAfterSec: json.parameters?.retry_after,
     };
 
-    logError('[telegram] 请求失败', {
+    const logPayload = {
       method: args.method,
       status: responseStatus,
       payloadType: isFormData ? 'form-data' : 'json',
@@ -196,7 +196,13 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
       description,
       parameters: json?.parameters ?? null,
       response: json,
-    });
+    };
+
+    if (args.method === 'deleteMessage' && /message to delete not found/i.test(description)) {
+      logger.info('[telegram] 删除消息目标不存在，按已清理处理', logPayload);
+    } else {
+      logError('[telegram] 请求失败', logPayload);
+    }
 
     throw err;
   }

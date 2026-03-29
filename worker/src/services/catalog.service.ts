@@ -307,6 +307,80 @@ function toTelegramMessageLink(chatIdRaw: string, messageId: number): string | n
   return null;
 }
 
+function isTelegramMessageDeleteNotFoundError(error: unknown) {
+  const err = error as { code?: string; message?: string } | null | undefined;
+  const code = err?.code ?? '';
+  const message = (err?.message ?? '').toLowerCase();
+  return code === 'TG_400' && message.includes('message to delete not found');
+}
+
+async function deleteTelegramMessages(args: {
+  botToken: string;
+  chatId: string;
+  messageIds: number[];
+  onError: (messageId: number, error: unknown) => void;
+}) {
+  for (const messageId of [...new Set(args.messageIds)].filter((item) => Number.isInteger(item) && item > 0)) {
+    try {
+      await sendTelegramRequest({
+        botToken: args.botToken,
+        method: 'deleteMessage',
+        payload: {
+          chat_id: args.chatId,
+          message_id: messageId,
+        },
+      });
+    } catch (error) {
+      if (isTelegramMessageDeleteNotFoundError(error)) {
+        continue;
+      }
+      args.onError(messageId, error);
+    }
+  }
+}
+
+async function deleteCollectionNavStateMessages(args: {
+  botToken: string;
+  chatId: string;
+  channelIdRaw: string;
+  state: CollectionNavState;
+}) {
+  await deleteTelegramMessages({
+    botToken: args.botToken,
+    chatId: args.chatId,
+    messageIds: [
+      ...(args.state.indexMessageId ? [args.state.indexMessageId] : []),
+      ...args.state.indexPageMessageIds,
+    ],
+    onError: (messageId, error) => {
+      logError('[q_catalog] 删除旧合集索引分页消息失败', {
+        channelId: args.channelIdRaw,
+        staleMessageId: messageId,
+        error,
+      });
+    },
+  });
+
+  for (const [collectionName, detailPages] of Object.entries(args.state.detailPageMessageIds)) {
+    await deleteTelegramMessages({
+      botToken: args.botToken,
+      chatId: args.chatId,
+      messageIds: [
+        ...(args.state.detailMessageIds[collectionName] ? [args.state.detailMessageIds[collectionName]] : []),
+        ...detailPages,
+      ],
+      onError: (messageId, error) => {
+        logError('[q_catalog] 删除旧合集详情消息失败', {
+          channelId: args.channelIdRaw,
+          collectionName,
+          staleMessageId: messageId,
+          error,
+        });
+      },
+    });
+  }
+}
+
 function buildCatalogIndexContent(channelName: string, totalPages: number) {
   return [
     `📚 ${channelName} 目录导航`,
@@ -677,12 +751,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
     const meta = parseCollectionMeta(task.mediaAsset?.sourceMeta);
     if (!meta) continue;
 
-    const parsedSeriesTitle = extractFieldValue(task.caption || '', /(?:^|\n)\s*📺?\s*片名\s*[：:]\s*(.+)/);
-    const fallbackSeriesTitle = normalizeDisplayTitle(meta.collectionName, `《${meta.collectionName}》`);
-    const seriesTitle = parsedSeriesTitle
-      ? normalizeDisplayTitle(parsedSeriesTitle, fallbackSeriesTitle)
-      : fallbackSeriesTitle;
-    const episodeTitle = seriesTitle;
+    const episodeTitle = getFileStem(task.mediaAsset?.originalName || '') || `第${meta.episodeNo}集`;
 
     const group = collectionGroups.get(meta.collectionName) ?? [];
     group.push({
@@ -723,14 +792,22 @@ export async function handleCatalogJob(channelIdRaw: string) {
     }
   }
 
+  let existingCollections: Array<{
+    name: string;
+    nameNormalized: string | null;
+    navEnabled: boolean;
+    navPageSize: number;
+  }> = [];
   if (collectionGroups.size > 0) {
-    const existingCollections = await prisma.collection.findMany({
+    existingCollections = await prisma.collection.findMany({
       where: { channelId },
-      select: { name: true, nameNormalized: true },
+      select: { name: true, nameNormalized: true, navEnabled: true, navPageSize: true },
     });
 
     const allowedCollectionNames = new Set(
-      existingCollections.map((item) => normalizeCollectionKey(item.nameNormalized || item.name)),
+      existingCollections
+        .filter((item) => item.navEnabled)
+        .map((item) => normalizeCollectionKey(item.nameNormalized || item.name)),
     );
 
     for (const name of [...collectionGroups.keys()]) {
@@ -768,9 +845,17 @@ export async function handleCatalogJob(channelIdRaw: string) {
   const collectionSections: string[] = [];
   let collectionIndexLinkInMainCatalog: string | null = null;
   let nextCollectionNavState: CollectionNavState | null = null;
+  const existingNavState = parseCollectionNavState(channel.navReplyMarkup);
+  if (collectionGroups.size === 0) {
+    await deleteCollectionNavStateMessages({
+      botToken,
+      chatId: channel.tgChatId,
+      channelIdRaw,
+      state: existingNavState,
+    });
+  }
   if (collectionGroups.size > 0) {
     const names = [...collectionGroups.keys()].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
-    const existingNavState = parseCollectionNavState(channel.navReplyMarkup);
     const detailMessageIds: Record<string, number> = {};
     const detailPageMessageIds: Record<string, number[]> = {};
 
@@ -778,35 +863,18 @@ export async function handleCatalogJob(channelIdRaw: string) {
 
     const collectionNameToNormalized = new Map(names.map((name) => [name, normalizeCollectionKey(name)]));
     const normalizedNames = [...new Set(collectionNameToNormalized.values())];
+    const requestedNameSet = new Set(names);
+    const requestedNormalizedNameSet = new Set(normalizedNames);
+    const collectionConfigs = existingCollections.filter((item) => {
+      const normalizedItemName = normalizeCollectionKey(item.nameNormalized || item.name);
+      return requestedNameSet.has(item.name) || requestedNormalizedNameSet.has(normalizedItemName);
+    });
 
-    let collectionConfigs: Array<{ name: string; navPageSize: number | null }> = [];
-    const collectionModel = (prisma as any).collection;
-    if (!collectionModel) {
-      logger.warn('[q_catalog] Prisma collection 模型缺失，跳过合集配置读取', {
-        channelId: channelIdRaw,
-      });
-    } else {
-      const allChannelCollections: Array<{ name: string; navPageSize: number | null }> = await collectionModel.findMany({
-        where: { channelId },
-        select: {
-          name: true,
-          navPageSize: true,
-        },
-      });
-
-      const requestedNameSet = new Set(names);
-      const requestedNormalizedNameSet = new Set(normalizedNames);
-      collectionConfigs = allChannelCollections.filter((item) => {
-        const normalizedItemName = normalizeCollectionKey(item.name);
-        return requestedNameSet.has(item.name) || requestedNormalizedNameSet.has(normalizedItemName);
-      });
-
-      logger.info('[q_catalog] 合集配置原始读取结果(按频道)', {
-        channelId: channelIdRaw,
-        fetchedCount: allChannelCollections.length,
-        fetchedNames: allChannelCollections.map((item) => item.name),
-      });
-    }
+    logger.info('[q_catalog] 合集配置原始读取结果(按频道)', {
+      channelId: channelIdRaw,
+      fetchedCount: existingCollections.length,
+      fetchedNames: existingCollections.map((item) => item.name),
+    });
 
     const collectionNavPageSizeMap = new Map<string, number>();
     for (const item of collectionConfigs) {
@@ -911,25 +979,19 @@ export async function handleCatalogJob(channelIdRaw: string) {
       }
 
       const staleDetailPages = existingDetailPages.slice(publishedDetailPages.length);
-      for (const staleMessageId of staleDetailPages) {
-        try {
-          await sendTelegramRequest({
-            botToken,
-            method: 'deleteMessage',
-            payload: {
-              chat_id: channel.tgChatId,
-              message_id: staleMessageId,
-            },
-          });
-        } catch (deleteError) {
+      await deleteTelegramMessages({
+        botToken,
+        chatId: channel.tgChatId,
+        messageIds: staleDetailPages,
+        onError: (messageId, error) => {
           logError('[q_catalog] 删除旧合集详情分页消息失败', {
             channelId: channelIdRaw,
             collectionName: name,
-            staleMessageId,
-            error: deleteError,
+            staleMessageId: messageId,
+            error,
           });
-        }
-      }
+        },
+      });
 
       if (publishedDetailPages.length > 0) {
         detailMessageIds[name] = publishedDetailPages[0];
@@ -994,24 +1056,18 @@ export async function handleCatalogJob(channelIdRaw: string) {
     }
 
     const staleIndexPages = existingIndexPages.slice(publishedIndexPages.length);
-    for (const staleMessageId of staleIndexPages) {
-      try {
-        await sendTelegramRequest({
-          botToken,
-          method: 'deleteMessage',
-          payload: {
-            chat_id: channel.tgChatId,
-            message_id: staleMessageId,
-          },
-        });
-      } catch (deleteError) {
+    await deleteTelegramMessages({
+      botToken,
+      chatId: channel.tgChatId,
+      messageIds: staleIndexPages,
+      onError: (messageId, error) => {
         logError('[q_catalog] 删除旧合集索引分页消息失败', {
           channelId: channelIdRaw,
-          staleMessageId,
-          error: deleteError,
+          staleMessageId: messageId,
+          error,
         });
-      }
-    }
+      },
+    });
 
     const indexMessageId = publishedIndexPages[0] ?? null;
     collectionIndexLinkInMainCatalog = indexMessageId
@@ -1023,25 +1079,19 @@ export async function handleCatalogJob(channelIdRaw: string) {
     );
     for (const staleName of staleCollectionNames) {
       const stalePages = existingNavState.detailPageMessageIds[staleName] ?? [];
-      for (const staleMessageId of stalePages) {
-        try {
-          await sendTelegramRequest({
-            botToken,
-            method: 'deleteMessage',
-            payload: {
-              chat_id: channel.tgChatId,
-              message_id: staleMessageId,
-            },
-          });
-        } catch (deleteError) {
+      await deleteTelegramMessages({
+        botToken,
+        chatId: channel.tgChatId,
+        messageIds: stalePages,
+        onError: (messageId, error) => {
           logError('[q_catalog] 删除旧合集详情消息失败', {
             channelId: channelIdRaw,
             collectionName: staleName,
-            staleMessageId,
-            error: deleteError,
+            staleMessageId: messageId,
+            error,
           });
-        }
-      }
+        },
+      });
     }
 
     nextCollectionNavState = {
@@ -1061,6 +1111,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
 
   const content = [mainCatalogContent, ...collectionSections].filter(Boolean).join('\n\n');
   const contentPreview = content.slice(0, 4000);
+  const hasMainCatalogContent = mainCatalogContent.trim().length > 0;
   let pinAttempted = false;
   let pinSuccess: boolean | null = null;
   let pinErrorMessage: string | null = null;
@@ -1069,13 +1120,30 @@ export async function handleCatalogJob(channelIdRaw: string) {
     const channelAny = channel as any;
     const storedPageMessageIds = parseStoredPageMessageIds(channelAny.navPageMessageIds);
     const publishedPageMessageIds: number[] = [];
+    const existingMainNavMessageId = channel.navMessageId ? Number(channel.navMessageId) : null;
 
-    if (pageContents.length <= 1) {
+    if (!hasMainCatalogContent) {
+      await deleteTelegramMessages({
+        botToken,
+        chatId: channel.tgChatId,
+        messageIds: [
+          ...(existingMainNavMessageId ? [existingMainNavMessageId] : []),
+          ...storedPageMessageIds,
+        ],
+        onError: (messageId, error) => {
+          logError('[q_catalog] 删除旧频道导航消息失败', {
+            channelId: channelIdRaw,
+            staleMessageId: messageId,
+            error,
+          });
+        },
+      });
+    } else if (pageContents.length <= 1) {
       const publishResult = await publishCatalogMessage({
         botToken,
         chatId: channel.tgChatId,
         text: mainCatalogContent,
-        existingMessageId: channel.navMessageId ? Number(channel.navMessageId) : null,
+        existingMessageId: existingMainNavMessageId,
         clearReplyMarkup: true,
       });
 
@@ -1132,7 +1200,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
         botToken,
         chatId: channel.tgChatId,
         text: buildCatalogIndexContent(channel.name, pageContents.length),
-        existingMessageId: channel.navMessageId ? Number(channel.navMessageId) : null,
+        existingMessageId: existingMainNavMessageId,
         replyMarkup: indexReplyMarkup,
       });
 
@@ -1154,25 +1222,21 @@ export async function handleCatalogJob(channelIdRaw: string) {
       }
     }
 
-    const stalePageMessageIds = storedPageMessageIds.slice(publishedPageMessageIds.length);
-    for (const staleMessageId of stalePageMessageIds) {
-      try {
-        await sendTelegramRequest({
-          botToken,
-          method: 'deleteMessage',
-          payload: {
-            chat_id: channel.tgChatId,
-            message_id: staleMessageId,
-          },
-        });
-      } catch (deleteError) {
+    const stalePageMessageIds = hasMainCatalogContent
+      ? storedPageMessageIds.slice(publishedPageMessageIds.length)
+      : [];
+    await deleteTelegramMessages({
+      botToken,
+      chatId: channel.tgChatId,
+      messageIds: stalePageMessageIds,
+      onError: (messageId, error) => {
         logError('[q_catalog] 删除旧目录分页消息失败', {
           channelId: channelIdRaw,
-          staleMessageId,
-          error: deleteError,
+          staleMessageId: messageId,
+          error,
         });
-      }
-    }
+      },
+    });
 
     try {
       await prisma.channel.update({
