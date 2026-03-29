@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: tg_crm
     ports:
-      - "127.0.0.1:5432:5432"
+      - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -22,7 +22,7 @@ services:
     container_name: tg-crm-redisv2
     restart: unless-stopped
     ports:
-      - "127.0.0.1:6379:6379"
+      - "6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -81,7 +81,7 @@ services:
       CORS_ORIGIN: ${CORS_ORIGIN}
     command: sh -c "pnpm --filter @tg-crm/api exec prisma generate && pnpm --filter @tg-crm/api run start"
     ports:
-      - "127.0.0.1:3001:3001" # 如果你配置好反代后，为了安全，可以把这里的对外端口映射删掉
+      - "3001:3001" # 如果你配置好反代后，为了安全，可以把这里的对外端口映射删掉
     volumes:
       - ./data/tg-crm:/data
       # 👇 映射 API 服务日志到宿主机
@@ -172,14 +172,14 @@ services:
     command: ["tail -f /dev/null"]
 
   tg-bot-api-v2:
-    image: aiogram/telegram-bot-api:7.6
+    image: aiogram/telegram-bot-api:latest
     container_name: tg-bot-api-v2
     restart: unless-stopped
     environment:
-      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
-      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
-      TELEGRAM_LOCAL: ${TELEGRAM_LOCAL:-1}
-      TELEGRAM_VERBOSITY: ${TELEGRAM_VERBOSITY:-4}
+      TELEGRAM_API_ID: "6"
+      TELEGRAM_API_HASH: "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+      TELEGRAM_LOCAL: "1"
+      TELEGRAM_VERBOSITY: "4"
     command:
       - "--http-timeout"
       - "3600"
@@ -218,7 +218,7 @@ services:
       - opensearch_data:/usr/share/opensearch/data
 
   alist:
-    image: xhofe/alist:v3.45.0
+    image: xhofe/alist:latest
     container_name: tg-crm-alistv2
     restart: unless-stopped
     ports:
@@ -258,8 +258,8 @@ services:
       - ./worker/logs:/logs/worker
     command: >-
       sh -c "while true; do
-      find /logs/api /logs/worker -type f -name '*.log' -mtime +$${LOG_RETENTION_DAYS} -delete;
-      sleep $$((CLEAN_INTERVAL_HOURS * 3600));
+      find /logs/api /logs/worker -type f -name '*.log' -mtime +${LOG_RETENTION_DAYS} -delete;
+      sleep $((CLEAN_INTERVAL_HOURS * 3600));
       done"
 
   # 【备份】：系统级综合备份服务 (每天凌晨 4:00 统一打包核心配置与数据)
