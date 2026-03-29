@@ -264,6 +264,7 @@ model Collection {
   id                  BigInt              @id @default(autoincrement())
   channelId           BigInt              @map("channel_id")
   name                String              @db.VarChar(128)
+  nameNormalized      String              @map("name_normalized") @db.VarChar(128)
   slug                String?             @db.VarChar(128)
   dirPath             String              @map("dir_path") @db.VarChar(255)
   coverAssetId        BigInt?             @map("cover_asset_id")
@@ -284,6 +285,7 @@ model Collection {
   createdByUser       User?               @relation(fields: [createdBy], references: [id])
 
   @@unique([channelId, name])
+  @@unique([channelId, nameNormalized])
   @@unique([channelId, dirPath])
   @@index([channelId, status, sortOrder])
   @@index([channelId, navEnabled])

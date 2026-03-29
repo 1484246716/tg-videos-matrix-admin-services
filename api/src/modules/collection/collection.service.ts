@@ -18,6 +18,13 @@ type SaveCollectionDto = {
   templateText?: string;
 };
 
+function normalizeCollectionName(name: string) {
+  return name
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function parseCollectionMeta(sourceMeta: unknown) {
   if (!sourceMeta || typeof sourceMeta !== 'object') return null;
   const meta = sourceMeta as Record<string, unknown>;
@@ -212,15 +219,32 @@ export class CollectionService {
     });
     if (!channel) throw new NotFoundException('channel not found');
 
+    const normalizedName = normalizeCollectionName(dto.name || '');
+    if (!normalizedName) {
+      throw new BadRequestException('name is required');
+    }
+
+    const existed = await this.prisma.collection.findFirst({
+      where: {
+        channelId: BigInt(dto.channelId),
+        nameNormalized: normalizedName,
+      },
+      select: { id: true, name: true },
+    });
+    if (existed) {
+      throw new BadRequestException(`合集名称已存在: ${existed.name}`);
+    }
+
     await this.ensureCollectionFolderExists({
       channelFolderPath: channel.folderPath,
-      collectionName: dto.name,
+      collectionName: normalizedName,
     });
 
     const created = await this.prisma.collection.create({
       data: {
         channelId: BigInt(dto.channelId),
-        name: dto.name,
+        name: normalizedName,
+        nameNormalized: normalizedName,
         slug: dto.slug || null,
         dirPath: dto.dirPath,
         status: dto.status,
@@ -241,6 +265,7 @@ export class CollectionService {
       sourceId: created.id.toString(),
       channelId: created.channelId.toString(),
     });
+    await this.enqueueCatalogRefresh(created.channelId.toString());
 
     return this.toResponse(created);
   }
@@ -251,38 +276,86 @@ export class CollectionService {
         role === 'admin'
           ? { id: BigInt(id) }
           : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
-      select: { id: true, channelId: true, channel: { select: { folderPath: true } } },
+      select: {
+        id: true,
+        channelId: true,
+        name: true,
+        nameNormalized: true,
+        navEnabled: true,
+        indexMessageId: true,
+        indexPageMessageIds: true,
+        lastBuiltAt: true,
+        channel: { select: { folderPath: true, tgChatId: true } },
+        _count: { select: { episodes: true } },
+      },
     });
     if (!existing) throw new NotFoundException('collection not found');
 
-    if (dto.name || dto.channelId) {
-      const channelId = dto.channelId ? BigInt(dto.channelId) : existing.channelId;
-      const channel = await this.prisma.channel.findFirst({
-        where:
-          role === 'admin'
-            ? { id: channelId }
-            : { id: channelId, createdBy: userId ? BigInt(userId) : undefined },
-        select: { id: true, folderPath: true },
+    const nextChannelId = dto.channelId ? BigInt(dto.channelId) : existing.channelId;
+    const nameProvided = typeof dto.name === 'string';
+    const nextNameNormalized = nameProvided ? normalizeCollectionName(dto.name || '') : existing.nameNormalized;
+
+    if (nameProvided && !nextNameNormalized) {
+      throw new BadRequestException('name is required');
+    }
+
+    const channel = await this.prisma.channel.findFirst({
+      where:
+        role === 'admin'
+          ? { id: nextChannelId }
+          : { id: nextChannelId, createdBy: userId ? BigInt(userId) : undefined },
+      select: { id: true, folderPath: true, tgChatId: true },
+    });
+
+    if (!channel) {
+      throw new NotFoundException('channel not found');
+    }
+
+    const isNameOrChannelChanged =
+      nextChannelId !== existing.channelId || nextNameNormalized !== existing.nameNormalized;
+
+    const isNameChanged = nextNameNormalized !== existing.nameNormalized;
+    const hasCatalogRecords = Boolean(
+      existing.navEnabled ||
+      existing.indexMessageId != null ||
+      (Array.isArray(existing.indexPageMessageIds) && existing.indexPageMessageIds.length > 0) ||
+      existing.lastBuiltAt != null,
+    );
+
+    if (isNameChanged && hasCatalogRecords) {
+      throw new BadRequestException('该合集已有目录记录，禁止修改合集名称');
+    }
+
+    if (isNameChanged && (existing._count?.episodes ?? 0) > 0) {
+      throw new BadRequestException('该合集已有视频，禁止修改合集名称');
+    }
+
+    if (isNameOrChannelChanged) {
+      const conflict = await this.prisma.collection.findFirst({
+        where: {
+          id: { not: existing.id },
+          channelId: nextChannelId,
+          nameNormalized: nextNameNormalized,
+        },
+        select: { id: true, name: true },
       });
 
-      if (!channel) {
-        throw new NotFoundException('channel not found');
+      if (conflict) {
+        throw new BadRequestException(`合集名称已存在: ${conflict.name}`);
       }
 
-      const collectionName = (dto.name || '').trim();
-      if (collectionName) {
-        await this.ensureCollectionFolderExists({
-          channelFolderPath: channel.folderPath,
-          collectionName,
-        });
-      }
+      await this.ensureCollectionFolderExists({
+        channelFolderPath: channel.folderPath,
+        collectionName: nextNameNormalized,
+      });
     }
 
     const updated = await this.prisma.collection.update({
       where: { id: BigInt(id) },
       data: {
         channelId: dto.channelId ? BigInt(dto.channelId) : undefined,
-        name: dto.name,
+        name: nameProvided ? nextNameNormalized : undefined,
+        nameNormalized: nameProvided ? nextNameNormalized : undefined,
         slug: dto.slug || undefined,
         dirPath: dto.dirPath,
         status: dto.status,
@@ -302,6 +375,7 @@ export class CollectionService {
       sourceId: updated.id.toString(),
       channelId: updated.channelId.toString(),
     });
+    await this.enqueueCatalogRefresh(updated.channelId.toString());
 
     return this.toResponse(updated);
   }
@@ -568,15 +642,50 @@ export class CollectionService {
         id: true,
         name: true,
         channel: {
-          select: { folderPath: true },
+          select: { id: true, folderPath: true },
         },
       },
     });
     if (!existing) throw new NotFoundException('collection not found');
 
     try {
-      await this.prisma.collection.delete({
-        where: { id: BigInt(id) },
+      const episodeRows = await this.prisma.collectionEpisode.findMany({
+        where: { collectionId: existing.id },
+        select: { mediaAssetId: true },
+      });
+
+      const metaAssets = await this.prisma.mediaAsset.findMany({
+        where: {
+          channelId: existing.channel.id,
+          AND: [
+            { sourceMeta: { path: ['isCollection'], equals: true } },
+            { sourceMeta: { path: ['collectionName'], equals: existing.name } },
+          ],
+        },
+        select: { id: true },
+      });
+
+      const mediaAssetIds = Array.from(
+        new Set([
+          ...episodeRows.map((row) => row.mediaAssetId),
+          ...metaAssets.map((row) => row.id),
+        ]),
+      );
+
+      await this.prisma.$transaction(async (tx) => {
+        if (mediaAssetIds.length > 0) {
+          await tx.dispatchTask.deleteMany({
+            where: { mediaAssetId: { in: mediaAssetIds } },
+          });
+
+          await tx.mediaAsset.deleteMany({
+            where: { id: { in: mediaAssetIds } },
+          });
+        }
+
+        await tx.collection.delete({
+          where: { id: existing.id },
+        });
       });
 
       await this.removeCollectionFolderIfExists({
@@ -589,6 +698,7 @@ export class CollectionService {
         sourceId: existing.id.toString(),
         action: 'delete',
       });
+      await this.enqueueCatalogRefresh(existing.channel.id.toString());
 
       return { ok: true };
     } catch (error) {
@@ -613,6 +723,27 @@ export class CollectionService {
       });
     } catch (error) {
       console.error('[collection] 搜索索引入队失败（不阻塞）', error);
+    }
+  }
+
+  private async enqueueCatalogRefresh(channelId: string) {
+    try {
+      const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+      const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+      const queue = new Queue('q_catalog', { connection: connection as any });
+      await queue.add(
+        'catalog-refresh-by-collection-change',
+        { channelIdRaw: channelId, source: 'collection-change' },
+        {
+          jobId: `catalog-refresh-${channelId}`,
+          removeOnComplete: true,
+          removeOnFail: 100,
+        },
+      );
+      await queue.close();
+      await connection.quit();
+    } catch (error) {
+      console.error('[collection] 目录刷新入队失败（不阻塞）', error);
     }
   }
 }

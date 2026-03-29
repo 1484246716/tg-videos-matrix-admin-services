@@ -677,12 +677,17 @@ export async function handleCatalogJob(channelIdRaw: string) {
     const meta = parseCollectionMeta(task.mediaAsset?.sourceMeta);
     if (!meta) continue;
 
-    const fileNameTitle = getFileStem(task.mediaAsset?.originalName || '未命名视频');
+    const parsedSeriesTitle = extractFieldValue(task.caption || '', /(?:^|\n)\s*📺?\s*片名\s*[：:]\s*(.+)/);
+    const fallbackSeriesTitle = normalizeDisplayTitle(meta.collectionName, `《${meta.collectionName}》`);
+    const seriesTitle = parsedSeriesTitle
+      ? normalizeDisplayTitle(parsedSeriesTitle, fallbackSeriesTitle)
+      : fallbackSeriesTitle;
+    const episodeTitle = seriesTitle;
 
     const group = collectionGroups.get(meta.collectionName) ?? [];
     group.push({
       episodeNo: meta.episodeNo,
-      title: fileNameTitle,
+      title: episodeTitle,
       messageUrl: task.telegramMessageLink,
     });
     collectionGroups.set(meta.collectionName, group);
@@ -715,6 +720,24 @@ export async function handleCatalogJob(channelIdRaw: string) {
         isMissingPlaceholder: true,
       });
       collectionGroups.set(meta.collectionName, group);
+    }
+  }
+
+  if (collectionGroups.size > 0) {
+    const existingCollections = await prisma.collection.findMany({
+      where: { channelId },
+      select: { name: true, nameNormalized: true },
+    });
+
+    const allowedCollectionNames = new Set(
+      existingCollections.map((item) => normalizeCollectionKey(item.nameNormalized || item.name)),
+    );
+
+    for (const name of [...collectionGroups.keys()]) {
+      const normalized = normalizeCollectionKey(name);
+      if (!allowedCollectionNames.has(normalized)) {
+        collectionGroups.delete(name);
+      }
     }
   }
 
@@ -838,7 +861,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
 
       for (let pageIndex = 0; pageIndex < episodePages.length; pageIndex += 1) {
         const pageLines = episodePages[pageIndex].map((ep) => {
-          const displayTitle = getFileStem(ep.title).trim();
+          const displayTitle = ep.title.trim();
           const safeTitle = escapeHtml(displayTitle || `第${ep.episodeNo}集`);
 
           if (ep.isMissingPlaceholder || !ep.messageUrl) {
