@@ -85,6 +85,11 @@ export const PERMISSION_MODULES: PermissionModule[] = [
     ],
   },
   {
+    key: "search",
+    name: "搜索",
+    actions: [{ key: "view", name: "查看" }],
+  },
+  {
     key: "relay-channels",
     name: "中转私密频道管理",
     actions: [
@@ -148,6 +153,7 @@ export const ROLE_TEMPLATES: RoleTemplate[] = [
       ...permissionsFor("media-lifecycle", ["view", "update", "delete"]),
       ...permissionsFor("mass-messaging", ["view", "create", "update", "delete"]),
       ...permissionsFor("collections", ["view", "create", "update", "delete"]),
+      ...permissionsFor("search", ["view"]),
       ...permissionsFor("bots", ["view", "create", "update"]),
       ...permissionsFor("relay-channels", ["view", "update"]),
     ],
@@ -164,6 +170,7 @@ export const ROLE_TEMPLATES: RoleTemplate[] = [
       ...permissionsFor("mass-messaging", ["view"]),
       ...permissionsFor("tasks", ["view"]),
       ...permissionsFor("collections", ["view"]),
+      ...permissionsFor("search", ["view"]),
       ...permissionsFor("bots", ["view"]),
       ...permissionsFor("relay-channels", ["view"]),
     ],

@@ -1,7 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
+import { PrismaService } from '../prisma/prisma.service';
 
 export interface JwtPayload {
     sub: string;
@@ -12,7 +13,10 @@ export interface JwtPayload {
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
-    constructor(configService: ConfigService) {
+    constructor(
+        configService: ConfigService,
+        private readonly prisma: PrismaService,
+    ) {
         super({
             jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
             ignoreExpiration: false,
@@ -20,12 +24,27 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         });
     }
 
-    validate(payload: JwtPayload) {
+    async validate(payload: JwtPayload) {
+        const user = await this.prisma.user.findUnique({
+            where: { id: BigInt(payload.sub) },
+            select: {
+                id: true,
+                username: true,
+                role: true,
+                status: true,
+                permissions: true,
+            },
+        });
+
+        if (!user || user.status !== 'active') {
+            throw new UnauthorizedException('账号不可用');
+        }
+
         return {
-            userId: payload.sub,
-            username: payload.username,
-            role: payload.role,
-            permissions: payload.permissions ?? [],
+            userId: user.id.toString(),
+            username: user.username,
+            role: user.role,
+            permissions: user.permissions ?? [],
         };
     }
 }
