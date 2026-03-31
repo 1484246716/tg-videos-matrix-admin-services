@@ -3,6 +3,15 @@ import dotenv from 'dotenv';
 dotenv.config({ path: '../.env' });
 dotenv.config();
 
+function getBooleanFlag(name: string, fallback: boolean) {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === 'true') return true;
+  if (normalized === 'false') return false;
+  return fallback;
+}
+
 export const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
 export const telegramApiBase =
   process.env.TELEGRAM_BOT_API_BASE || 'http://localhost:8081';
@@ -24,6 +33,22 @@ export const DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED = true;
 export const CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED = true;
 export const CHANNEL_LOCK_ENABLED = true;
 export const CHANNEL_LOCK_TTL_MS = Number(process.env.CHANNEL_LOCK_TTL_MS || '60000');
+export const ORDER_STRATEGY_FEATURE_ENABLED = getBooleanFlag(
+  'ORDER_STRATEGY_FEATURE_ENABLED',
+  true,
+);
+export const ORDER_STRATEGY_NORMAL_UPLOAD_GATE_ENABLED = getBooleanFlag(
+  'ORDER_STRATEGY_NORMAL_UPLOAD_GATE_ENABLED',
+  true,
+);
+export const ORDER_STRATEGY_NORMAL_DISPATCH_GATE_ENABLED = getBooleanFlag(
+  'ORDER_STRATEGY_NORMAL_DISPATCH_GATE_ENABLED',
+  true,
+);
+export const ORDER_STRATEGY_HEAD_BYPASS_ENABLED = getBooleanFlag(
+  'ORDER_STRATEGY_HEAD_BYPASS_ENABLED',
+  true,
+);
 
 export const GRAMJS_API_ID = Number(process.env.GRAMJS_API_ID || '0');
 export const GRAMJS_API_HASH = process.env.GRAMJS_API_HASH || '';

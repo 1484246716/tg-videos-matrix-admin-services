@@ -5,6 +5,13 @@ import { TYPEA_MAX_UPLOAD_SIZE_MB } from '../config/env';
 import { prisma, getTaskDefinitionModel } from '../infra/prisma';
 import { logger } from '../logger';
 import { hashFile, scanChannelVideos, waitForFileStable } from '../shared/file-utils';
+import {
+  buildCollectionOrderMeta,
+  buildNormalOrderMeta,
+  parseEpisodeOrderFromText,
+  parseOrderSchedulerConfig,
+  resolveOrderMeta,
+} from '../shared/order-meta';
 import { tryAcquireRelayPathLock, releaseRelayPathLock } from '../shared/relay-path-lock';
 import { TYPEA_INGEST_ERROR_CODE, TYPEA_INGEST_FINAL_REASON } from '../shared/metrics';
 
@@ -26,7 +33,13 @@ async function removeLocalDuplicateFile(filePath: string, mediaAssetId: string) 
   }
 }
 
-function parseCollectionMeta(filePath: string) {
+function formatCollectionOrderKey(collectionName: string, orderNo: number | null) {
+  if (orderNo === null) return `${collectionName}#missing`;
+  const abs = String(Math.abs(orderNo)).padStart(6, '0');
+  return `${collectionName}#${orderNo < 0 ? '-' : '+'}${abs}`;
+}
+
+function parseCollectionMeta(filePath: string, orderConfig: ReturnType<typeof parseOrderSchedulerConfig>) {
   const normalizedFile = filePath.replace(/\\/g, '/');
   const marker = '/collection/';
   const lowerFile = normalizedFile.toLowerCase();
@@ -39,34 +52,44 @@ function parseCollectionMeta(filePath: string) {
 
   const collectionName = parts[0];
   const fileName = parts[parts.length - 1];
-
-  const patterns = [
-    /\[第\s*(\d+)\s*(?:集|话|話)\]/,
-    /第\s*(\d+)\s*(?:集|话|話)/,
-    /S\d+E(\d+)/i,
-  ];
-
-  let episodeNo: number | null = null;
-  for (const pattern of patterns) {
-    const match = fileName.match(pattern);
-    if (!match || !match[1]) continue;
-    const parsed = Number(match[1]);
-    if (!Number.isFinite(parsed) || parsed <= 0) continue;
-    episodeNo = parsed;
-    break;
-  }
-
-  const episodeParseFailed = episodeNo === null;
-  const orderKey = `${collectionName}#${episodeNo ? String(episodeNo).padStart(4, '0') : '0000'}`;
+  const parsed = parseEpisodeOrderFromText(fileName, orderConfig);
+  const orderKey = formatCollectionOrderKey(collectionName, parsed.orderNo);
 
   return {
     isCollection: true,
     collectionName,
-    episodeNo,
-    episodeParseFailed,
+    episodeNo: parsed.episodeNo,
+    orderNo: parsed.orderNo,
+    episodeParseFailed: parsed.orderParseFailed,
+    episodeMatchedBy: parsed.matchedBy,
+    episodeMatchedToken: parsed.matchedToken,
     collectionPath: `Collection/${collectionName}`,
     collectionOrderKey: orderKey,
   };
+}
+
+function buildSourceOrderMeta(args: {
+  channelId: bigint;
+  collectionMeta: ReturnType<typeof parseCollectionMeta>;
+  normalOrderNo: number | null;
+}) {
+  if (args.collectionMeta) {
+    return {
+      ...args.collectionMeta,
+      ...buildCollectionOrderMeta({
+        channelId: args.channelId,
+        collectionName: args.collectionMeta.collectionName,
+        episodeNo: args.collectionMeta.episodeNo,
+        episodeParseFailed: args.collectionMeta.episodeParseFailed,
+        orderNo: args.collectionMeta.orderNo,
+      }),
+    };
+  }
+
+  return buildNormalOrderMeta({
+    channelId: args.channelId,
+    orderNo: args.normalOrderNo ?? 1,
+  });
 }
 
 export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
@@ -103,7 +126,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
         ? { id: { in: payloadChannelIds.map((id) => BigInt(id)) } }
         : {}),
     },
-    select: { id: true, folderPath: true },
+    select: { id: true, folderPath: true, navReplyMarkup: true },
   });
 
   const maxUploadSizeBytes = TYPEA_MAX_UPLOAD_SIZE_MB * 1024 * 1024;
@@ -114,12 +137,21 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
   let rejectedTooLarge = 0;
 
   for (const channel of channels) {
+    const orderConfig = parseOrderSchedulerConfig(channel.navReplyMarkup);
     let files: string[] = [];
     try {
       files = await scanChannelVideos(channel.folderPath);
     } catch {
       continue;
     }
+
+    const channelEntries: Array<{
+      filePath: string;
+      fileStat: Awaited<ReturnType<typeof stat>>;
+      pathLock: Awaited<ReturnType<typeof tryAcquireRelayPathLock>>;
+      collectionMeta: ReturnType<typeof parseCollectionMeta>;
+      sourceOrderMeta: Record<string, unknown>;
+    }> = [];
 
     for (const filePath of files) {
       scannedFiles += 1;
@@ -136,159 +168,84 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
 
       try {
         await waitForFileStable(filePath);
+        const fileStat = await stat(filePath);
+
+        channelEntries.push({
+          filePath,
+          fileStat,
+          pathLock,
+          collectionMeta: parseCollectionMeta(filePath, orderConfig),
+          sourceOrderMeta: {},
+        });
       } catch (error) {
         logger.warn('[relay] 文件未稳定或不可用，跳过', {
           filePath,
           reason: error instanceof Error ? error.message : String(error),
         });
         await releaseRelayPathLock(pathLock);
-        continue;
       }
+    }
 
-      try {
-        const s = await stat(filePath);
-
-      const existedByPath = await prisma.mediaAsset.findFirst({
-        where: {
-          localPath: filePath,
-          status: { in: [MediaStatus.ready, MediaStatus.ingesting, MediaStatus.relay_uploaded] },
-        },
-        select: { id: true, status: true },
+    const normalEntries = channelEntries
+      .filter((entry) => !entry.collectionMeta)
+      .sort((left, right) => {
+        if (left.fileStat.mtimeMs !== right.fileStat.mtimeMs) {
+          return Number(left.fileStat.mtimeMs) - Number(right.fileStat.mtimeMs);
+        }
+        const leftName = basename(left.filePath);
+        const rightName = basename(right.filePath);
+        if (leftName !== rightName) {
+          return leftName.localeCompare(rightName, 'zh-CN');
+        }
+        return left.filePath.localeCompare(right.filePath, 'zh-CN');
       });
 
-      if (existedByPath) {
-        logger.info('[relay] 扫描跳过：localPath 已存在活跃记录', {
-          filePath,
-          existedMediaAssetId: existedByPath.id.toString(),
-          existedStatus: existedByPath.status,
-          reason: 'path_dedup_skip',
+    normalEntries.forEach((entry, index) => {
+      entry.sourceOrderMeta = buildSourceOrderMeta({
+        channelId: channel.id,
+        collectionMeta: null,
+        normalOrderNo: index + 1,
+      });
+    });
+
+    channelEntries
+      .filter((entry) => entry.collectionMeta)
+      .forEach((entry) => {
+        entry.sourceOrderMeta = buildSourceOrderMeta({
+          channelId: channel.id,
+          collectionMeta: entry.collectionMeta,
+          normalOrderNo: null,
         });
-        continue;
-      }
+      });
 
-      if (s.size > maxUploadSizeBytes) {
-        const ingestError = `FILE_TOO_LARGE: file size ${s.size} exceeds ${maxUploadSizeBytes} bytes (${TYPEA_MAX_UPLOAD_SIZE_MB}MB policy)`;
+    for (const entry of channelEntries) {
+      const { filePath, fileStat, pathLock, collectionMeta, sourceOrderMeta } = entry;
+      const s = fileStat;
 
-        const fileHash = await hashFile(filePath);
-        const existed = await prisma.mediaAsset.findUnique({
+      try {
+        const existedByPath = await prisma.mediaAsset.findFirst({
           where: {
-            fileHash_fileSize: {
-              fileHash,
-              fileSize: s.size,
-            },
+            localPath: filePath,
+            status: { in: [MediaStatus.ready, MediaStatus.ingesting, MediaStatus.relay_uploaded] },
           },
-          select: { id: true, sourceMeta: true },
+          select: { id: true, status: true },
         });
 
-        const sourceMeta =
-          existed?.sourceMeta && typeof existed.sourceMeta === 'object'
-            ? (existed.sourceMeta as Record<string, unknown>)
-            : {};
-
-        if (existed) {
-          await prisma.mediaAsset.update({
-            where: { id: existed.id },
-            data: {
-              status: MediaStatus.failed,
-              ingestError,
-              sourceMeta: {
-                ...sourceMeta,
-                relayChannelId: definition.relayChannelId.toString(),
-                taskDefinitionId: definition.id.toString(),
-                ingestErrorCode: TYPEA_INGEST_ERROR_CODE.fileTooLarge,
-                ingestFinalReason: TYPEA_INGEST_FINAL_REASON.fileTooLarge,
-                ingestLeaseUntil: null,
-                ingestWorkerJobId: null,
-                ingestRejectedAt: new Date().toISOString(),
-              },
-            },
+        if (existedByPath) {
+          logger.info('[relay] 扫描跳过：localPath 已存在活跃记录', {
+            filePath,
+            existedMediaAssetId: existedByPath.id.toString(),
+            existedStatus: existedByPath.status,
+            reason: 'path_dedup_skip',
+            orderType: sourceOrderMeta.orderType,
+            orderGroup: sourceOrderMeta.orderGroup,
+            orderNo: sourceOrderMeta.orderNo,
           });
-        } else {
-          await prisma.mediaAsset.create({
-            data: {
-              channelId: channel.id,
-              originalName: basename(filePath),
-              localPath: filePath,
-              fileSize: BigInt(s.size),
-              fileHash,
-              status: MediaStatus.failed,
-              ingestError,
-              sourceMeta: {
-                relayChannelId: definition.relayChannelId.toString(),
-                taskDefinitionId: definition.id.toString(),
-                ingestErrorCode: TYPEA_INGEST_ERROR_CODE.fileTooLarge,
-                ingestFinalReason: TYPEA_INGEST_FINAL_REASON.fileTooLarge,
-                ingestRejectedAt: new Date().toISOString(),
-                relayPriority: definition.priority,
-                relayMaxRetries: definition.maxRetries,
-              },
-            },
-          });
-          createdAssets += 1;
+          continue;
         }
 
-        rejectedTooLarge += 1;
-        logger.warn('[typea_metrics] relay scan rejected too large file', {
-          typea_rejected_too_large_total: 1,
-          filePath,
-          fileSize: s.size,
-          maxUploadSizeBytes,
-          maxUploadSizeMb: TYPEA_MAX_UPLOAD_SIZE_MB,
-          metric_labels: {
-            typea_rejected_too_large_total: 'TypeA 超大小文件拒绝总数',
-          },
-        });
-        continue;
-      }
-
-      const hashStart = Date.now();
-      const fileHash = await hashFile(filePath);
-      const hashDurationMs = Date.now() - hashStart;
-      const collectionMeta = parseCollectionMeta(filePath);
-
-      if (collectionMeta?.episodeParseFailed) {
-        logger.warn('[relay] 合集集号解析失败，等待重命名后重扫', {
-          channelId: channel.id.toString(),
-          filePath,
-          collectionName: collectionMeta.collectionName,
-        });
-      }
-
-      if (collectionMeta && !collectionMeta.episodeParseFailed && collectionMeta.episodeNo !== null) {
-        const sameEpisodeAssets = await prisma.mediaAsset.findMany({
-          where: {
-            channelId: channel.id,
-            sourceMeta: {
-              path: ['collectionName'],
-              equals: collectionMeta.collectionName,
-            },
-          },
-          select: {
-            id: true,
-            localPath: true,
-            sourceMeta: true,
-            status: true,
-          },
-        });
-
-        const conflictAssets = sameEpisodeAssets.filter((asset) => {
-          if (asset.localPath === filePath) return false;
-          const meta =
-            asset.sourceMeta && typeof asset.sourceMeta === 'object'
-              ? (asset.sourceMeta as Record<string, unknown>)
-              : null;
-          if (!meta || meta.isCollection !== true) return false;
-          const epNo =
-            typeof meta.episodeNo === 'number'
-              ? meta.episodeNo
-              : typeof meta.episodeNo === 'string' && /^\d+$/.test(meta.episodeNo)
-                ? Number(meta.episodeNo)
-                : null;
-          return epNo === collectionMeta.episodeNo;
-        });
-
-        if (conflictAssets.length > 0) {
-          const ingestError = `COLLECTION_EPISODE_CONFLICT: ${collectionMeta.collectionName} 第${collectionMeta.episodeNo}集重复`; 
+        if (s.size > maxUploadSizeBytes) {
+          const ingestError = `FILE_TOO_LARGE: file size ${s.size} exceeds ${maxUploadSizeBytes} bytes (${TYPEA_MAX_UPLOAD_SIZE_MB}MB policy)`;
 
           const fileHash = await hashFile(filePath);
           const existed = await prisma.mediaAsset.findUnique({
@@ -301,29 +258,27 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
             select: { id: true, sourceMeta: true },
           });
 
-          const conflictIds = conflictAssets.map((asset) => asset.id.toString());
+          const sourceMeta =
+            existed?.sourceMeta && typeof existed.sourceMeta === 'object'
+              ? (existed.sourceMeta as Record<string, unknown>)
+              : {};
 
           if (existed) {
-            const sourceMetaExisted =
-              existed.sourceMeta && typeof existed.sourceMeta === 'object'
-                ? (existed.sourceMeta as Record<string, unknown>)
-                : {};
-
             await prisma.mediaAsset.update({
               where: { id: existed.id },
               data: {
                 status: MediaStatus.failed,
                 ingestError,
                 sourceMeta: {
-                  ...sourceMetaExisted,
-                  ...(collectionMeta ?? {}),
-                  episodeConflict: true,
-                  episodeConflictPolicy: 'block',
-                  episodeConflictAssetIds: conflictIds,
-                  ingestFinalReason: 'collection_episode_conflict',
-                  ingestErrorCode: 'COLLECTION_EPISODE_CONFLICT',
+                  ...sourceMeta,
+                  ...sourceOrderMeta,
                   relayChannelId: definition.relayChannelId.toString(),
                   taskDefinitionId: definition.id.toString(),
+                  ingestErrorCode: TYPEA_INGEST_ERROR_CODE.fileTooLarge,
+                  ingestFinalReason: TYPEA_INGEST_FINAL_REASON.fileTooLarge,
+                  ingestLeaseUntil: null,
+                  ingestWorkerJobId: null,
+                  ingestRejectedAt: new Date().toISOString(),
                 },
               },
             });
@@ -338,14 +293,12 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
                 status: MediaStatus.failed,
                 ingestError,
                 sourceMeta: {
-                  ...(collectionMeta ?? {}),
-                  episodeConflict: true,
-                  episodeConflictPolicy: 'block',
-                  episodeConflictAssetIds: conflictIds,
-                  ingestFinalReason: 'collection_episode_conflict',
-                  ingestErrorCode: 'COLLECTION_EPISODE_CONFLICT',
+                  ...sourceOrderMeta,
                   relayChannelId: definition.relayChannelId.toString(),
                   taskDefinitionId: definition.id.toString(),
+                  ingestErrorCode: TYPEA_INGEST_ERROR_CODE.fileTooLarge,
+                  ingestFinalReason: TYPEA_INGEST_FINAL_REASON.fileTooLarge,
+                  ingestRejectedAt: new Date().toISOString(),
                   relayPriority: definition.priority,
                   relayMaxRetries: definition.maxRetries,
                 },
@@ -354,60 +307,162 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
             createdAssets += 1;
           }
 
-          logger.warn('[relay] 合集重复集号冲突，按 block 策略阻塞派发', {
+          rejectedTooLarge += 1;
+          logger.warn('[typea_metrics] relay scan rejected too large file', {
+            typea_rejected_too_large_total: 1,
+            filePath,
+            fileSize: s.size,
+            maxUploadSizeBytes,
+            maxUploadSizeMb: TYPEA_MAX_UPLOAD_SIZE_MB,
+            orderType: sourceOrderMeta.orderType,
+            orderGroup: sourceOrderMeta.orderGroup,
+            orderNo: sourceOrderMeta.orderNo,
+            metric_labels: {
+              typea_rejected_too_large_total: 'TypeA 超大小文件拒绝总数',
+            },
+          });
+          continue;
+        }
+
+        const hashStart = Date.now();
+        const fileHash = await hashFile(filePath);
+        const hashDurationMs = Date.now() - hashStart;
+
+        if (collectionMeta?.episodeParseFailed) {
+          logger.warn('[relay] 合集集号解析失败，等待重命名后重扫', {
             channelId: channel.id.toString(),
             filePath,
             collectionName: collectionMeta.collectionName,
-            episodeNo: collectionMeta.episodeNo,
-            conflictAssetIds: conflictIds,
+            orderType: sourceOrderMeta.orderType,
+            orderGroup: sourceOrderMeta.orderGroup,
+            orderNo: sourceOrderMeta.orderNo,
+          });
+        }
+
+        if (collectionMeta && !collectionMeta.episodeParseFailed && collectionMeta.orderNo !== null) {
+          const sameEpisodeAssets = await prisma.mediaAsset.findMany({
+            where: {
+              channelId: channel.id,
+              sourceMeta: {
+                path: ['collectionName'],
+                equals: collectionMeta.collectionName,
+              },
+            },
+            select: {
+              id: true,
+              localPath: true,
+              sourceMeta: true,
+              status: true,
+            },
           });
 
-          continue;
+          const conflictAssets = sameEpisodeAssets.filter((asset) => {
+            if (asset.localPath === filePath) return false;
+            const resolved = resolveOrderMeta({ channelId: channel.id, sourceMeta: asset.sourceMeta });
+            return resolved.orderType === 'collection' && resolved.orderNo === collectionMeta.orderNo;
+          });
+
+          if (conflictAssets.length > 0) {
+            const conflictLabel =
+              collectionMeta.episodeNo !== null
+                ? `第${collectionMeta.episodeNo}集`
+                : `顺序号${collectionMeta.orderNo}`;
+            const ingestError = `COLLECTION_EPISODE_CONFLICT: ${collectionMeta.collectionName} ${conflictLabel}重复`;
+            const existed = await prisma.mediaAsset.findUnique({
+              where: {
+                fileHash_fileSize: {
+                  fileHash,
+                  fileSize: s.size,
+                },
+              },
+              select: { id: true, sourceMeta: true },
+            });
+
+            const conflictIds = conflictAssets.map((asset) => asset.id.toString());
+
+            if (existed) {
+              const sourceMetaExisted =
+                existed.sourceMeta && typeof existed.sourceMeta === 'object'
+                  ? (existed.sourceMeta as Record<string, unknown>)
+                  : {};
+
+              await prisma.mediaAsset.update({
+                where: { id: existed.id },
+                data: {
+                  status: MediaStatus.failed,
+                  ingestError,
+                  sourceMeta: {
+                    ...sourceMetaExisted,
+                    ...sourceOrderMeta,
+                    episodeConflict: true,
+                    episodeConflictPolicy: 'block',
+                    episodeConflictAssetIds: conflictIds,
+                    ingestFinalReason: 'collection_episode_conflict',
+                    ingestErrorCode: 'COLLECTION_EPISODE_CONFLICT',
+                    relayChannelId: definition.relayChannelId.toString(),
+                    taskDefinitionId: definition.id.toString(),
+                  },
+                },
+              });
+            } else {
+              await prisma.mediaAsset.create({
+                data: {
+                  channelId: channel.id,
+                  originalName: basename(filePath),
+                  localPath: filePath,
+                  fileSize: BigInt(s.size),
+                  fileHash,
+                  status: MediaStatus.failed,
+                  ingestError,
+                  sourceMeta: {
+                    ...sourceOrderMeta,
+                    episodeConflict: true,
+                    episodeConflictPolicy: 'block',
+                    episodeConflictAssetIds: conflictIds,
+                    ingestFinalReason: 'collection_episode_conflict',
+                    ingestErrorCode: 'COLLECTION_EPISODE_CONFLICT',
+                    relayChannelId: definition.relayChannelId.toString(),
+                    taskDefinitionId: definition.id.toString(),
+                    relayPriority: definition.priority,
+                    relayMaxRetries: definition.maxRetries,
+                  },
+                },
+              });
+              createdAssets += 1;
+            }
+
+            logger.warn('[relay] 合集重复集号冲突，按 block 策略阻塞派发', {
+              channelId: channel.id.toString(),
+              filePath,
+              collectionName: collectionMeta.collectionName,
+              episodeNo: collectionMeta.episodeNo,
+              conflictLabel,
+              conflictAssetIds: conflictIds,
+              orderType: sourceOrderMeta.orderType,
+              orderGroup: sourceOrderMeta.orderGroup,
+              orderNo: sourceOrderMeta.orderNo,
+            });
+            continue;
+          }
         }
-      }
 
-      if (hashDurationMs > 500) {
-        logger.info('[relay] hashFile 耗时', {
-          stage: 'hash_file',
-          filePath,
-          fileSize: s.size,
-          durationMs: hashDurationMs,
-        });
-      }
-
-      let asset = await prisma.mediaAsset.findUnique({
-        where: {
-          fileHash_fileSize: {
-            fileHash,
+        if (hashDurationMs > 500) {
+          logger.info('[relay] hashFile 耗时', {
+            stage: 'hash_file',
+            filePath,
             fileSize: s.size,
-          },
-        },
-        select: {
-          id: true,
-          status: true,
-          sourceMeta: true,
-          telegramFileId: true,
-          relayMessageId: true,
-        },
-      });
+            durationMs: hashDurationMs,
+            orderType: sourceOrderMeta.orderType,
+            orderGroup: sourceOrderMeta.orderGroup,
+            orderNo: sourceOrderMeta.orderNo,
+          });
+        }
 
-      if (!asset) {
-        asset = await prisma.mediaAsset.create({
-          data: {
-            channelId: channel.id,
-            originalName: basename(filePath),
-            localPath: filePath,
-            fileSize: BigInt(s.size),
-            fileHash,
-            status: MediaStatus.ready,
-            sourceMeta: {
-              relayChannelId: definition.relayChannelId.toString(),
-              taskDefinitionId: definition.id.toString(),
-              relayEnqueueAt: new Date().toISOString(),
-              relayPriority: definition.priority,
-              relayMaxRetries: definition.maxRetries,
-              ingestRetryCount: 0,
-              ...(collectionMeta ?? {}),
+        let asset = await prisma.mediaAsset.findUnique({
+          where: {
+            fileHash_fileSize: {
+              fileHash,
+              fileSize: s.size,
             },
           },
           select: {
@@ -418,130 +473,163 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
             relayMessageId: true,
           },
         });
-        createdAssets += 1;
-      }
 
-      if (!asset) {
-        continue;
-      }
-
-      const sourceMeta =
-        asset.sourceMeta && typeof asset.sourceMeta === 'object'
-          ? (asset.sourceMeta as Record<string, unknown>)
-          : {};
-      const ingestFinalReason =
-        typeof sourceMeta.ingestFinalReason === 'string'
-          ? sourceMeta.ingestFinalReason
-          : '';
-      const isRetryableFailed =
-        asset.status === MediaStatus.failed &&
-        ingestFinalReason === TYPEA_INGEST_FINAL_REASON.retryable;
-
-      const isAlreadyUploadedDuplicate =
-        asset.status === MediaStatus.relay_uploaded ||
-        Boolean(asset.telegramFileId) ||
-        Boolean(asset.relayMessageId);
-
-      if (isAlreadyUploadedDuplicate) {
-        const duplicateName = basename(filePath);
-        const duplicateError = `DUPLICATE_ALREADY_UPLOADED: 本地重复文件已跳过 ${duplicateName}`;
-
-        const existingDuplicateFailed = await prisma.mediaAsset.findFirst({
-          where: {
-            localPath: filePath,
-            status: MediaStatus.failed,
-            sourceMeta: {
-              path: ['ingestFinalReason'],
-              equals: 'duplicate_already_uploaded',
-            },
-          },
-          select: { id: true, sourceMeta: true },
-        });
-
-        if (existingDuplicateFailed) {
-          const failedMeta =
-            existingDuplicateFailed.sourceMeta && typeof existingDuplicateFailed.sourceMeta === 'object'
-              ? (existingDuplicateFailed.sourceMeta as Record<string, unknown>)
-              : {};
-
-          await prisma.mediaAsset.update({
-            where: { id: existingDuplicateFailed.id },
-            data: {
-              ingestError: duplicateError,
-              sourceMeta: {
-                ...failedMeta,
-                relayChannelId: definition.relayChannelId.toString(),
-                taskDefinitionId: definition.id.toString(),
-                ingestFinalReason: 'duplicate_already_uploaded',
-                duplicateDetectedAt: new Date().toISOString(),
-                duplicateLocalPath: filePath,
-                duplicateOfMediaAssetId: asset.id.toString(),
-              },
-            },
-          });
-        } else {
-          const dedupFileHash = `${fileHash}:dup:${Date.now().toString(36)}`;
-          await prisma.mediaAsset.create({
+        if (!asset) {
+          asset = await prisma.mediaAsset.create({
             data: {
               channelId: channel.id,
-              originalName: duplicateName,
+              originalName: basename(filePath),
               localPath: filePath,
               fileSize: BigInt(s.size),
-              fileHash: dedupFileHash,
-              status: MediaStatus.failed,
-              ingestError: duplicateError,
+              fileHash,
+              status: MediaStatus.ready,
               sourceMeta: {
+                ...sourceOrderMeta,
                 relayChannelId: definition.relayChannelId.toString(),
                 taskDefinitionId: definition.id.toString(),
-                ingestErrorCode: 'DUPLICATE_ALREADY_UPLOADED',
-                ingestFinalReason: 'duplicate_already_uploaded',
-                duplicateDetectedAt: new Date().toISOString(),
-                duplicateLocalPath: filePath,
-                duplicateOfMediaAssetId: asset.id.toString(),
+                relayEnqueueAt: new Date().toISOString(),
+                relayPriority: definition.priority,
+                relayMaxRetries: definition.maxRetries,
+                ingestRetryCount: 0,
               },
             },
+            select: {
+              id: true,
+              status: true,
+              sourceMeta: true,
+              telegramFileId: true,
+              relayMessageId: true,
+            },
+          });
+          createdAssets += 1;
+        }
+
+        if (!asset) {
+          continue;
+        }
+
+        const sourceMeta =
+          asset.sourceMeta && typeof asset.sourceMeta === 'object'
+            ? (asset.sourceMeta as Record<string, unknown>)
+            : {};
+        const ingestFinalReason =
+          typeof sourceMeta.ingestFinalReason === 'string'
+            ? sourceMeta.ingestFinalReason
+            : '';
+        const isRetryableFailed =
+          asset.status === MediaStatus.failed &&
+          ingestFinalReason === TYPEA_INGEST_FINAL_REASON.retryable;
+
+        const isAlreadyUploadedDuplicate =
+          asset.status === MediaStatus.relay_uploaded ||
+          Boolean(asset.telegramFileId) ||
+          Boolean(asset.relayMessageId);
+
+        if (isAlreadyUploadedDuplicate) {
+          const duplicateName = basename(filePath);
+          const duplicateError = `DUPLICATE_ALREADY_UPLOADED: 本地重复文件已跳过 ${duplicateName}`;
+
+          const existingDuplicateFailed = await prisma.mediaAsset.findFirst({
+            where: {
+              localPath: filePath,
+              status: MediaStatus.failed,
+              sourceMeta: {
+                path: ['ingestFinalReason'],
+                equals: 'duplicate_already_uploaded',
+              },
+            },
+            select: { id: true, sourceMeta: true },
+          });
+
+          if (existingDuplicateFailed) {
+            const failedMeta =
+              existingDuplicateFailed.sourceMeta && typeof existingDuplicateFailed.sourceMeta === 'object'
+                ? (existingDuplicateFailed.sourceMeta as Record<string, unknown>)
+                : {};
+
+            await prisma.mediaAsset.update({
+              where: { id: existingDuplicateFailed.id },
+              data: {
+                ingestError: duplicateError,
+                sourceMeta: {
+                  ...failedMeta,
+                  ...sourceOrderMeta,
+                  relayChannelId: definition.relayChannelId.toString(),
+                  taskDefinitionId: definition.id.toString(),
+                  ingestFinalReason: 'duplicate_already_uploaded',
+                  duplicateDetectedAt: new Date().toISOString(),
+                  duplicateLocalPath: filePath,
+                  duplicateOfMediaAssetId: asset.id.toString(),
+                },
+              },
+            });
+          } else {
+            const dedupFileHash = `${fileHash}:dup:${Date.now().toString(36)}`;
+            await prisma.mediaAsset.create({
+              data: {
+                channelId: channel.id,
+                originalName: duplicateName,
+                localPath: filePath,
+                fileSize: BigInt(s.size),
+                fileHash: dedupFileHash,
+                status: MediaStatus.failed,
+                ingestError: duplicateError,
+                sourceMeta: {
+                  ...sourceOrderMeta,
+                  relayChannelId: definition.relayChannelId.toString(),
+                  taskDefinitionId: definition.id.toString(),
+                  ingestErrorCode: 'DUPLICATE_ALREADY_UPLOADED',
+                  ingestFinalReason: 'duplicate_already_uploaded',
+                  duplicateDetectedAt: new Date().toISOString(),
+                  duplicateLocalPath: filePath,
+                  duplicateOfMediaAssetId: asset.id.toString(),
+                },
+              },
+            });
+          }
+
+          await removeLocalDuplicateFile(filePath, asset.id.toString());
+          continue;
+        }
+
+        if (
+          asset.status === MediaStatus.ingesting ||
+          (asset.status === MediaStatus.failed && !isRetryableFailed)
+        ) {
+          continue;
+        }
+
+        if (isRetryableFailed) {
+          logger.info('[typea_metrics] relay scan recovered retryable failed asset', {
+            mediaAssetId: asset.id.toString(),
+            typea_recovered_retryable_failed_total: 1,
+            metric_labels: {
+              typea_recovered_retryable_failed_total: 'TypeA 扫描阶段恢复可重试失败任务总数',
+            },
+            orderType: sourceOrderMeta.orderType,
+            orderGroup: sourceOrderMeta.orderGroup,
+            orderNo: sourceOrderMeta.orderNo,
           });
         }
 
-        await removeLocalDuplicateFile(filePath, asset.id.toString());
-        continue;
-      }
-
-      if (
-        asset.status === MediaStatus.ingesting ||
-        (asset.status === MediaStatus.failed && !isRetryableFailed)
-      ) {
-        continue;
-      }
-
-      if (isRetryableFailed) {
-        logger.info('[typea_metrics] relay scan recovered retryable failed asset', {
-          mediaAssetId: asset.id.toString(),
-          typea_recovered_retryable_failed_total: 1,
-          metric_labels: {
-            typea_recovered_retryable_failed_total: 'TypeA 扫描阶段恢复可重试失败任务总数',
+        await prisma.mediaAsset.update({
+          where: { id: asset.id },
+          data: {
+            status: MediaStatus.ready,
+            ingestError: null,
+            sourceMeta: {
+              ...sourceMeta,
+              ...sourceOrderMeta,
+              relayChannelId: definition.relayChannelId.toString(),
+              taskDefinitionId: definition.id.toString(),
+              relayEnqueueAt: new Date().toISOString(),
+              relayPriority: definition.priority,
+              relayMaxRetries: definition.maxRetries,
+            },
           },
         });
-      }
 
-      await prisma.mediaAsset.update({
-        where: { id: asset.id },
-        data: {
-          status: MediaStatus.ready,
-          ingestError: null,
-          sourceMeta: {
-            ...sourceMeta,
-            relayChannelId: definition.relayChannelId.toString(),
-            taskDefinitionId: definition.id.toString(),
-            relayEnqueueAt: new Date().toISOString(),
-            relayPriority: definition.priority,
-            relayMaxRetries: definition.maxRetries,
-            ...(collectionMeta ?? {}),
-          },
-        },
-      });
-
-      enqueuedTasks += 1;
+        enqueuedTasks += 1;
       } finally {
         await releaseRelayPathLock(pathLock);
       }

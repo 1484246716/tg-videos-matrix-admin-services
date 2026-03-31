@@ -5,6 +5,7 @@ import { prisma } from '../infra/prisma';
 import { searchIndexQueue } from '../infra/redis';
 import { logger, logError } from '../logger';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
+import { resolveOrderMeta } from '../shared/order-meta';
 import { sendVideoByTelegram, TelegramError } from '../shared/telegram';
 
 function isParseEntitiesError(error: { code?: string; message?: string } | null | undefined) {
@@ -67,6 +68,19 @@ function applyCollectionEpisodeTitle(caption: string, title: string) {
   return `${desiredLine}\n${trimmedCaption}`;
 }
 
+function buildDispatchOrderLogFields(channelId: bigint, sourceMeta: unknown, mediaAssetId: bigint) {
+  const orderMeta = resolveOrderMeta({ channelId, sourceMeta });
+  return {
+    mediaAssetId: mediaAssetId.toString(),
+    orderType: orderMeta.orderType,
+    orderGroup: orderMeta.orderGroup,
+    orderNo: orderMeta.orderNo,
+    orderParseFailed: orderMeta.orderParseFailed,
+    collectionName: orderMeta.collectionName,
+    episodeNo: orderMeta.episodeNo,
+  };
+}
+
 export async function handleDispatchJob(
   dispatchTaskIdRaw: string,
   jobId: string,
@@ -108,6 +122,12 @@ export async function handleDispatchJob(
     throw new Error(`未找到分发任务: ${dispatchTaskIdRaw}`);
   }
 
+  const orderLogFields = buildDispatchOrderLogFields(
+    task.channelId,
+    task.mediaAsset.sourceMeta,
+    task.mediaAsset.id,
+  );
+
   await prisma.dispatchTask.update({
     where: { id: dispatchTaskId },
     data: {
@@ -123,8 +143,17 @@ export async function handleDispatchJob(
       detail: {
         jobId,
         attemptsMade,
+        ...orderLogFields,
       },
     },
+  });
+
+  logger.info('[q_dispatch] 开始执行分发任务', {
+    dispatchTaskId: dispatchTaskIdRaw,
+    channelId: task.channelId.toString(),
+    jobId,
+    attemptsMade,
+    ...orderLogFields,
   });
 
   try {
@@ -286,6 +315,7 @@ export async function handleDispatchJob(
               postIntervalSec: intervalSec,
               lastPostAt: task.channel.lastPostAt?.toISOString() ?? null,
               nextAllowedAt: nextAllowedAt.toISOString(),
+              ...orderLogFields,
             },
           },
         });
@@ -296,6 +326,7 @@ export async function handleDispatchJob(
           postIntervalSec: intervalSec,
           lastPostAt: task.channel.lastPostAt?.toISOString() ?? null,
           nextAllowedAt: nextAllowedAt.toISOString(),
+          ...orderLogFields,
         });
 
         return {
@@ -370,8 +401,17 @@ export async function handleDispatchJob(
           botId: bot.id.toString(),
           messageId: sendResult.messageId,
           messageLink: sendResult.messageLink,
+          ...orderLogFields,
         },
       },
+    });
+
+    logger.info('[q_dispatch] 分发任务发送成功', {
+      dispatchTaskId: dispatchTaskIdRaw,
+      channelId: task.channelId.toString(),
+      messageId: sendResult.messageId,
+      messageLink: sendResult.messageLink,
+      ...orderLogFields,
     });
 
     // ── 触发搜索索引更新（延迟2秒等AI caption等后续处理完成）──
@@ -436,8 +476,21 @@ export async function handleDispatchJob(
           retryCount: nextRetryCount,
           nextRunAt: nextStatus === TaskStatus.dead ? null : nextRunAt,
           deterministic,
+          ...orderLogFields,
         },
       },
+    });
+
+    logger.warn('[q_dispatch] 分发任务执行失败', {
+      dispatchTaskId: dispatchTaskIdRaw,
+      channelId: task.channelId.toString(),
+      errorCode: code,
+      errorMessage: message,
+      retryCount: nextRetryCount,
+      nextStatus,
+      nextRunAt: nextStatus === TaskStatus.dead ? null : nextRunAt.toISOString(),
+      deterministic,
+      ...orderLogFields,
     });
 
     if (code === 'TG_429' || code === 'TG_403') {
@@ -456,6 +509,7 @@ export async function handleDispatchJob(
             telegramErrorMessage: message,
             retryCount: nextRetryCount,
             jobId,
+            ...orderLogFields,
           },
         },
       });

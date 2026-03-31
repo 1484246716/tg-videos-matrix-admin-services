@@ -267,6 +267,7 @@ model Collection {
   nameNormalized      String              @map("name_normalized") @db.VarChar(128)
   slug                String?             @db.VarChar(128)
   dirPath             String              @map("dir_path") @db.VarChar(255)
+  extConfig           Json?               @map("ext_config")
   coverAssetId        BigInt?             @map("cover_asset_id")
   description         String?
   status              ChannelStatus       @default(active)
