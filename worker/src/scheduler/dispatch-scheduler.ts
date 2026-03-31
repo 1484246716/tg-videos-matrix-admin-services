@@ -14,6 +14,23 @@ const DISPATCH_HEAD_BYPASS_DELAY_SEC = 10 * 60;
 const COLLECTION_SKIP_GRACE_MS = 5 * 60 * 1000;
 const COLLECTION_SKIP_REASON = 'auto_skip_missing_after_grace';
 
+function parseEpisodeNoFromText(text: string) {
+  const patterns = [
+    /\[第\s*(\d+)\s*(?:集|话|話)\]/,
+    /第\s*(\d+)\s*(?:集|话|話)/,
+    /S\d+E(\d+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match || !match[1]) continue;
+    const parsed = Number(match[1]);
+    if (!Number.isFinite(parsed) || parsed <= 0) continue;
+    return parsed;
+  }
+  return null;
+}
+
 function computeDispatchNextAllowedAt(args: {
   lastPostAt: Date | null;
   postIntervalSec: number;
@@ -217,6 +234,7 @@ export async function scheduleDueDispatchTasks() {
       mediaAsset: {
         select: {
           sourceMeta: true,
+          originalName: true,
         },
       },
     },
@@ -232,8 +250,45 @@ export async function scheduleDueDispatchTasks() {
       continue;
     }
 
-    const collectionMeta = parseCollectionMeta(task.mediaAsset.sourceMeta);
+    let collectionMeta = parseCollectionMeta(task.mediaAsset.sourceMeta);
     const collectionCfg = parseCollectionSchedulerConfig(task.channel.navReplyMarkup);
+
+    if (collectionMeta?.episodeParseFailed || (collectionMeta && collectionMeta.episodeNo === null)) {
+      const fallbackEpisodeNo = parseEpisodeNoFromText(task.mediaAsset.originalName || '');
+      if (fallbackEpisodeNo !== null) {
+        const sourceMetaRaw = task.mediaAsset.sourceMeta;
+        const sourceMetaObj =
+          sourceMetaRaw && typeof sourceMetaRaw === 'object'
+            ? (sourceMetaRaw as Record<string, unknown>)
+            : {};
+
+        await prisma.mediaAsset.update({
+          where: { id: task.mediaAssetId },
+          data: {
+            sourceMeta: {
+              ...sourceMetaObj,
+              episodeNo: fallbackEpisodeNo,
+              episodeParseFailed: false,
+            },
+          },
+        });
+
+        collectionMeta = {
+          collectionName: collectionMeta.collectionName,
+          episodeNo: fallbackEpisodeNo,
+          episodeParseFailed: false,
+        };
+
+        logger.info('[scheduler] 合集集号已从文件名自动修复', {
+          taskId: task.id.toString(),
+          channelId: channelIdStr,
+          mediaAssetId: task.mediaAssetId.toString(),
+          collectionName: collectionMeta.collectionName,
+          episodeNo: fallbackEpisodeNo,
+          originalName: task.mediaAsset.originalName,
+        });
+      }
+    }
 
     const shouldBypassHead =
       !collectionMeta &&

@@ -41,21 +41,19 @@ function parseCollectionMeta(filePath: string) {
   const fileName = parts[parts.length - 1];
 
   const patterns = [
-    /\[第\s*(\d+)\s*集\]/,
-    /第\s*(\d+)\s*集/,
+    /\[第\s*(\d+)\s*(?:集|话|話)\]/,
+    /第\s*(\d+)\s*(?:集|话|話)/,
     /S\d+E(\d+)/i,
   ];
 
   let episodeNo: number | null = null;
   for (const pattern of patterns) {
     const match = fileName.match(pattern);
-    if (match && match[1]) {
-      const parsed = Number(match[1]);
-      if (Number.isFinite(parsed)) {
-        episodeNo = parsed;
-        break;
-      }
-    }
+    if (!match || !match[1]) continue;
+    const parsed = Number(match[1]);
+    if (!Number.isFinite(parsed) || parsed <= 0) continue;
+    episodeNo = parsed;
+    break;
   }
 
   const episodeParseFailed = episodeNo === null;
