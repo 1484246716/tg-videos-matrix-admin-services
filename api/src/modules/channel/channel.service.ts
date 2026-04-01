@@ -130,9 +130,36 @@ export class ChannelService {
     return resolve(raw);
   }
 
-  private resolveChannelFolderPath(folderPath: string) {
+  private resolveChannelFolderPath(folderPath: string, options?: { allowLegacyAbsolute?: boolean }) {
     const root = this.getChannelsRootDir();
     const normalizedInput = normalize(folderPath.trim().replace(/\\/g, '/'));
+
+    if (!normalizedInput) {
+      throw new ConflictException('目录路径不能为空');
+    }
+
+    const isDriveAbsolute = /^[a-zA-Z]:[\\/]/.test(normalizedInput);
+
+    if (isDriveAbsolute) {
+      if (!options?.allowLegacyAbsolute) {
+        throw new ConflictException('目录路径不合法，禁止使用盘符绝对路径');
+      }
+
+      const absolutePath = resolve(normalizedInput);
+      const safeRoot = root.endsWith('\/') ? root : `${root}/`;
+      const safeRootWin = root.endsWith('\\') ? root : `${root}\\`;
+
+      if (
+        absolutePath !== root &&
+        !absolutePath.startsWith(safeRoot) &&
+        !absolutePath.startsWith(safeRootWin)
+      ) {
+        throw new ConflictException('目录路径不合法，禁止越权访问');
+      }
+
+      return absolutePath;
+    }
+
     const relativePath = normalizedInput.replace(/^[\\/]+/, '');
 
     if (!relativePath) {
@@ -165,7 +192,7 @@ export class ChannelService {
   }
 
   private async moveOrCreateFolder(oldPath: string, newPath: string) {
-    const from = this.resolveChannelFolderPath(oldPath);
+    const from = this.resolveChannelFolderPath(oldPath, { allowLegacyAbsolute: true });
     const to = this.resolveChannelFolderPath(newPath);
 
     if (from === to) return;

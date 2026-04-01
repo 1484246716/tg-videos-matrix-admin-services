@@ -189,6 +189,53 @@ function parseStoredPageMessageIds(raw: unknown) {
   return raw.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item > 0);
 }
 
+function reconcilePageMessageIds(args: {
+  ids: number[];
+  expectedCount: number;
+  scope: string;
+  channelIdRaw: string;
+}) {
+  const valid = args.ids.filter((item) => Number.isInteger(item) && item > 0);
+  const deduped: number[] = [];
+  const seen = new Set<number>();
+  for (const id of valid) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    deduped.push(id);
+  }
+
+  if (deduped.length !== args.expectedCount) {
+    throw new Error(
+      `[q_catalog] 分页消息ID对账失败(scope=${args.scope}, channelId=${args.channelIdRaw}): expected=${args.expectedCount}, actual=${deduped.length}`,
+    );
+  }
+
+  return deduped;
+}
+
+function applyPublishResultAndRewriteId(args: {
+  pageIds: number[];
+  pageIndex: number;
+  resultMessageId: number;
+  orphanCandidateIds: Set<number>;
+  scope: string;
+  channelIdRaw: string;
+}) {
+  const oldId = args.pageIds[args.pageIndex] ?? null;
+  if (oldId && oldId !== args.resultMessageId) {
+    args.orphanCandidateIds.add(oldId);
+    logger.info('[q_catalog] 分页消息触发fallback并回写新ID', {
+      channelId: args.channelIdRaw,
+      scope: args.scope,
+      pageIndex: args.pageIndex + 1,
+      oldMessageId: oldId,
+      newMessageId: args.resultMessageId,
+    });
+  }
+
+  args.pageIds[args.pageIndex] = args.resultMessageId;
+}
+
 type CollectionNavState = {
   indexMessageId: number | null;
   indexPageMessageIds: number[];
@@ -586,7 +633,10 @@ function parseCollectionMeta(sourceMeta: unknown) {
   };
 }
 
-export async function handleCatalogJob(channelIdRaw: string) {
+export async function handleCatalogJob(
+  channelIdRaw: string,
+  options?: { selfHealOnly?: boolean },
+) {
   let catalogTaskId: bigint | null = null;
   const channelId = BigInt(channelIdRaw);
 
@@ -610,7 +660,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
     throw new Error(`频道机器人未启用: ${channelIdRaw}`);
   }
 
-  if (CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED) {
+  if (CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED && !options?.selfHealOnly) {
     const guardNow = new Date();
     const intervalSec = Math.max(0, channel.navIntervalSec ?? 0);
     const nextAllowedAt = channel.lastNavUpdateAt
@@ -924,6 +974,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
       const episodePages = chunkVideos(episodes, collectionDetailPageSize);
       const existingDetailPages = existingNavState.detailPageMessageIds[name] ?? [];
       const publishedDetailPages: number[] = [];
+      const detailOrphanCandidateIds = new Set<number>();
 
       const detailTexts: string[] = [];
 
@@ -963,7 +1014,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
           const currentMessageId = publishedDetailPages[pageIndex] ?? null;
           if (!currentMessageId) continue;
 
-          await publishCatalogMessage({
+          const detailRepublishResult = await publishCatalogMessage({
             botToken,
             chatId: channel.tgChatId,
             text: detailTexts[pageIndex],
@@ -975,10 +1026,31 @@ export async function handleCatalogJob(channelIdRaw: string) {
               detailPageMessageIds: publishedDetailPages,
             }) ?? undefined,
           });
+
+          applyPublishResultAndRewriteId({
+            pageIds: publishedDetailPages,
+            pageIndex,
+            resultMessageId: detailRepublishResult.messageId,
+            orphanCandidateIds: detailOrphanCandidateIds,
+            scope: 'collection_detail',
+            channelIdRaw,
+          });
         }
       }
 
-      const staleDetailPages = existingDetailPages.slice(publishedDetailPages.length);
+      const reconciledDetailPageIds = reconcilePageMessageIds({
+        ids: publishedDetailPages,
+        expectedCount: episodePages.length,
+        scope: `collection_detail:${name}`,
+        channelIdRaw,
+      });
+      publishedDetailPages.length = 0;
+      publishedDetailPages.push(...reconciledDetailPageIds);
+
+      const staleDetailPages = [
+        ...existingDetailPages.slice(publishedDetailPages.length),
+        ...[...detailOrphanCandidateIds].filter((id) => !publishedDetailPages.includes(id)),
+      ];
       await deleteTelegramMessages({
         botToken,
         chatId: channel.tgChatId,
@@ -1009,6 +1081,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
     const indexPages = chunkVideos(collectionIndexItems, collectionIndexPageSize);
     const existingIndexPages = existingNavState.indexPageMessageIds;
     const publishedIndexPages: number[] = [];
+    const indexOrphanCandidateIds = new Set<number>();
 
     for (let pageIndex = 0; pageIndex < indexPages.length; pageIndex += 1) {
       const text = [
@@ -1046,16 +1119,37 @@ export async function handleCatalogJob(channelIdRaw: string) {
         indexPageMessageIds: publishedIndexPages,
       });
 
-      await publishCatalogMessage({
+      const indexRepublishResult = await publishCatalogMessage({
         botToken,
         chatId: channel.tgChatId,
         text,
         existingMessageId: currentMessageId,
         replyMarkup,
       });
+
+      applyPublishResultAndRewriteId({
+        pageIds: publishedIndexPages,
+        pageIndex,
+        resultMessageId: indexRepublishResult.messageId,
+        orphanCandidateIds: indexOrphanCandidateIds,
+        scope: 'collection_index',
+        channelIdRaw,
+      });
     }
 
-    const staleIndexPages = existingIndexPages.slice(publishedIndexPages.length);
+    const reconciledIndexPageIds = reconcilePageMessageIds({
+      ids: publishedIndexPages,
+      expectedCount: indexPages.length,
+      scope: 'collection_index',
+      channelIdRaw,
+    });
+    publishedIndexPages.length = 0;
+    publishedIndexPages.push(...reconciledIndexPageIds);
+
+    const staleIndexPages = [
+      ...existingIndexPages.slice(publishedIndexPages.length),
+      ...[...indexOrphanCandidateIds].filter((id) => !publishedIndexPages.includes(id)),
+    ];
     await deleteTelegramMessages({
       botToken,
       chatId: channel.tgChatId,
@@ -1120,6 +1214,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
     const channelAny = channel as any;
     const storedPageMessageIds = parseStoredPageMessageIds(channelAny.navPageMessageIds);
     const publishedPageMessageIds: number[] = [];
+    const mainPageOrphanCandidateIds = new Set<number>();
     const existingMainNavMessageId = channel.navMessageId ? Number(channel.navMessageId) : null;
 
     if (!hasMainCatalogContent) {
@@ -1177,7 +1272,7 @@ export async function handleCatalogJob(channelIdRaw: string) {
 
       for (let pageIndex = 0; pageIndex < pageContents.length; pageIndex += 1) {
         const pageText = pageIndex === 0 ? mainCatalogContent : pageContents[pageIndex];
-        await publishCatalogMessage({
+        const republishResult = await publishCatalogMessage({
           botToken,
           chatId: channel.tgChatId,
           text: pageText,
@@ -1189,7 +1284,25 @@ export async function handleCatalogJob(channelIdRaw: string) {
             pageMessageIds: publishedPageMessageIds,
           }) ?? undefined,
         });
+
+        applyPublishResultAndRewriteId({
+          pageIds: publishedPageMessageIds,
+          pageIndex,
+          resultMessageId: republishResult.messageId,
+          orphanCandidateIds: mainPageOrphanCandidateIds,
+          scope: 'main_catalog',
+          channelIdRaw,
+        });
       }
+
+      const reconciledMainPageIds = reconcilePageMessageIds({
+        ids: publishedPageMessageIds,
+        expectedCount: pageContents.length,
+        scope: 'main_catalog',
+        channelIdRaw,
+      });
+      publishedPageMessageIds.length = 0;
+      publishedPageMessageIds.push(...reconciledMainPageIds);
 
       const indexReplyMarkup = buildCatalogPageButtons({
         chatId: channel.tgChatId,
@@ -1223,7 +1336,10 @@ export async function handleCatalogJob(channelIdRaw: string) {
     }
 
     const stalePageMessageIds = hasMainCatalogContent
-      ? storedPageMessageIds.slice(publishedPageMessageIds.length)
+      ? [
+          ...storedPageMessageIds.slice(publishedPageMessageIds.length),
+          ...[...mainPageOrphanCandidateIds].filter((id) => !publishedPageMessageIds.includes(id)),
+        ]
       : [];
     await deleteTelegramMessages({
       botToken,

@@ -1,4 +1,8 @@
-import { CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED } from '../config/env';
+import {
+  CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED,
+  TYPEC_SELF_HEAL_ENABLED,
+  TYPEC_SELF_HEAL_ON_SKIP,
+} from '../config/env';
 import { prisma } from '../infra/prisma';
 import { catalogQueue } from '../infra/redis';
 import { logger } from '../logger';
@@ -44,13 +48,17 @@ export async function scheduleDueCatalogTasks() {
         now,
       });
       if (nextAllowedAt.getTime() > now.getTime()) {
-        logger.info('[scheduler] 目录任务未到频道更新窗口，跳过', {
+        logger.info('[scheduler] 目录任务未到频道更新窗口', {
           channelId: channel.id.toString(),
           navIntervalSec: channel.navIntervalSec,
           lastNavUpdateAt: channel.lastNavUpdateAt?.toISOString() ?? null,
           nextAllowedAt: nextAllowedAt.toISOString(),
+          selfHealOnSkip: TYPEC_SELF_HEAL_ENABLED && TYPEC_SELF_HEAL_ON_SKIP,
         });
-        continue;
+
+        if (!(TYPEC_SELF_HEAL_ENABLED && TYPEC_SELF_HEAL_ON_SKIP)) {
+          continue;
+        }
       }
     }
 
@@ -79,6 +87,16 @@ export async function scheduleDueCatalogTasks() {
       'catalog-publish',
       {
         channelIdRaw: channel.id.toString(),
+        selfHealOnly:
+          Boolean(TYPEC_SELF_HEAL_ENABLED && TYPEC_SELF_HEAL_ON_SKIP) &&
+          CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED &&
+          channel.lastNavUpdateAt
+            ? computeCatalogNextAllowedAt({
+                lastNavUpdateAt: channel.lastNavUpdateAt,
+                navIntervalSec: channel.navIntervalSec,
+                now,
+              }).getTime() > now.getTime()
+            : false,
       },
       {
         jobId,

@@ -15,7 +15,9 @@ export const catalogWorker = new Worker(
       throw new Error('任务负载缺少 channelIdRaw');
     }
 
-    return handleCatalogJob(channelIdRaw);
+    const selfHealOnly = Boolean((job.data as { selfHealOnly?: boolean } | undefined)?.selfHealOnly);
+
+    return handleCatalogJob(channelIdRaw, { selfHealOnly });
   },
   { connection: connection as any, concurrency: 3 },
 );
