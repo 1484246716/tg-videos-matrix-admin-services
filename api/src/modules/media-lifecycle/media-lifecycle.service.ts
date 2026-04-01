@@ -69,6 +69,8 @@ export class MediaLifecycleService {
     stage?: string;
     mediaType?: string;
     limit?: number;
+    page?: number;
+    pageSize?: number;
     userId?: string;
     role?: string;
   }) {
@@ -76,50 +78,60 @@ export class MediaLifecycleService {
     const tfid = (params.telegramFileId || '').trim();
     const normalizedMediaType = (params.mediaType || '').trim().toLowerCase();
 
-    const mediaAssets = await this.prisma.mediaAsset.findMany({
-      where: {
-        channelId: params.channelId ? BigInt(params.channelId) : undefined,
-        ...(tfid
-          ? {
-              OR: [
-                {
-                  telegramFileId: {
-                    contains: tfid,
-                    mode: 'insensitive',
-                  },
+    const where = {
+      channelId: params.channelId ? BigInt(params.channelId) : undefined,
+      ...(tfid
+        ? {
+            OR: [
+              {
+                telegramFileId: {
+                  contains: tfid,
+                  mode: 'insensitive' as const,
                 },
-                {
-                  telegramFileUniqueId: {
-                    contains: tfid,
-                    mode: 'insensitive',
-                  },
+              },
+              {
+                telegramFileUniqueId: {
+                  contains: tfid,
+                  mode: 'insensitive' as const,
                 },
-              ],
-            }
-          : {}),
-        ...(normalizedMediaType === 'collection'
-          ? {
-              sourceMeta: {
-                path: ['isCollection'],
-                equals: true,
               },
-            }
-          : {}),
-        originalName: params.keyword ? { contains: params.keyword, mode: 'insensitive' } : undefined,
-        status: stageFilter?.mediaStatus ? stageFilter.mediaStatus : undefined,
-        channel:
-          params.role === 'admin'
-            ? undefined
-            : {
-                createdBy: params.userId ? BigInt(params.userId) : undefined,
-              },
-      },
-      orderBy: { updatedAt: 'desc' },
-      take: params.limit ?? 50,
-      include: {
-        channel: { select: { id: true, name: true, createdBy: true } },
-      },
-    });
+            ],
+          }
+        : {}),
+      ...(normalizedMediaType === 'collection'
+        ? {
+            sourceMeta: {
+              path: ['isCollection'],
+              equals: true,
+            },
+          }
+        : {}),
+      originalName: params.keyword ? { contains: params.keyword, mode: 'insensitive' as const } : undefined,
+      status: stageFilter?.mediaStatus ? stageFilter.mediaStatus : undefined,
+      channel:
+        params.role === 'admin'
+          ? undefined
+          : {
+              createdBy: params.userId ? BigInt(params.userId) : undefined,
+            },
+    };
+
+    const usePagination = Number.isFinite(params.page) || Number.isFinite(params.pageSize);
+    const pageSize = Math.max(1, Math.min(200, Math.floor(params.pageSize ?? params.limit ?? 50)));
+    const page = Math.max(1, Math.floor(params.page ?? 1));
+    const skip = (page - 1) * pageSize;
+
+    const [total, mediaAssets] = await this.prisma.$transaction([
+      this.prisma.mediaAsset.count({ where }),
+      this.prisma.mediaAsset.findMany({
+        where,
+        orderBy: { updatedAt: 'desc' },
+        ...(usePagination ? { skip, take: pageSize } : { take: params.limit ?? 50 }),
+        include: {
+          channel: { select: { id: true, name: true, createdBy: true } },
+        },
+      }),
+    ]);
 
     const mediaIds = mediaAssets.map((asset) => asset.id);
 
@@ -143,7 +155,7 @@ export class MediaLifecycleService {
       dispatchMap.set(key, current);
     });
 
-    return mediaAssets.map((asset) => {
+    const list = mediaAssets.map((asset) => {
       const dispatches = dispatchMap.get(asset.id.toString()) ?? [];
       const latestDispatch = dispatches[0];
 
@@ -171,12 +183,12 @@ export class MediaLifecycleService {
         ingestDurationSec: asset.ingestDurationSec,
         latestDispatch: latestDispatch
           ? {
-            id: latestDispatch.id.toString(),
-            status: latestDispatch.status,
-            channelName: (latestDispatch as any).channel?.name ?? null,
-            telegramMessageLink: latestDispatch.telegramMessageLink,
-            telegramErrorMessage: latestDispatch.telegramErrorMessage,
-          }
+              id: latestDispatch.id.toString(),
+              status: latestDispatch.status,
+              channelName: (latestDispatch as any).channel?.name ?? null,
+              telegramMessageLink: latestDispatch.telegramMessageLink,
+              telegramErrorMessage: latestDispatch.telegramErrorMessage,
+            }
           : null,
         mediaType: isCollection ? 'collection' : 'normal',
         collectionName:
@@ -240,6 +252,20 @@ export class MediaLifecycleService {
           })(),
       };
     });
+
+    if (!usePagination) {
+      return list;
+    }
+
+    return {
+      list,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / pageSize)),
+      },
+    };
   }
 
   async getProgress(ids: string[]) {

@@ -25,6 +25,8 @@ export class MediaAssetController {
     @Query('status') status?: MediaStatus,
     @Query('keyword') keyword?: string,
     @Query('limit') limit?: string,
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
     @Request() req?: AuthRequest,
   ) {
     return this.mediaAssetService.list({
@@ -32,6 +34,8 @@ export class MediaAssetController {
       status,
       keyword,
       limit: limit ? Number(limit) : undefined,
+      page: page ? Number(page) : undefined,
+      pageSize: pageSize ? Number(pageSize) : undefined,
       userId: req?.user.userId,
       role: req?.user.role,
     });

@@ -32,42 +32,53 @@ export class MediaAssetService {
     status?: MediaStatus;
     keyword?: string;
     limit?: number;
+    page?: number;
+    pageSize?: number;
     userId?: string;
     role?: string;
   }) {
     const keyword = (params.keyword || '').trim();
+    const where = {
+      channelId: params.channelId ? BigInt(params.channelId) : undefined,
+      status: params.status,
+      originalName: keyword
+        ? {
+            contains: keyword,
+            mode: 'insensitive' as const,
+          }
+        : undefined,
+      channel:
+        params.role === 'admin'
+          ? undefined
+          : {
+              createdBy: params.userId ? BigInt(params.userId) : undefined,
+            },
+    };
 
-    const items = await this.prisma.mediaAsset.findMany({
-      where: {
-        channelId: params.channelId ? BigInt(params.channelId) : undefined,
-        status: params.status,
-        originalName: keyword
-          ? {
-              contains: keyword,
-              mode: 'insensitive',
-            }
-          : undefined,
-        channel:
-          params.role === 'admin'
-            ? undefined
-            : {
-                createdBy: params.userId ? BigInt(params.userId) : undefined,
-              },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: params.limit ?? 50,
-      include: {
-        channel: {
-          select: {
-            id: true,
-            name: true,
-            tgChatId: true,
+    const usePagination = Number.isFinite(params.page) || Number.isFinite(params.pageSize);
+    const pageSize = Math.max(1, Math.min(200, Math.floor(params.pageSize ?? params.limit ?? 50)));
+    const page = Math.max(1, Math.floor(params.page ?? 1));
+    const skip = (page - 1) * pageSize;
+
+    const [total, items] = await this.prisma.$transaction([
+      this.prisma.mediaAsset.count({ where }),
+      this.prisma.mediaAsset.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        ...(usePagination ? { skip, take: pageSize } : { take: params.limit ?? 50 }),
+        include: {
+          channel: {
+            select: {
+              id: true,
+              name: true,
+              tgChatId: true,
+            },
           },
         },
-      },
-    });
+      }),
+    ]);
 
-    return items.map((item) => ({
+    const list = items.map((item) => ({
       ...item,
       id: item.id.toString(),
       channelId: item.channelId.toString(),
@@ -78,11 +89,25 @@ export class MediaAssetService {
       relayMessageId: item.relayMessageId ? item.relayMessageId.toString() : null,
       channel: item.channel
         ? {
-          ...item.channel,
-          id: item.channel.id.toString(),
-        }
+            ...item.channel,
+            id: item.channel.id.toString(),
+          }
         : null,
     }));
+
+    if (!usePagination) {
+      return list;
+    }
+
+    return {
+      list,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / pageSize)),
+      },
+    };
   }
 
   async create(dto: CreateMediaAssetDto) {

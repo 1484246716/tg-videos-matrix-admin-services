@@ -22,6 +22,8 @@ export class MediaLifecycleController {
     @Query('stage') stage?: string,
     @Query('mediaType') mediaType?: string,
     @Query('limit') limit?: string,
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
     @Request() req?: AuthRequest,
   ) {
     return this.mediaLifecycleService.list({
@@ -31,6 +33,8 @@ export class MediaLifecycleController {
       stage,
       mediaType,
       limit: limit ? Number(limit) : undefined,
+      page: page ? Number(page) : undefined,
+      pageSize: pageSize ? Number(pageSize) : undefined,
       userId: req?.user.userId,
       role: req?.user.role,
     });
