@@ -16,23 +16,9 @@ type SaveCollectionDto = {
   navEnabled: boolean;
   navPageSize: number;
   templateText?: string;
-  inheritChannelOrderConfig?: boolean;
-  collectionDispatchGateEnabled?: boolean;
-  collectionHeadBypassEnabled?: boolean;
-  collectionHeadBypassMinutes?: number;
-  collectionGapPolicy?: 'strict' | 'allow_gap';
-  collectionAllowedGapSize?: number;
 };
 
 const DEFAULT_COLLECTION_STATUS = 'active' as const;
-const DEFAULT_COLLECTION_ORDER_CONFIG = {
-  inheritChannelOrderConfig: true,
-  collectionDispatchGateEnabled: true,
-  collectionHeadBypassEnabled: false,
-  collectionHeadBypassMinutes: 180,
-  collectionGapPolicy: 'strict' as const,
-  collectionAllowedGapSize: 0,
-};
 
 function normalizeCollectionName(name: string) {
   return name
@@ -127,121 +113,6 @@ function sanitizeJsonForPrisma(value: unknown): unknown {
   }
 
   return value;
-}
-
-function parsePositiveInteger(value: unknown, fallback: number, min = 0, max = Number.MAX_SAFE_INTEGER) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
-  const normalized = Math.floor(parsed);
-  if (normalized < min || normalized > max) return fallback;
-  return normalized;
-}
-
-function parseCollectionOrderConfig(rawExtConfig: unknown): {
-  inheritChannelOrderConfig: boolean;
-  collectionDispatchGateEnabled: boolean;
-  collectionHeadBypassEnabled: boolean;
-  collectionHeadBypassMinutes: number;
-  collectionGapPolicy: 'strict' | 'allow_gap';
-  collectionAllowedGapSize: number;
-} {
-  const extConfig =
-    rawExtConfig && typeof rawExtConfig === 'object' && !Array.isArray(rawExtConfig)
-      ? (rawExtConfig as Record<string, unknown>)
-      : {};
-  const order =
-    extConfig.order && typeof extConfig.order === 'object' && !Array.isArray(extConfig.order)
-      ? (extConfig.order as Record<string, unknown>)
-      : {};
-
-  return {
-    inheritChannelOrderConfig:
-      typeof order.inheritChannelOrderConfig === 'boolean'
-        ? order.inheritChannelOrderConfig
-        : DEFAULT_COLLECTION_ORDER_CONFIG.inheritChannelOrderConfig,
-    collectionDispatchGateEnabled:
-      typeof order.collectionDispatchGateEnabled === 'boolean'
-        ? order.collectionDispatchGateEnabled
-        : DEFAULT_COLLECTION_ORDER_CONFIG.collectionDispatchGateEnabled,
-    collectionHeadBypassEnabled:
-      typeof order.collectionHeadBypassEnabled === 'boolean'
-        ? order.collectionHeadBypassEnabled
-        : DEFAULT_COLLECTION_ORDER_CONFIG.collectionHeadBypassEnabled,
-    collectionHeadBypassMinutes: parsePositiveInteger(
-      order.collectionHeadBypassMinutes,
-      DEFAULT_COLLECTION_ORDER_CONFIG.collectionHeadBypassMinutes,
-      1,
-      1440,
-    ),
-    collectionGapPolicy:
-      order.collectionGapPolicy === 'allow_gap' || order.collectionGapPolicy === 'strict'
-        ? order.collectionGapPolicy
-        : DEFAULT_COLLECTION_ORDER_CONFIG.collectionGapPolicy,
-    collectionAllowedGapSize: parsePositiveInteger(
-      order.collectionAllowedGapSize,
-      DEFAULT_COLLECTION_ORDER_CONFIG.collectionAllowedGapSize,
-      0,
-      20,
-    ),
-  };
-}
-
-function mergeCollectionOrderConfigIntoExtConfig(
-  rawExtConfig: unknown,
-  dto: Pick<
-    SaveCollectionDto,
-    | 'inheritChannelOrderConfig'
-    | 'collectionDispatchGateEnabled'
-    | 'collectionHeadBypassEnabled'
-    | 'collectionHeadBypassMinutes'
-    | 'collectionGapPolicy'
-    | 'collectionAllowedGapSize'
-  >,
-) {
-  const extConfig =
-    rawExtConfig && typeof rawExtConfig === 'object' && !Array.isArray(rawExtConfig)
-      ? { ...(rawExtConfig as Record<string, unknown>) }
-      : {};
-  const currentOrder =
-    extConfig.order && typeof extConfig.order === 'object' && !Array.isArray(extConfig.order)
-      ? { ...(extConfig.order as Record<string, unknown>) }
-      : {};
-
-  const nextOrder = {
-    ...currentOrder,
-    inheritChannelOrderConfig:
-      typeof dto.inheritChannelOrderConfig === 'boolean'
-        ? dto.inheritChannelOrderConfig
-        : DEFAULT_COLLECTION_ORDER_CONFIG.inheritChannelOrderConfig,
-    collectionDispatchGateEnabled:
-      typeof dto.collectionDispatchGateEnabled === 'boolean'
-        ? dto.collectionDispatchGateEnabled
-        : DEFAULT_COLLECTION_ORDER_CONFIG.collectionDispatchGateEnabled,
-    collectionHeadBypassEnabled:
-      typeof dto.collectionHeadBypassEnabled === 'boolean'
-        ? dto.collectionHeadBypassEnabled
-        : DEFAULT_COLLECTION_ORDER_CONFIG.collectionHeadBypassEnabled,
-    collectionHeadBypassMinutes: parsePositiveInteger(
-      dto.collectionHeadBypassMinutes,
-      DEFAULT_COLLECTION_ORDER_CONFIG.collectionHeadBypassMinutes,
-      1,
-      1440,
-    ),
-    collectionGapPolicy:
-      dto.collectionGapPolicy === 'allow_gap' || dto.collectionGapPolicy === 'strict'
-        ? dto.collectionGapPolicy
-        : DEFAULT_COLLECTION_ORDER_CONFIG.collectionGapPolicy,
-    collectionAllowedGapSize: parsePositiveInteger(
-      dto.collectionAllowedGapSize,
-      DEFAULT_COLLECTION_ORDER_CONFIG.collectionAllowedGapSize,
-      0,
-      20,
-    ),
-    updatedAt: new Date().toISOString(),
-  };
-
-  extConfig.order = nextOrder;
-  return sanitizeJsonForPrisma(extConfig) as Prisma.InputJsonValue;
 }
 
 function mergeCollectionNavStateIntoReplyMarkup(rawNavReplyMarkup: unknown, state: CollectionNavState | null) {
@@ -552,8 +423,6 @@ export class CollectionService {
       ? Math.max(0, Math.floor((now - blockedEpisode.mediaUpdatedAt) / 1000))
       : null;
 
-    const collectionOrderConfig = parseCollectionOrderConfig(row.extConfig);
-
     return {
       ...row,
       id: row.id.toString(),
@@ -572,12 +441,6 @@ export class CollectionService {
       currentEpisodeNo: null,
       blockingTaskId: blockedEpisode?.mediaAssetId ?? null,
       blockedDurationSec,
-      inheritChannelOrderConfig: collectionOrderConfig.inheritChannelOrderConfig,
-      collectionDispatchGateEnabled: collectionOrderConfig.collectionDispatchGateEnabled,
-      collectionHeadBypassEnabled: collectionOrderConfig.collectionHeadBypassEnabled,
-      collectionHeadBypassMinutes: collectionOrderConfig.collectionHeadBypassMinutes,
-      collectionGapPolicy: collectionOrderConfig.collectionGapPolicy,
-      collectionAllowedGapSize: collectionOrderConfig.collectionAllowedGapSize,
     };
   }
 
@@ -731,7 +594,6 @@ export class CollectionService {
         nameNormalized: normalizedName,
         slug: dto.slug || null,
         dirPath: dto.dirPath,
-        extConfig: mergeCollectionOrderConfigIntoExtConfig(undefined, dto),
         status: DEFAULT_COLLECTION_STATUS,
         sortOrder: dto.sortOrder,
         navEnabled: dto.navEnabled,
@@ -770,7 +632,6 @@ export class CollectionService {
         indexMessageId: true,
         indexPageMessageIds: true,
         lastBuiltAt: true,
-        extConfig: true,
         channel: { select: { folderPath: true, tgChatId: true } },
         _count: { select: { episodes: true } },
       },
@@ -844,26 +705,6 @@ export class CollectionService {
         nameNormalized: nameProvided ? nextNameNormalized : undefined,
         slug: dto.slug || undefined,
         dirPath: dto.dirPath,
-        extConfig: mergeCollectionOrderConfigIntoExtConfig(existing.extConfig, {
-          inheritChannelOrderConfig:
-            typeof dto.inheritChannelOrderConfig === 'boolean'
-              ? dto.inheritChannelOrderConfig
-              : parseCollectionOrderConfig(existing.extConfig).inheritChannelOrderConfig,
-          collectionDispatchGateEnabled:
-            typeof dto.collectionDispatchGateEnabled === 'boolean'
-              ? dto.collectionDispatchGateEnabled
-              : parseCollectionOrderConfig(existing.extConfig).collectionDispatchGateEnabled,
-          collectionHeadBypassEnabled:
-            typeof dto.collectionHeadBypassEnabled === 'boolean'
-              ? dto.collectionHeadBypassEnabled
-              : parseCollectionOrderConfig(existing.extConfig).collectionHeadBypassEnabled,
-          collectionHeadBypassMinutes:
-            dto.collectionHeadBypassMinutes ?? parseCollectionOrderConfig(existing.extConfig).collectionHeadBypassMinutes,
-          collectionGapPolicy:
-            dto.collectionGapPolicy ?? parseCollectionOrderConfig(existing.extConfig).collectionGapPolicy,
-          collectionAllowedGapSize:
-            dto.collectionAllowedGapSize ?? parseCollectionOrderConfig(existing.extConfig).collectionAllowedGapSize,
-        }),
         status: DEFAULT_COLLECTION_STATUS,
         sortOrder: dto.sortOrder,
         navEnabled: dto.navEnabled,

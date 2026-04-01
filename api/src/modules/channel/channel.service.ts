@@ -19,122 +19,6 @@ import { UpdateChannelStatusDto } from './dto/update-channel-status.dto';
 export class ChannelService {
   constructor(private readonly prisma: PrismaService) { }
 
-  private readonly defaultEpisodeAliases = [
-    '集',
-    '期',
-    '话',
-    '季',
-    '部',
-    '弹',
-    '场',
-    '出',
-    '播',
-    '章',
-    '节',
-    '回',
-    '卷',
-    '册',
-    '篇',
-    '版',
-    '辑',
-    '编',
-    '讲',
-    '课',
-    '首',
-    '曲',
-    '关',
-    '局',
-    '赛季',
-    '轮',
-    '届',
-    '次',
-    '序言',
-    '序章',
-    '前言',
-    '引言',
-    '楔子',
-    '前传',
-    '先导片',
-    '预告片',
-    '季前赛',
-    'Ova版',
-    '番外',
-    '番外篇',
-    '特别篇',
-    'SP',
-    'OVA',
-    'OAD',
-    '剧场版',
-    '特典',
-    '幕后花絮',
-    '资料片',
-    'DLC',
-    '总集篇',
-    '终章',
-    '最终话',
-    '最终回',
-    '最终局',
-    '尾声',
-    '后记',
-    '大结局',
-    '完结篇',
-    '后传',
-    '总决赛',
-  ] as const;
-
-  private readonly defaultEpisodePrefixTokens = [
-    '序言',
-    '序章',
-    '前言',
-    '引言',
-    '楔子',
-    '前传',
-    '先导片',
-    '预告片',
-    '季前赛',
-    'Ova版',
-    '番外',
-    '番外篇',
-    '特别篇',
-    'SP',
-    'OVA',
-    'OAD',
-    '剧场版',
-    '特典',
-  ] as const;
-
-  private readonly defaultEpisodeSuffixTokens = [
-    '幕后花絮',
-    '资料片',
-    'DLC',
-    '总集篇',
-    '终章',
-    '最终话',
-    '最终回',
-    '最终局',
-    '尾声',
-    '后记',
-    '大结局',
-    '完结篇',
-    '后传',
-    '总决赛',
-  ] as const;
-
-  private readonly defaultOrderConfig = {
-    orderGateEnabled: true,
-    normalOrderUploadGateEnabled: true,
-    normalOrderDispatchGateEnabled: true,
-    orderHeadBypassEnabled: false,
-    orderHeadBypassMinutes: 180,
-    normalOrderKeyMode: 'mtime_file_path' as const,
-    episodeRuleMode: 'profiled' as const,
-    episodeNoPatternEnabled: true,
-    episodeChineseNumberEnabled: true,
-    episodeAliases: [...this.defaultEpisodeAliases],
-    episodePrefixTokens: [...this.defaultEpisodePrefixTokens],
-    episodeSuffixTokens: [...this.defaultEpisodeSuffixTokens],
-  };
-
   private parseSafeBigInt(value: string) {
     const raw = value.trim();
     if (!raw) return null;
@@ -152,104 +36,6 @@ export class ChannelService {
         typeof v === 'bigint' ? v.toString() : v,
       ),
     ) as T;
-  }
-
-  private asObject(value: unknown): Record<string, unknown> {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      return {};
-    }
-    return value as Record<string, unknown>;
-  }
-
-  private normalizeStringList(value: unknown, fallback: readonly string[]) {
-    if (!Array.isArray(value)) {
-      return [...fallback];
-    }
-
-    const deduped = new Map<string, string>();
-    for (const item of value) {
-      if (typeof item !== 'string') continue;
-      const trimmed = item.trim();
-      if (!trimmed) continue;
-      deduped.set(trimmed.toLocaleLowerCase('zh-CN'), trimmed);
-    }
-
-    return deduped.size > 0 ? [...deduped.values()] : [...fallback];
-  }
-
-  private sanitizeOrderConfig(input: unknown) {
-    const cfg = this.asObject(input);
-    return {
-      ...cfg,
-      orderGateEnabled:
-        typeof cfg.orderGateEnabled === 'boolean'
-          ? cfg.orderGateEnabled
-          : this.defaultOrderConfig.orderGateEnabled,
-      normalOrderUploadGateEnabled:
-        typeof cfg.normalOrderUploadGateEnabled === 'boolean'
-          ? cfg.normalOrderUploadGateEnabled
-          : this.defaultOrderConfig.normalOrderUploadGateEnabled,
-      normalOrderDispatchGateEnabled:
-        typeof cfg.normalOrderDispatchGateEnabled === 'boolean'
-          ? cfg.normalOrderDispatchGateEnabled
-          : this.defaultOrderConfig.normalOrderDispatchGateEnabled,
-      orderHeadBypassEnabled:
-        typeof cfg.orderHeadBypassEnabled === 'boolean'
-          ? cfg.orderHeadBypassEnabled
-          : this.defaultOrderConfig.orderHeadBypassEnabled,
-      orderHeadBypassMinutes:
-        typeof cfg.orderHeadBypassMinutes === 'number' && Number.isFinite(cfg.orderHeadBypassMinutes) && cfg.orderHeadBypassMinutes > 0
-          ? Math.min(1440, Math.max(1, Math.floor(cfg.orderHeadBypassMinutes)))
-          : this.defaultOrderConfig.orderHeadBypassMinutes,
-      normalOrderKeyMode:
-        cfg.normalOrderKeyMode === 'created_at_id' ? 'created_at_id' : this.defaultOrderConfig.normalOrderKeyMode,
-      episodeRuleMode:
-        cfg.episodeRuleMode === 'legacy' || cfg.episodeRuleMode === 'profiled'
-          ? cfg.episodeRuleMode
-          : this.defaultOrderConfig.episodeRuleMode,
-      episodeNoPatternEnabled:
-        typeof cfg.episodeNoPatternEnabled === 'boolean'
-          ? cfg.episodeNoPatternEnabled
-          : this.defaultOrderConfig.episodeNoPatternEnabled,
-      episodeChineseNumberEnabled:
-        typeof cfg.episodeChineseNumberEnabled === 'boolean'
-          ? cfg.episodeChineseNumberEnabled
-          : this.defaultOrderConfig.episodeChineseNumberEnabled,
-      episodeAliases: this.normalizeStringList(
-        cfg.episodeAliases,
-        this.defaultOrderConfig.episodeAliases,
-      ),
-      episodePrefixTokens: this.normalizeStringList(
-        cfg.episodePrefixTokens,
-        this.defaultOrderConfig.episodePrefixTokens,
-      ),
-      episodeSuffixTokens: this.normalizeStringList(
-        cfg.episodeSuffixTokens,
-        this.defaultOrderConfig.episodeSuffixTokens,
-      ),
-    };
-  }
-
-  private sanitizeNavReplyMarkup(input: unknown): Prisma.InputJsonValue | null | undefined {
-    if (input === undefined) {
-      return undefined;
-    }
-
-    if (input === null) {
-      return null;
-    }
-
-    const root = this.asObject(input);
-    const sanitized: Record<string, unknown> = {
-      ...root,
-      __orderConfig: this.sanitizeOrderConfig(root.__orderConfig),
-    };
-
-    if (!Array.isArray(root.inline_keyboard)) {
-      delete sanitized.inline_keyboard;
-    }
-
-    return sanitized as Prisma.InputJsonValue;
   }
 
   private getTelegramBotApiBase() {
@@ -477,7 +263,7 @@ export class ChannelService {
         aiSystemPromptTemplate: dto.aiSystemPromptTemplate,
         navTemplateText: dto.navTemplateText,
         aiReplyMarkup: dto.aiReplyMarkup as Prisma.InputJsonValue,
-        navReplyMarkup: this.sanitizeNavReplyMarkup(dto.navReplyMarkup),
+        navReplyMarkup: dto.navReplyMarkup as Prisma.InputJsonValue,
         tags: dto.tags ?? [],
         createdBy: role === 'admin' ? null : userId ? BigInt(userId) : null,
       };
@@ -597,7 +383,7 @@ export class ChannelService {
         aiSystemPromptTemplate: data.aiSystemPromptTemplate,
         navTemplateText: data.navTemplateText,
         aiReplyMarkup: data.aiReplyMarkup,
-        navReplyMarkup: this.sanitizeNavReplyMarkup(data.navReplyMarkup),
+        navReplyMarkup: data.navReplyMarkup,
         tags: data.tags,
       } as any),
     });
@@ -839,7 +625,7 @@ export class ChannelService {
       aiSystemPromptTemplate: dto.aiSystemPromptTemplate,
       navTemplateText: dto.navTemplateText,
       aiReplyMarkup: dto.aiReplyMarkup as Prisma.InputJsonValue,
-      navReplyMarkup: this.sanitizeNavReplyMarkup(dto.navReplyMarkup),
+      navReplyMarkup: dto.navReplyMarkup as Prisma.InputJsonValue,
       tags: dto.tags,
     };
 
