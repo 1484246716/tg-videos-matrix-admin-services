@@ -20,6 +20,10 @@ function normalizeTelegramApiBase(raw: string): string {
   return raw.replace(/\/+$/, '');
 }
 
+function maskTelegramEndpoint(url: string): string {
+  return url.replace(/\/bot[^/]+\//, '/bot***\/');
+}
+
 function toTelegramMessageLink(chatIdRaw: string, messageId: number): string | null {
   if (chatIdRaw.startsWith('-100')) {
     const internalId = chatIdRaw.slice(4);
@@ -138,21 +142,45 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
   } catch (error) {
     const rawCode = typeof error === 'object' && error ? (error as { code?: string }).code : undefined;
     const rawMessage = typeof error === 'object' && error ? (error as { message?: string }).message : undefined;
+    const errorObj = error as {
+      name?: string;
+      message?: string;
+      code?: string;
+      cause?: { message?: string; code?: string };
+      errors?: Array<{ message?: string; code?: string }>;
+    };
     const isSocketHangUp =
       rawCode === 'ECONNRESET' ||
       rawCode === 'EPIPE' ||
       rawCode === 'TG_SOCKET_HANG_UP' ||
       (typeof rawMessage === 'string' && rawMessage.toLowerCase().includes('socket hang up'));
 
-    if (isSocketHangUp) {
-      logError('[telegram] 连接被中断', {
-        method: args.method,
-        timeoutMs,
-        payloadType: isFormData ? 'form-data' : 'json',
-        code: rawCode ?? null,
-        message: rawMessage ?? null,
-      });
+    const aggregateErrors = Array.isArray(errorObj.errors)
+      ? errorObj.errors.map((item) => ({
+          message: item?.message ?? null,
+          code: item?.code ?? null,
+        }))
+      : [];
 
+    const causeMessage =
+      errorObj.cause && typeof errorObj.cause === 'object' ? (errorObj.cause.message ?? null) : null;
+    const causeCode =
+      errorObj.cause && typeof errorObj.cause === 'object' ? (errorObj.cause.code ?? null) : null;
+
+    logError('[telegram] 请求异常(网络/连接层)', {
+      method: args.method,
+      endpoint: maskTelegramEndpoint(endpoint),
+      timeoutMs,
+      payloadType: isFormData ? 'form-data' : 'json',
+      name: errorObj.name ?? null,
+      message: errorObj.message ?? null,
+      code: errorObj.code ?? null,
+      causeMessage,
+      causeCode,
+      aggregateErrors,
+    });
+
+    if (isSocketHangUp) {
       const err: TelegramError = {
         code: 'TG_SOCKET_HANG_UP',
         message: 'Telegram 连接中断（socket hang up）',
@@ -165,6 +193,7 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
       if (error.code === 'ECONNABORTED') {
         logError('[telegram] 请求超时', {
           method: args.method,
+          endpoint: maskTelegramEndpoint(endpoint),
           timeoutMs,
           payloadType: isFormData ? 'form-data' : 'json',
         });

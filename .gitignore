@@ -7,3 +7,6 @@ dist
 coverage
 *.log
 apps/api/prisma/migrations
+
+# Ignore local data directory
+data/

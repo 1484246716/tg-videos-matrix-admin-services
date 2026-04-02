@@ -62,19 +62,12 @@ services:
       TELEGRAM_API_HASH: "eb06d4abfb49dc3eeb1aeb98ae0f581e"
       TELEGRAM_LOCAL: "1"
       TELEGRAM_VERBOSITY: "4"
-    command:
-      - "--http-timeout"
-      - "3600"
-      - "--http-poll-timeout"
-      - "3600"
-      - "--log-verbosity"
-      - "4"
     ports:
       - "8081:8081"
     volumes:
       - ./videos:/app/videos
       - ./data/tg-bot-api:/var/lib/telegram-bot-api
-      - ./data/tg-bot-api-tmp:/tmp/telegram-bot-api
+      - tg_bot_api_tmp:/tmp/telegram-bot-api
 
   alist:
     image: xhofe/alist:latest
@@ -94,6 +87,7 @@ volumes:
   pg_data:
   redis_data:
   opensearch_data:
+  tg_bot_api_tmp:
 
 # docker compose -p tg-videos-matrix -f docker-compose-local.yml up -d
 # docker compose -p tg-videos-matrix -f docker-compose-local.yml down
