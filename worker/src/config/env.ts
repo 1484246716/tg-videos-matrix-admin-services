@@ -93,6 +93,23 @@ export const RELAY_UPLOAD_QUEUE_CONCURRENCY = (() => {
   return Math.min(32, Math.floor(n));
 })();
 
+/** 上传进度日志里程碑（百分比，逗号分隔），默认 20,50,100 */
+export const RELAY_UPLOAD_PROGRESS_LOG_MILESTONES = (() => {
+  const raw = process.env.RELAY_UPLOAD_PROGRESS_LOG_MILESTONES ?? '20,50,100';
+  const parsed = raw
+    .split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0 && n <= 100)
+    .map((n) => Math.floor(n));
+
+  const uniqueSorted = Array.from(new Set(parsed)).sort((a, b) => a - b);
+
+  if (uniqueSorted.length === 0) return [20, 50, 100];
+  if (!uniqueSorted.includes(100)) uniqueSorted.push(100);
+
+  return uniqueSorted;
+})();
+
 /** 中转文件“稳定检测”最少连续通过次数 */
 export const RELAY_MIN_STABLE_CHECKS = Number(
   process.env.RELAY_MIN_STABLE_CHECKS || '3',

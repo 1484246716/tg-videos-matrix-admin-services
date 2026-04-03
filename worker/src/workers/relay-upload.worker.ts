@@ -20,6 +20,7 @@ import {
   GRAMJS_FORWARD_TARGET_CHAT_ID,
   GRAMJS_UPLOAD_WORKERS,
   RELAY_UPLOAD_GRAMJS_THRESHOLD_MB,
+  RELAY_UPLOAD_PROGRESS_LOG_MILESTONES,
   RELAY_UPLOAD_QUEUE_CONCURRENCY,
   TYPEA_FAIL_ON_FILE_MISSING,
   TYPEA_INGEST_LEASE_MS,
@@ -29,6 +30,34 @@ import { TYPEA_INGEST_ERROR_CODE, TYPEA_INGEST_FINAL_REASON } from '../shared/me
 
 const PROGRESS_TTL_SECONDS = 24 * 60 * 60;
 const PROGRESS_WRITE_INTERVAL_MS = 5000;
+
+function createProgressMilestoneLogger(params: {
+  traceId: string;
+  mediaAssetId: string;
+  relayChannelId: string;
+  stage: 'gramjs_progress' | 'upload_progress_percent';
+  extra?: Record<string, unknown>;
+}) {
+  const loggedMilestones = new Set<number>();
+
+  return (percentRaw: number) => {
+    const percent = Math.max(0, Math.min(100, Number(percentRaw.toFixed(2))));
+
+    for (const milestone of RELAY_UPLOAD_PROGRESS_LOG_MILESTONES) {
+      if (percent >= milestone && !loggedMilestones.has(milestone)) {
+        logger.info('[q_relay_upload] 上传进度里程碑', {
+          traceId: params.traceId,
+          stage: params.stage,
+          mediaAssetId: params.mediaAssetId,
+          relayChannelId: params.relayChannelId,
+          progress: milestone,
+          ...(params.extra || {}),
+        });
+        loggedMilestones.add(milestone);
+      }
+    }
+  };
+}
 
 function calcIngestDurationSec(startedAt?: Date | null, finishedAt?: Date | null) {
   if (!startedAt || !finishedAt) return null;
@@ -307,6 +336,15 @@ export const relayUploadWorker = new Worker(
 
       const uploadStart = Date.now();
       let lastProgressWriteAt = 0;
+      const logGramjsProgressMilestone = createProgressMilestoneLogger({
+        traceId,
+        mediaAssetId: mediaAssetIdRaw,
+        relayChannelId: relayChannelIdRaw,
+        stage: 'gramjs_progress',
+        extra: {
+          uploadMethod: 'gramjs_sendVideo',
+        },
+      });
 
       let gramjsMessageId: number;
       try {
@@ -321,13 +359,7 @@ export const relayUploadWorker = new Worker(
           thumbnailPath: thumbnailPath ?? undefined,
           progressCallback: (progress) => {
             const percent = Number((progress * 100).toFixed(2));
-            logger.info('[q_relay_upload] GramJS 上传进度', {
-              traceId,
-              stage: 'gramjs_progress',
-              mediaAssetId: mediaAssetIdRaw,
-              relayChannelId: relayChannelIdRaw,
-              progress: percent,
-            });
+            logGramjsProgressMilestone(percent);
 
             const now = Date.now();
             if (now - lastProgressWriteAt >= PROGRESS_WRITE_INTERVAL_MS) {
@@ -459,26 +491,24 @@ export const relayUploadWorker = new Worker(
     const fileStream = createReadStream(mediaAsset.localPath);
     const streamWithProgress = new PassThrough();
     let streamedBytes = 0;
-    let lastProgressAt = Date.now();
     let lastProgressWriteAt = 0;
+    const logUploadProgressMilestone = createProgressMilestoneLogger({
+      traceId,
+      mediaAssetId: mediaAssetIdRaw,
+      relayChannelId: relayChannelIdRaw,
+      stage: 'upload_progress_percent',
+      extra: {
+        uploadMethod: 'sendVideo',
+      },
+    });
 
     fileStream.on('data', (chunk) => {
       streamedBytes += chunk.length;
       const now = Date.now();
-      if (now - lastProgressAt >= 30 * 1000) {
-        logger.info('[q_relay_upload] 上传字节进度', {
-          traceId,
-          stage: 'upload_progress_bytes',
-          mediaAssetId: mediaAssetIdRaw,
-          relayChannelId: relayChannelIdRaw,
-          streamedBytes,
-          fileSize,
-        });
-        lastProgressAt = now;
-      }
+      const progress = fileSize ? (streamedBytes / fileSize) * 100 : 0;
+      logUploadProgressMilestone(progress);
 
       if (now - lastProgressWriteAt >= PROGRESS_WRITE_INTERVAL_MS) {
-        const progress = fileSize ? (streamedBytes / fileSize) * 100 : 0;
         void writeProgress({
           mediaAssetId: mediaAssetIdRaw,
           streamedBytes,
