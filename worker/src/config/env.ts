@@ -45,9 +45,50 @@ export const TYPEC_SELF_HEAL_ENABLED =
 export const TYPEC_SELF_HEAL_ON_SKIP =
   process.env.TYPEC_SELF_HEAL_ON_SKIP !== 'false';
 
+/** TypeC 在常规执行流程中是否启用自愈修复（false 关闭） */
+export const TYPEC_SELF_HEAL_ON_RUN =
+  process.env.TYPEC_SELF_HEAL_ON_RUN !== 'false';
+
 /** TypeC 自愈时是否允许执行孤儿消息清理（false 关闭） */
 export const TYPEC_SELF_HEAL_CLEANUP_ENABLED =
   process.env.TYPEC_SELF_HEAL_CLEANUP_ENABLED !== 'false';
+
+/** TypeC 合集索引是否展示空合集（默认 true） */
+export const TYPEC_COLLECTION_INDEX_SHOW_EMPTY =
+  process.env.TYPEC_COLLECTION_INDEX_SHOW_EMPTY !== 'false';
+
+/** TypeC 合集全量扫描批次大小（默认 1000） */
+export const TYPEC_COLLECTION_FULL_SCAN_BATCH_SIZE = (() => {
+  const n = Number(process.env.TYPEC_COLLECTION_FULL_SCAN_BATCH_SIZE ?? '1000');
+  if (!Number.isFinite(n) || n < 100) return 1000;
+  return Math.min(5000, Math.floor(n));
+})();
+
+/** TypeC 合集数据源（recent/full/cache，默认 full） */
+export const TYPEC_COLLECTION_DATA_SOURCE =
+  process.env.TYPEC_COLLECTION_DATA_SOURCE === 'cache'
+    ? 'cache'
+    : process.env.TYPEC_COLLECTION_DATA_SOURCE === 'recent'
+      ? 'recent'
+      : 'full';
+
+/** TypeC 合集缓存过期阈值（秒） */
+export const TYPEC_COLLECTION_CACHE_STALE_SECONDS = (() => {
+  const n = Number(process.env.TYPEC_COLLECTION_CACHE_STALE_SECONDS ?? '300');
+  if (!Number.isFinite(n) || n < 30) return 300;
+  return Math.floor(n);
+})();
+
+/** TypeC 合集缓存不可用时是否回源DB */
+export const TYPEC_COLLECTION_CACHE_FALLBACK_TO_DB =
+  process.env.TYPEC_COLLECTION_CACHE_FALLBACK_TO_DB !== 'false';
+
+/** 合集快照增量刷新批次大小 */
+export const COLLECTION_SNAPSHOT_INCREMENTAL_BATCH_SIZE = (() => {
+  const n = Number(process.env.COLLECTION_SNAPSHOT_INCREMENTAL_BATCH_SIZE ?? '1000');
+  if (!Number.isFinite(n) || n < 100) return 1000;
+  return Math.min(5000, Math.floor(n));
+})();
 
 /** 是否启用频道级分布式锁 */
 export const CHANNEL_LOCK_ENABLED = true;
@@ -187,3 +228,24 @@ export const TYPEA_ALERT_FAILED_FINAL_SPIKE_THRESHOLD = Number(
 export const TYPEA_ALERT_QUEUE_STUCK_MINUTES = Number(
   process.env.TYPEA_ALERT_QUEUE_STUCK_MINUTES || '5',
 );
+
+/** Telegram 429/暂时错误重试最大次数（含首发） */
+export const TG_RETRY_MAX_ATTEMPTS = (() => {
+  const n = Number(process.env.TG_RETRY_MAX_ATTEMPTS ?? '5');
+  if (!Number.isFinite(n) || n < 1) return 5;
+  return Math.min(10, Math.floor(n));
+})();
+
+/** Telegram 重试最大退避秒数 */
+export const TG_RETRY_BACKOFF_MAX_SECONDS = (() => {
+  const n = Number(process.env.TG_RETRY_BACKOFF_MAX_SECONDS ?? '60');
+  if (!Number.isFinite(n) || n < 1) return 60;
+  return Math.min(300, Math.floor(n));
+})();
+
+/** Telegram 请求最小间隔（毫秒，全局） */
+export const TG_SEND_MIN_INTERVAL_MS = (() => {
+  const n = Number(process.env.TG_SEND_MIN_INTERVAL_MS ?? '120');
+  if (!Number.isFinite(n) || n < 0) return 120;
+  return Math.min(5000, Math.floor(n));
+})();

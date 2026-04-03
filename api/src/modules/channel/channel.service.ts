@@ -14,10 +14,27 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateChannelDto } from './dto/create-channel.dto';
 import { UpdateChannelDto } from './dto/update-channel.dto';
 import { UpdateChannelStatusDto } from './dto/update-channel-status.dto';
+import { Queue } from 'bullmq';
+import IORedis from 'ioredis';
 
 @Injectable()
 export class ChannelService {
+  private catalogQueue: Queue | null = null;
+  private redisConnection: IORedis | null = null;
+
   constructor(private readonly prisma: PrismaService) { }
+
+  private getCatalogQueue() {
+    if (!this.catalogQueue) {
+      const redisUrl = (process.env.REDIS_URL || 'redis://127.0.0.1:6379').trim();
+      this.redisConnection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+      this.catalogQueue = new Queue('q_catalog', {
+        connection: this.redisConnection as any,
+      });
+    }
+
+    return this.catalogQueue;
+  }
 
   private parseSafeBigInt(value: string) {
     const raw = value.trim();
@@ -696,6 +713,87 @@ export class ChannelService {
     });
 
     return this.serializeBigInt(updated);
+  }
+
+  async repairCatalog(id: string, userId?: string, role?: string) {
+    const channel = await this.prisma.channel.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
+      select: {
+        id: true,
+        name: true,
+        status: true,
+        navEnabled: true,
+        navTemplateText: true,
+        defaultBotId: true,
+      },
+    });
+
+    if (!channel) {
+      throw new NotFoundException('channel not found');
+    }
+
+    if (channel.status !== 'active') {
+      throw new BadRequestException('频道未启用，无法执行目录修复');
+    }
+
+    if (!channel.navEnabled) {
+      throw new BadRequestException('频道未开启目录功能，无法执行目录修复');
+    }
+
+    if (!channel.navTemplateText || !channel.defaultBotId) {
+      throw new BadRequestException('频道缺少目录模板或默认机器人，无法执行目录修复');
+    }
+
+    const queue = this.getCatalogQueue();
+    const channelIdRaw = channel.id.toString();
+    const jobId = `catalog-manual-repair-${channelIdRaw}`;
+
+    const existingJob = await queue.getJob(jobId);
+    if (existingJob) {
+      const state = await existingJob.getState();
+      if (state === 'waiting' || state === 'active' || state === 'delayed') {
+        return {
+          ok: true,
+          channelId: channelIdRaw,
+          channelName: channel.name,
+          enqueued: false,
+          reason: 'job_already_in_progress',
+          jobId,
+          jobState: state,
+        };
+      }
+      if (state === 'failed' || state === 'completed') {
+        await existingJob.remove().catch(() => undefined);
+      }
+    }
+
+    await queue.add(
+      'catalog-publish',
+      {
+        channelIdRaw,
+        selfHealOnly: true,
+        manualRepair: true,
+        source: 'channels_manual_repair',
+      },
+      {
+        jobId,
+        removeOnComplete: true,
+        removeOnFail: 200,
+      },
+    );
+
+    return {
+      ok: true,
+      channelId: channelIdRaw,
+      channelName: channel.name,
+      enqueued: true,
+      manualRepair: true,
+      selfHealOnly: true,
+      jobId,
+    };
   }
 
   async remove(id: string, userId?: string, role?: string) {

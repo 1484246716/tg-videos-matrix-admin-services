@@ -2,7 +2,12 @@ import axios from 'axios';
 import http from 'node:http';
 import https from 'node:https';
 import FormData from 'form-data';
-import { telegramApiBase } from '../config/env';
+import {
+  telegramApiBase,
+  TG_RETRY_BACKOFF_MAX_SECONDS,
+  TG_RETRY_MAX_ATTEMPTS,
+  TG_SEND_MIN_INTERVAL_MS,
+} from '../config/env';
 import { logger, logError } from '../logger';
 
 export type TelegramSendResult = {
@@ -101,6 +106,43 @@ export type TelegramResponse = {
   updateIdMax?: number;
 };
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+let lastTelegramRequestAt = 0;
+async function throttleTelegramRequests() {
+  if (TG_SEND_MIN_INTERVAL_MS <= 0) return;
+  const now = Date.now();
+  const waitMs = Math.max(0, lastTelegramRequestAt + TG_SEND_MIN_INTERVAL_MS - now);
+  if (waitMs > 0) {
+    await sleep(waitMs);
+  }
+  lastTelegramRequestAt = Date.now();
+}
+
+function parseRetryAfterSeconds(description: string, fallback?: number) {
+  if (typeof fallback === 'number' && Number.isFinite(fallback) && fallback > 0) {
+    return Math.floor(fallback);
+  }
+  const m = description.match(/retry after\s+(\d+)/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.floor(n);
+}
+
+function computeRetryDelayMs(attempt: number, retryAfterSec?: number) {
+  if (retryAfterSec && retryAfterSec > 0) {
+    const jitter = Math.floor(Math.random() * 250);
+    return retryAfterSec * 1000 + jitter;
+  }
+
+  const expSec = Math.min(TG_RETRY_BACKOFF_MAX_SECONDS, Math.pow(2, Math.max(0, attempt - 1)));
+  const jitter = Math.floor(Math.random() * 250);
+  return expSec * 1000 + jitter;
+}
+
 export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<TelegramResponse> {
   const endpoint = `${normalizeTelegramApiBase(telegramApiBase)}/bot${args.botToken}/${args.method}`;
 
@@ -121,119 +163,159 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
     parameters?: { retry_after?: number };
   };
 
-  try {
-    const formHeaders = isFormData && typeof (args.payload as FormData).getHeaders === 'function'
-      ? (args.payload as FormData).getHeaders()
-      : undefined;
-    const response = await axios.post(endpoint, args.payload, {
-      headers: isFormData
-        ? { ...formHeaders, 'content-length': (args.payload as FormData).getLengthSync() }
-        : { 'content-type': 'application/json' },
-      timeout: timeoutMs,
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-      httpAgent: keepAliveHttpAgent,
-      httpsAgent: keepAliveHttpsAgent,
-      validateStatus: () => true,
-    });
+  for (let attempt = 1; attempt <= TG_RETRY_MAX_ATTEMPTS; attempt += 1) {
+    await throttleTelegramRequests();
 
-    responseStatus = response.status;
-    json = response.data as typeof json;
-  } catch (error) {
-    const rawCode = typeof error === 'object' && error ? (error as { code?: string }).code : undefined;
-    const rawMessage = typeof error === 'object' && error ? (error as { message?: string }).message : undefined;
-    const errorObj = error as {
-      name?: string;
-      message?: string;
-      code?: string;
-      cause?: { message?: string; code?: string };
-      errors?: Array<{ message?: string; code?: string }>;
-    };
-    const isSocketHangUp =
-      rawCode === 'ECONNRESET' ||
-      rawCode === 'EPIPE' ||
-      rawCode === 'TG_SOCKET_HANG_UP' ||
-      (typeof rawMessage === 'string' && rawMessage.toLowerCase().includes('socket hang up'));
+    try {
+      const formHeaders = isFormData && typeof (args.payload as FormData).getHeaders === 'function'
+        ? (args.payload as FormData).getHeaders()
+        : undefined;
+      const response = await axios.post(endpoint, args.payload, {
+        headers: isFormData
+          ? { ...formHeaders, 'content-length': (args.payload as FormData).getLengthSync() }
+          : { 'content-type': 'application/json' },
+        timeout: timeoutMs,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        httpAgent: keepAliveHttpAgent,
+        httpsAgent: keepAliveHttpsAgent,
+        validateStatus: () => true,
+      });
 
-    const aggregateErrors = Array.isArray(errorObj.errors)
-      ? errorObj.errors.map((item) => ({
-          message: item?.message ?? null,
-          code: item?.code ?? null,
-        }))
-      : [];
-
-    const causeMessage =
-      errorObj.cause && typeof errorObj.cause === 'object' ? (errorObj.cause.message ?? null) : null;
-    const causeCode =
-      errorObj.cause && typeof errorObj.cause === 'object' ? (errorObj.cause.code ?? null) : null;
-
-    logError('[telegram] 请求异常(网络/连接层)', {
-      method: args.method,
-      endpoint: maskTelegramEndpoint(endpoint),
-      timeoutMs,
-      payloadType: isFormData ? 'form-data' : 'json',
-      name: errorObj.name ?? null,
-      message: errorObj.message ?? null,
-      code: errorObj.code ?? null,
-      causeMessage,
-      causeCode,
-      aggregateErrors,
-    });
-
-    if (isSocketHangUp) {
-      const err: TelegramError = {
-        code: 'TG_SOCKET_HANG_UP',
-        message: 'Telegram 连接中断（socket hang up）',
+      responseStatus = response.status;
+      json = response.data as typeof json;
+    } catch (error) {
+      const rawCode = typeof error === 'object' && error ? (error as { code?: string }).code : undefined;
+      const rawMessage = typeof error === 'object' && error ? (error as { message?: string }).message : undefined;
+      const errorObj = error as {
+        name?: string;
+        message?: string;
+        code?: string;
+        cause?: { message?: string; code?: string };
+        errors?: Array<{ message?: string; code?: string }>;
       };
+      const isSocketHangUp =
+        rawCode === 'ECONNRESET' ||
+        rawCode === 'EPIPE' ||
+        rawCode === 'TG_SOCKET_HANG_UP' ||
+        (typeof rawMessage === 'string' && rawMessage.toLowerCase().includes('socket hang up'));
 
-      throw err;
-    }
+      const aggregateErrors = Array.isArray(errorObj.errors)
+        ? errorObj.errors.map((item) => ({
+            message: item?.message ?? null,
+            code: item?.code ?? null,
+          }))
+        : [];
 
-    if (axios.isAxiosError(error)) {
-      if (error.code === 'ECONNABORTED') {
-        logError('[telegram] 请求超时', {
+      const causeMessage =
+        errorObj.cause && typeof errorObj.cause === 'object' ? (errorObj.cause.message ?? null) : null;
+      const causeCode =
+        errorObj.cause && typeof errorObj.cause === 'object' ? (errorObj.cause.code ?? null) : null;
+
+      const isTimeout = axios.isAxiosError(error) && error.code === 'ECONNABORTED';
+      const isRetryableNetworkError = isSocketHangUp || isTimeout;
+
+      if (isRetryableNetworkError && attempt < TG_RETRY_MAX_ATTEMPTS) {
+        const delayMs = computeRetryDelayMs(attempt);
+        logger.warn('[telegram] 网络层异常，准备重试', {
           method: args.method,
+          attempt,
+          maxAttempts: TG_RETRY_MAX_ATTEMPTS,
+          delayMs,
           endpoint: maskTelegramEndpoint(endpoint),
-          timeoutMs,
-          payloadType: isFormData ? 'form-data' : 'json',
+          isSocketHangUp,
+          isTimeout,
         });
+        await sleep(delayMs);
+        continue;
+      }
+
+      logError('[telegram] 请求异常(网络/连接层)', {
+        method: args.method,
+        endpoint: maskTelegramEndpoint(endpoint),
+        timeoutMs,
+        payloadType: isFormData ? 'form-data' : 'json',
+        name: errorObj.name ?? null,
+        message: errorObj.message ?? null,
+        code: errorObj.code ?? null,
+        causeMessage,
+        causeCode,
+        aggregateErrors,
+        attempt,
+      });
+
+      if (isSocketHangUp) {
+        const err: TelegramError = {
+          code: 'TG_SOCKET_HANG_UP',
+          message: 'Telegram 连接中断（socket hang up）',
+        };
+        throw err;
+      }
+
+      if (isTimeout) {
         const err: TelegramError = {
           code: 'TG_TIMEOUT',
           message: `Telegram 请求超时（${timeoutMs}ms）`,
         };
         throw err;
       }
+
+      throw error;
     }
-    throw error;
+
+    if (!json || !json.ok || responseStatus < 200 || responseStatus >= 300) {
+      const errorCode = json?.error_code ?? responseStatus;
+      const description = json?.description || `Telegram API 请求失败 (${responseStatus})`;
+      const retryAfterSec = parseRetryAfterSeconds(description, json?.parameters?.retry_after);
+
+      const err: TelegramError = {
+        code: `TG_${errorCode}`,
+        message: `Telegram 请求失败：${description}`,
+        retryAfterSec,
+      };
+
+      const logPayload = {
+        method: args.method,
+        status: responseStatus,
+        payloadType: isFormData ? 'form-data' : 'json',
+        errorCode,
+        description,
+        parameters: json?.parameters ?? null,
+        response: json,
+        attempt,
+      };
+
+      if (args.method === 'deleteMessage' && /message to delete not found/i.test(description)) {
+        logger.info('[telegram] 删除消息目标不存在，按已清理处理', logPayload);
+        throw err;
+      }
+
+      if (args.method === 'editMessageText' && /message is not modified/i.test(description)) {
+        logger.info('[telegram] 编辑消息内容未变化，按幂等成功处理', logPayload);
+        throw err;
+      }
+
+      const isTooManyRequests = Number(errorCode) === 429 || /too many requests/i.test(description);
+      if (isTooManyRequests && attempt < TG_RETRY_MAX_ATTEMPTS) {
+        const delayMs = computeRetryDelayMs(attempt, retryAfterSec ?? undefined);
+        logger.warn('[telegram] 触发限流，准备重试', {
+          ...logPayload,
+          retryAfterSec: retryAfterSec ?? null,
+          delayMs,
+        });
+        await sleep(delayMs);
+        continue;
+      }
+
+      logError('[telegram] 请求失败', logPayload);
+      throw err;
+    }
+
+    break;
   }
 
   if (!json || !json.ok || responseStatus < 200 || responseStatus >= 300) {
-    const errorCode = json?.error_code ?? responseStatus;
-    const description = json?.description || `Telegram API 请求失败 (${responseStatus})`;
-
-    const err: TelegramError = {
-      code: `TG_${errorCode}`,
-      message: `Telegram 请求失败：${description}`,
-      retryAfterSec: json.parameters?.retry_after,
-    };
-
-    const logPayload = {
-      method: args.method,
-      status: responseStatus,
-      payloadType: isFormData ? 'form-data' : 'json',
-      errorCode,
-      description,
-      parameters: json?.parameters ?? null,
-      response: json,
-    };
-
-    if (args.method === 'deleteMessage' && /message to delete not found/i.test(description)) {
-      logger.info('[telegram] 删除消息目标不存在，按已清理处理', logPayload);
-    } else {
-      logError('[telegram] 请求失败', logPayload);
-    }
-
-    throw err;
+    throw new Error('[telegram] 请求失败：重试后未获得成功响应');
   }
 
   logger.info('[telegram] 请求成功', {

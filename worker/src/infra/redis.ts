@@ -26,4 +26,7 @@ export const backfillQueue = new Queue('q_relay_fileid_backfill', {
 });
 export const searchIndexQueue = new Queue('q_search_index', {
   connection: connection as any,
-});
+});
+export const collectionSnapshotQueue = new Queue('q_collection_snapshot', {
+  connection: connection as any,
+});

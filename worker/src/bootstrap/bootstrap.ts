@@ -1,10 +1,18 @@
 import '../config/env';
-import { catalogQueue, dispatchQueue, relayUploadQueue, massMessageQueue, searchIndexQueue } from '../infra/redis';
+import {
+  catalogQueue,
+  collectionSnapshotQueue,
+  dispatchQueue,
+  relayUploadQueue,
+  massMessageQueue,
+  searchIndexQueue,
+} from '../infra/redis';
 import { ensureWorkerPrismaModels, logWorkerDatabaseFingerprint } from '../infra/prisma';
 import { logger, logError } from '../logger';
 import { SCHEDULER_POLL_MS, telegramApiBase } from '../config/env';
 import { scheduleEnabledTaskDefinitions } from '../scheduler/task-definition-scheduler';
 import { scheduleDueMassMessageItems } from '../scheduler/mass-message-scheduler';
+import { scheduleCollectionSnapshotRefresh } from '../scheduler/collection-snapshot-scheduler';
 import { reconcileTypeAStuckAssets } from '../services/typea-reconcile.service';
 import { auditTypeAHealth } from '../services/typea-audit.service';
 import { enqueueChangedCollectionEpisodes } from '../services/search-index-trigger.service';
@@ -14,6 +22,7 @@ import '../workers/relay-upload.worker';
 import '../workers/catalog.worker';
 import '../workers/mass-message.worker';
 import '../workers/search-index.worker';
+import '../workers/collection-snapshot.worker';
 
 async function drainStaleRelayJobs() {
   logger.info('[bootstrap] 正在清理过期的中转上传任务...');
@@ -78,6 +87,12 @@ export async function bootstrapWorker() {
     { removeOnComplete: true, removeOnFail: 100 },
   );
 
+  await collectionSnapshotQueue.add(
+    'bootstrap-check',
+    { source: 'worker_startup', timestamp: new Date().toISOString() },
+    { removeOnComplete: true, removeOnFail: 100 },
+  );
+
   await drainStaleRelayJobs();
 
   logger.info('[bootstrap] Telegram API 地址', { telegramApiBase });
@@ -104,6 +119,10 @@ export async function bootstrapWorker() {
 
     void enqueueChangedCollectionEpisodes().catch((err) => {
       logError('[scheduler:search-index-episodes] 变更扫描异常', err);
+    });
+
+    void scheduleCollectionSnapshotRefresh().catch((err) => {
+      logError('[scheduler:collection-snapshot] 增量刷新调度异常', err);
     });
   }, SCHEDULER_POLL_MS);
 

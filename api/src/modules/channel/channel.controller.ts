@@ -122,6 +122,12 @@ export class ChannelController {
     return this.channelService.updateStatus(id, dto, req.user.userId, req.user.role);
   }
 
+  @Permissions('channels:update')
+  @Post(':id/catalog-repair')
+  repairCatalog(@Param('id') id: string, @Request() req: AuthRequest) {
+    return this.channelService.repairCatalog(id, req.user.userId, req.user.role);
+  }
+
   @Permissions('channels:delete')
   @Delete(':id')
   remove(@Param('id') id: string, @Request() req: AuthRequest) {

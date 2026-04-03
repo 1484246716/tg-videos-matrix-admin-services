@@ -375,6 +375,53 @@ model CatalogHistory {
   @@map("catalog_histories")
 }
 
+model CollectionSnapshot {
+  id                       BigInt   @id @default(autoincrement())
+  channelId                BigInt   @map("channel_id")
+  collectionName           String   @map("collection_name") @db.VarChar(128)
+  collectionNameNormalized String   @map("collection_name_normalized") @db.VarChar(128)
+  episodeCount             Int      @default(0) @map("episode_count")
+  minEpisodeNo             Int?     @map("min_episode_no")
+  maxEpisodeNo             Int?     @map("max_episode_no")
+  lastSourceUpdatedAt      DateTime? @map("last_source_updated_at") @db.Timestamptz(6)
+  lastRebuildAt            DateTime @map("last_rebuild_at") @db.Timestamptz(6)
+  version                  BigInt   @default(0)
+  isDeleted                Boolean  @default(false) @map("is_deleted")
+
+  @@unique([channelId, collectionNameNormalized])
+  @@index([channelId, isDeleted])
+  @@index([channelId, lastRebuildAt(sort: Desc)])
+  @@map("collection_snapshot")
+}
+
+model CollectionEpisodeSnapshot {
+  id                       BigInt   @id @default(autoincrement())
+  channelId                BigInt   @map("channel_id")
+  collectionNameNormalized String   @map("collection_name_normalized") @db.VarChar(128)
+  episodeNo                Int      @map("episode_no")
+  telegramMessageId        BigInt?  @map("telegram_message_id")
+  telegramMessageUrl       String?  @map("telegram_message_url") @db.VarChar(255)
+  title                    String?  @db.VarChar(255)
+  isMissingPlaceholder     Boolean  @default(false) @map("is_missing_placeholder")
+  sourceDispatchTaskId     BigInt?  @map("source_dispatch_task_id")
+  sourceUpdatedAt          DateTime? @map("source_updated_at") @db.Timestamptz(6)
+  snapshotUpdatedAt        DateTime @map("snapshot_updated_at") @db.Timestamptz(6)
+
+  @@unique([channelId, collectionNameNormalized, episodeNo])
+  @@index([channelId, collectionNameNormalized, episodeNo])
+  @@index([channelId, snapshotUpdatedAt(sort: Desc)])
+  @@map("collection_episode_snapshot")
+}
+
+model CollectionSnapshotCursor {
+  id             Int      @id
+  lastDispatchId BigInt   @default(0) @map("last_dispatch_id")
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("collection_snapshot_cursor")
+}
+
 model DispatchTask {
   id                   BigInt            @id @default(autoincrement())
   channelId            BigInt            @map("channel_id")
