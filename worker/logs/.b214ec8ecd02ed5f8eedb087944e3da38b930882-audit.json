@@ -1,0 +1,15 @@
+{
+    "keep": {
+        "days": true,
+        "amount": 14
+    },
+    "auditLog": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\.b214ec8ecd02ed5f8eedb087944e3da38b930882-audit.json",
+    "files": [
+        {
+            "date": 1775178475798,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\worker-2026-04-03.log",
+            "hash": "d019ef0c7dca64e55f4641af5f35904708f0e35c8147812a2725f630b47aa12d"
+        }
+    ],
+    "hashType": "sha256"
+}
