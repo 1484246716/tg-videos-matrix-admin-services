@@ -67,6 +67,42 @@ function applyCollectionEpisodeTitle(caption: string, title: string) {
   return `${desiredLine}\n${trimmedCaption}`;
 }
 
+function normalizeTitleFallback(raw: string, fallback: string) {
+  const candidate = raw
+    .replace(/[《》#]/g, '')
+    .replace(/未知/g, '')
+    .trim();
+  if (candidate) return candidate;
+
+  const cleanFallback = fallback.replace(/[《》#]/g, '').trim();
+  return cleanFallback || '精彩视频';
+}
+
+function sanitizeTypeBCaptionUnknown(caption: string, fallbackTitle: string) {
+  let next = caption.trim();
+  if (!next) return fallbackTitle;
+
+  const matchedTitle = next.match(/(?:^|\n)\s*📺?\s*片名\s*[：:]\s*(.+)/);
+  const titleFromCaption = matchedTitle?.[1]?.trim() || '';
+  const safeTitle = normalizeTitleFallback(titleFromCaption, fallbackTitle);
+
+  if (/(?:^|\n)\s*📺?\s*片名\s*[：:]\s*未知\s*(?:\n|$)/.test(next) || /(《\s*#?未知\s*》)/.test(next)) {
+    next = applyCollectionEpisodeTitle(next, safeTitle);
+  }
+
+  const lines = next.split('\n');
+  const firstNonEmptyLineIndex = lines.findIndex((line) => line.trim().length > 0);
+  if (firstNonEmptyLineIndex >= 0) {
+    const firstLine = lines[firstNonEmptyLineIndex].trim();
+    if (firstLine.startsWith('#') && /#\s*未知|《\s*#?未知\s*》/.test(firstLine)) {
+      lines[firstNonEmptyLineIndex] = `#视频 #精选 《#${safeTitle}》`;
+      next = lines.join('\n');
+    }
+  }
+
+  return next;
+}
+
 export async function handleDispatchJob(
   dispatchTaskIdRaw: string,
   jobId: string,
@@ -142,6 +178,27 @@ export async function handleDispatchJob(
         ? `视频实测时长约 ${Math.floor(task.mediaAsset.durationSec / 60)} 分 ${task.mediaAsset.durationSec % 60} 秒（请据此填写“单集片长”，不要瞎编）`
         : '未探测到可靠视频时长（“单集片长”请谨慎表述为未知或约略，不要乱填具体分钟数）';
 
+    const isCollectionAsset = mediaSourceMeta?.isCollection === true;
+    const collectionName = typeof mediaSourceMeta?.collectionName === 'string' ? mediaSourceMeta.collectionName.trim() : '';
+    const episodeNo =
+      typeof mediaSourceMeta?.episodeNo === 'number'
+        ? mediaSourceMeta.episodeNo
+        : typeof mediaSourceMeta?.episodeNo === 'string' && /^\d+$/.test(mediaSourceMeta.episodeNo)
+          ? Number(mediaSourceMeta.episodeNo)
+          : null;
+
+    const aiUserPrompt =
+      isCollectionAsset && collectionName && episodeNo !== null
+        ? [
+            '请为这个合集视频生成文案（仅针对本条视频）。',
+            `合集名：${collectionName}`,
+            `集数：第${episodeNo}集`,
+            `视频文件名：${task.mediaAsset.originalName}`,
+            runtimeHint,
+            '要求：优先基于“合集名+第N集+文件名”判断，禁止编造；确实无法确认可写未知。',
+          ].join('\n')
+        : `请为这个视频生成文案，原名：${task.mediaAsset.originalName}\n${runtimeHint}`;
+
     let finalCaption = task.caption || task.mediaAsset.aiGeneratedCaption;
     if (isAiFailureText(finalCaption)) {
       finalCaption = originalNameStem;
@@ -180,7 +237,7 @@ export async function handleDispatchJob(
           finalCaption = await generateTextWithAiProfile(
             profile,
             task.channel.aiSystemPromptTemplate,
-            `请为这个视频生成文案，原名：${task.mediaAsset.originalName}\n${runtimeHint}`,
+            aiUserPrompt,
           );
 
           if (isAiFailureText(finalCaption)) {
@@ -213,14 +270,8 @@ export async function handleDispatchJob(
       finalCaption = originalNameStem;
     }
 
-    const isCollectionAsset = mediaSourceMeta?.isCollection === true;
-    const collectionName = typeof mediaSourceMeta?.collectionName === 'string' ? mediaSourceMeta.collectionName.trim() : '';
-    const episodeNo =
-      typeof mediaSourceMeta?.episodeNo === 'number'
-        ? mediaSourceMeta.episodeNo
-        : typeof mediaSourceMeta?.episodeNo === 'string' && /^\d+$/.test(mediaSourceMeta.episodeNo)
-          ? Number(mediaSourceMeta.episodeNo)
-          : null;
+    finalCaption = sanitizeTypeBCaptionUnknown(finalCaption || '', originalNameStem || '精彩视频');
+
     if (isCollectionAsset && collectionName && episodeNo !== null) {
       finalCaption = applyCollectionEpisodeTitle(
         finalCaption || '',
