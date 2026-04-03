@@ -187,24 +187,37 @@ export async function handleDispatchJob(
           ? Number(mediaSourceMeta.episodeNo)
           : null;
 
+    const enhancedCollectionVideoName =
+      isCollectionAsset && collectionName && episodeNo !== null
+        ? `${buildCollectionEpisodeTitle(collectionName, episodeNo)} ${originalNameStem}`.trim()
+        : null;
+
+    const aiSearchVideoName = enhancedCollectionVideoName ?? originalNameStem;
+
     const aiUserPrompt =
       isCollectionAsset && collectionName && episodeNo !== null
         ? [
             '请为这个合集视频生成文案（仅针对本条视频）。',
+            `基础视频名：${task.mediaAsset.originalName}`,
+            `增强视频名：${aiSearchVideoName}`,
             `合集名：${collectionName}`,
             `集数：第${episodeNo}集`,
-            `视频文件名：${task.mediaAsset.originalName}`,
             runtimeHint,
-            '要求：优先基于“合集名+第N集+文件名”判断，禁止编造；确实无法确认可写未知。',
+            '要求：必须优先依据“增强视频名（合集名+第N集+视频名）”进行搜索与理解，再按系统提示词要求的格式输出；禁止编造。',
           ].join('\n')
-        : `请为这个视频生成文案，原名：${task.mediaAsset.originalName}\n${runtimeHint}`;
+        : [
+            '请为这个视频生成文案。',
+            `视频名：${aiSearchVideoName}`,
+            runtimeHint,
+            '要求：按系统提示词要求的格式输出；信息不确定时请明确标注未知，不要编造。',
+          ].join('\n');
 
     let finalCaption = task.caption || task.mediaAsset.aiGeneratedCaption;
     if (isAiFailureText(finalCaption)) {
       finalCaption = originalNameStem;
     }
 
-    if (!finalCaption && task.channel.aiSystemPromptTemplate) {
+    if (task.channel.aiSystemPromptTemplate) {
       let profile = task.channel.aiModelProfileId
         ? await prisma.aiModelProfile.findUnique({
             where: { id: task.channel.aiModelProfileId },
@@ -257,10 +270,10 @@ export async function handleDispatchJob(
             dispatchTaskId: task.id.toString(),
             error: aiErr,
           });
-          finalCaption = originalNameStem;
+          finalCaption = finalCaption || originalNameStem;
         }
       } else {
-        finalCaption = originalNameStem;
+        finalCaption = finalCaption || originalNameStem;
       }
     } else if (!finalCaption) {
       finalCaption = originalNameStem;
