@@ -150,18 +150,23 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
   const timeoutMs = args.timeoutMs ?? 45 * 60 * 1000;
 
   let responseStatus = 0;
-  let json: {
-    ok: boolean;
-    result?: {
-      message_id?: number;
-      video?: { file_id?: string; file_unique_id?: string };
-      document?: { file_id?: string; file_unique_id?: string };
-      animation?: { file_id?: string; file_unique_id?: string };
-    } | true;
-    error_code?: number;
-    description?: string;
-    parameters?: { retry_after?: number };
-  };
+  let json:
+    | {
+        ok: boolean;
+        result?:
+          | {
+              message_id?: number;
+              video?: { file_id?: string; file_unique_id?: string };
+              document?: { file_id?: string; file_unique_id?: string };
+              animation?: { file_id?: string; file_unique_id?: string };
+            }
+          | TelegramUpdate[]
+          | true;
+        error_code?: number;
+        description?: string;
+        parameters?: { retry_after?: number };
+      }
+    | undefined;
 
   for (let attempt = 1; attempt <= TG_RETRY_MAX_ATTEMPTS; attempt += 1) {
     await throttleTelegramRequests();
@@ -266,7 +271,7 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
     if (!json || !json.ok || responseStatus < 200 || responseStatus >= 300) {
       const errorCode = json?.error_code ?? responseStatus;
       const description = json?.description || `Telegram API 请求失败 (${responseStatus})`;
-      const retryAfterSec = parseRetryAfterSeconds(description, json?.parameters?.retry_after);
+      const retryAfterSec = parseRetryAfterSeconds(description, json?.parameters?.retry_after ?? undefined);
 
       const err: TelegramError = {
         code: `TG_${errorCode}`,
