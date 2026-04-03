@@ -121,14 +121,14 @@ async function throttleTelegramRequests() {
   lastTelegramRequestAt = Date.now();
 }
 
-function parseRetryAfterSeconds(description: string, fallback?: number) {
+function parseRetryAfterSeconds(description: string, fallback?: number): number | undefined {
   if (typeof fallback === 'number' && Number.isFinite(fallback) && fallback > 0) {
     return Math.floor(fallback);
   }
   const m = description.match(/retry after\s+(\d+)/i);
-  if (!m) return null;
+  if (!m) return undefined;
   const n = Number(m[1]);
-  if (!Number.isFinite(n) || n <= 0) return null;
+  if (!Number.isFinite(n) || n <= 0) return undefined;
   return Math.floor(n);
 }
 
@@ -330,21 +330,29 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
     response: json,
   });
 
-  const resultObject = json.result && typeof json.result === 'object' ? json.result : undefined;
-
   const updates = Array.isArray(json.result) ? (json.result as TelegramUpdate[]) : undefined;
   const updateIdMax = updates && updates.length > 0
     ? updates.reduce((max, update) => (update.update_id > max ? update.update_id : max), updates[0].update_id)
     : undefined;
 
+  const resultObject =
+    !Array.isArray(json.result) && json.result && typeof json.result === 'object'
+      ? (json.result as {
+          message_id?: number;
+          video?: { file_id?: string; file_unique_id?: string };
+          document?: { file_id?: string; file_unique_id?: string };
+          animation?: { file_id?: string; file_unique_id?: string };
+        })
+      : undefined;
+
   return {
-    messageId: resultObject ? resultObject.message_id : undefined,
-    videoFileId: resultObject ? resultObject.video?.file_id : undefined,
-    videoFileUniqueId: resultObject ? resultObject.video?.file_unique_id : undefined,
-    documentFileId: resultObject ? resultObject.document?.file_id : undefined,
-    documentFileUniqueId: resultObject ? resultObject.document?.file_unique_id : undefined,
-    animationFileId: resultObject ? (resultObject as { animation?: { file_id?: string } }).animation?.file_id : undefined,
-    animationFileUniqueId: resultObject ? (resultObject as { animation?: { file_unique_id?: string } }).animation?.file_unique_id : undefined,
+    messageId: resultObject?.message_id,
+    videoFileId: resultObject?.video?.file_id,
+    videoFileUniqueId: resultObject?.video?.file_unique_id,
+    documentFileId: resultObject?.document?.file_id,
+    documentFileUniqueId: resultObject?.document?.file_unique_id,
+    animationFileId: resultObject?.animation?.file_id,
+    animationFileUniqueId: resultObject?.animation?.file_unique_id,
     updates,
     updateIdMax,
   };
