@@ -34,6 +34,26 @@ export const TASK_DEFINITION_ERROR_RETRY_SEC = Number(
 /** 是否启用分发任务（TypeB/Dispatch）频道级时间窗口保护 */
 export const DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED = true;
 
+/** 是否启用合集顺序闸门自动旁路 */
+export const COLLECTION_AUTO_BYPASS_ENABLED =
+  process.env.COLLECTION_AUTO_BYPASS_ENABLED !== 'false';
+
+/** 合集顺序闸门自动旁路阈值（分钟） */
+export const COLLECTION_AUTO_BYPASS_AFTER_MINUTES = (() => {
+  const n = Number(process.env.COLLECTION_AUTO_BYPASS_AFTER_MINUTES ?? '10');
+  if (!Number.isFinite(n) || n < 1) return 10;
+  return Math.min(180, Math.floor(n));
+})();
+
+/** 是否在前置任务重试耗尽时启用自动旁路 */
+export const COLLECTION_AUTO_BYPASS_ON_MAX_RETRIES =
+  process.env.COLLECTION_AUTO_BYPASS_ON_MAX_RETRIES !== 'false';
+
+/** 自动旁路写入的 skipStatus 标记 */
+export const COLLECTION_AUTO_BYPASS_MARK =
+  (process.env.COLLECTION_AUTO_BYPASS_MARK || 'skipped_auto_failed_prev').trim() ||
+  'skipped_auto_failed_prev';
+
 /** 是否启用目录任务（TypeC/Catalog）频道级时间窗口保护 */
 export const CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED = true;
 

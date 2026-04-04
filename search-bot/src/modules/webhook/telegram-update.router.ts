@@ -1,5 +1,10 @@
 import { parseSearchCommand } from '../command/command.parser';
-import { querySearch } from '../search/search.client';
+import { renderSearchMessage } from '../render/message.renderer';
+import { renderPagerKeyboard } from '../render/keyboard.renderer';
+import { createCallbackToken } from '../callback/callback-token.service';
+import { handleCallbackQuery } from '../callback/callback-handler';
+import { allowChannelRequest, allowUserRequest } from '../security/rate-limit.service';
+import { searchWithCache } from '../search/search.orchestrator';
 
 export interface TelegramMessage {
   message_id?: number;
@@ -25,7 +30,7 @@ export async function routeTelegramUpdate(update: TelegramUpdate) {
   }
 
   if (update.callback_query) {
-    return { routed: 'callback_query', ok: true };
+    return handleCallbackQuery(update.callback_query);
   }
 
   return { routed: 'ignored', ok: true };
@@ -38,23 +43,75 @@ async function handleMessage(message: TelegramMessage) {
   }
 
   const chatId = message.chat?.id;
-  const channelIds = typeof chatId === 'number' ? [String(chatId)] : [];
+  const requesterId = message.from?.id;
+  const channelId = typeof chatId === 'number' ? String(chatId) : '';
 
-  const result = await querySearch({
+  if (!channelId || typeof requesterId !== 'number') {
+    return { routed: 'message', ok: false, action: 'invalid_context' };
+  }
+
+  const allowedByUser = await allowUserRequest(String(requesterId));
+  if (!allowedByUser) {
+    return {
+      routed: 'message',
+      ok: true,
+      action: 'rate_limited_user',
+      send: {
+        chatId,
+        text: '请求过于频繁，请稍后再试。',
+      },
+    };
+  }
+
+  const allowedByChannel = await allowChannelRequest(channelId);
+  if (!allowedByChannel) {
+    return {
+      routed: 'message',
+      ok: true,
+      action: 'rate_limited_channel',
+      send: {
+        chatId,
+        text: '当前频道搜索请求过多，请稍后重试。',
+      },
+    };
+  }
+
+  const page = 1;
+  const pageSize = 20;
+  const result = await searchWithCache({
     keyword: parsed.keyword,
-    channelIds,
-    limit: 20,
+    channelId,
+    limit: pageSize,
     offset: 0,
-    fallbackToDb: true,
+  });
+
+  const nextToken = result.hasMore
+    ? await createCallbackToken({
+        keyword: parsed.keyword,
+        channelId,
+        requesterId: String(requesterId),
+        page: page + 1,
+        pageSize,
+      })
+    : null;
+
+  const text = renderSearchMessage({
+    keyword: parsed.keyword,
+    page,
+    pageSize,
+    total: result.total,
+    items: result.results,
   });
 
   return {
     routed: 'message',
     ok: true,
-    action: 'search',
-    keyword: parsed.keyword,
-    total: result.total,
-    hasMore: result.hasMore,
-    route: result.route,
+    action: 'send_message',
+    send: {
+      chatId,
+      text,
+      replyMarkup: renderPagerKeyboard({ prevToken: null, nextToken }),
+      degraded: result.total === 0,
+    },
   };
 }

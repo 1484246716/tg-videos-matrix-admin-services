@@ -99,6 +99,40 @@ importers:
         specifier: ^5.6.3
         version: 5.9.3
 
+  search-bot:
+    dependencies:
+      axios:
+        specifier: ^1.7.7
+        version: 1.13.6
+      dotenv:
+        specifier: ^16.4.5
+        version: 16.6.1
+      express:
+        specifier: ^5.2.1
+        version: 5.2.1
+      ioredis:
+        specifier: ^5.4.1
+        version: 5.10.0
+      zod:
+        specifier: ^3.23.8
+        version: 3.25.76
+    devDependencies:
+      '@types/express':
+        specifier: ^5.0.3
+        version: 5.0.6
+      '@types/node':
+        specifier: ^24.3.1
+        version: 24.12.2
+      ts-node:
+        specifier: ^10.9.2
+        version: 10.9.2(@types/node@24.12.2)(typescript@5.9.3)
+      ts-node-dev:
+        specifier: ^2.0.0
+        version: 2.0.0(@types/node@24.12.2)(typescript@5.9.3)
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+
   worker:
     dependencies:
       '@prisma/client':
@@ -121,7 +155,7 @@ importers:
         version: 5.10.0
       openai:
         specifier: ^6.27.0
-        version: 6.29.0
+        version: 6.29.0(zod@3.25.76)
       telegram:
         specifier: ^2.23.0
         version: 2.26.22
@@ -487,6 +521,9 @@ packages:
 
   '@types/ms@2.1.0':
     resolution: {integrity: sha512-GsCCIZDE/p3i96vtEqx+7dBUGXrc7zeSK3wwPHIaRThS+9OhWIXRqzs4d6k1SVU8g91DrNRWxWUGhp5KXQb2VA==, tarball: https://registry.npmmirror.com/@types/ms/-/ms-2.1.0.tgz}
+
+  '@types/node@24.12.2':
+    resolution: {integrity: sha512-A1sre26ke7HDIuY/M23nd9gfB+nrmhtYyMINbjI1zHJxYteKR6qSMX56FsmjMcDb3SMcjJg5BiRRgOCC/yBD0g==, tarball: https://registry.npmmirror.com/@types/node/-/node-24.12.2.tgz}
 
   '@types/node@25.4.0':
     resolution: {integrity: sha512-9wLpoeWuBlcbBpOY3XmzSTG3oscB6xjBEEtn+pYXTfhyXhIxC5FsBer2KTopBlvKEiW9l13po9fq+SJY/5lkhw==, tarball: https://registry.npmmirror.com/@types/node/-/node-25.4.0.tgz}
@@ -1906,6 +1943,9 @@ packages:
     resolution: {integrity: sha512-rvKSBiC5zqCCiDZ9kAOszZcDvdAHwwIKJG33Ykj43OKcWsnmcBRL09YTU4nOeHZ8Y2a7l1MgTd08SBe9A8Qj6A==, tarball: https://registry.npmmirror.com/uint8array-extras/-/uint8array-extras-1.5.0.tgz}
     engines: {node: '>=18'}
 
+  undici-types@7.16.0:
+    resolution: {integrity: sha512-Zz+aZWSj8LE6zoxD+xrjh4VfkIG8Ya6LvYkZqtUQGJPZjYl53ypCaUwWqo7eI0x66KBGeRo+mlBEkMSeSZ38Nw==, tarball: https://registry.npmmirror.com/undici-types/-/undici-types-7.16.0.tgz}
+
   undici-types@7.18.2:
     resolution: {integrity: sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w==, tarball: https://registry.npmmirror.com/undici-types/-/undici-types-7.18.2.tgz}
 
@@ -2069,6 +2109,9 @@ packages:
   yn@3.1.1:
     resolution: {integrity: sha512-Ux4ygGWsu2c7isFWe8Yu1YluJmqVhxqK2cLXNQA5AcC3QfbGNpM7fu0Y8b/z16pXLnFxZYvWhd3fhBY9DLmC6Q==, tarball: https://registry.npmmirror.com/yn/-/yn-3.1.1.tgz}
     engines: {node: '>=6'}
+
+  zod@3.25.76:
+    resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==, tarball: https://registry.npmmirror.com/zod/-/zod-3.25.76.tgz}
 
 snapshots:
 
@@ -2385,6 +2428,10 @@ snapshots:
       '@types/node': 25.4.0
 
   '@types/ms@2.1.0': {}
+
+  '@types/node@24.12.2':
+    dependencies:
+      undici-types: 7.16.0
 
   '@types/node@25.4.0':
     dependencies:
@@ -3440,7 +3487,9 @@ snapshots:
     dependencies:
       fn.name: 1.1.0
 
-  openai@6.29.0: {}
+  openai@6.29.0(zod@3.25.76):
+    optionalDependencies:
+      zod: 3.25.76
 
   pako@2.1.0: {}
 
@@ -3812,6 +3861,24 @@ snapshots:
 
   ts-custom-error@3.3.1: {}
 
+  ts-node-dev@2.0.0(@types/node@24.12.2)(typescript@5.9.3):
+    dependencies:
+      chokidar: 3.6.0
+      dynamic-dedupe: 0.3.0
+      minimist: 1.2.8
+      mkdirp: 1.0.4
+      resolve: 1.22.11
+      rimraf: 2.7.1
+      source-map-support: 0.5.21
+      tree-kill: 1.2.2
+      ts-node: 10.9.2(@types/node@24.12.2)(typescript@5.9.3)
+      tsconfig: 7.0.0
+      typescript: 5.9.3
+    transitivePeerDependencies:
+      - '@swc/core'
+      - '@swc/wasm'
+      - '@types/node'
+
   ts-node-dev@2.0.0(@types/node@25.4.0)(typescript@5.9.3):
     dependencies:
       chokidar: 3.6.0
@@ -3829,6 +3896,24 @@ snapshots:
       - '@swc/core'
       - '@swc/wasm'
       - '@types/node'
+
+  ts-node@10.9.2(@types/node@24.12.2)(typescript@5.9.3):
+    dependencies:
+      '@cspotcode/source-map-support': 0.8.1
+      '@tsconfig/node10': 1.0.12
+      '@tsconfig/node12': 1.0.11
+      '@tsconfig/node14': 1.0.3
+      '@tsconfig/node16': 1.0.4
+      '@types/node': 24.12.2
+      acorn: 8.16.0
+      acorn-walk: 8.3.5
+      arg: 4.1.3
+      create-require: 1.1.1
+      diff: 4.0.4
+      make-error: 1.3.6
+      typescript: 5.9.3
+      v8-compile-cache-lib: 3.0.1
+      yn: 3.1.1
 
   ts-node@10.9.2(@types/node@25.4.0)(typescript@5.9.3):
     dependencies:
@@ -3883,6 +3968,8 @@ snapshots:
       '@lukeed/csprng': 1.1.0
 
   uint8array-extras@1.5.0: {}
+
+  undici-types@7.16.0: {}
 
   undici-types@7.18.2: {}
 
@@ -4012,3 +4099,5 @@ snapshots:
   yaeti@0.0.6: {}
 
   yn@3.1.1: {}
+
+  zod@3.25.76: {}

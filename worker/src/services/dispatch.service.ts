@@ -1,7 +1,7 @@
 import { TaskStatus } from '@prisma/client';
 import { generateTextWithAiProfile } from '../ai-provider';
 import { DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED } from '../config/env';
-import { prisma } from '../infra/prisma';
+import { prisma, withPrismaRetry } from '../infra/prisma';
 import { searchIndexQueue } from '../infra/redis';
 import { logger, logError } from '../logger';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
@@ -110,58 +110,70 @@ export async function handleDispatchJob(
 ) {
   const dispatchTaskId = BigInt(dispatchTaskIdRaw);
 
-  const task = await prisma.dispatchTask.findUnique({
-    where: { id: dispatchTaskId },
-    include: {
-      channel: {
-        select: {
-          id: true,
-          name: true,
-          tgChatId: true,
-          defaultBotId: true,
-          aiModelProfileId: true,
-          aiSystemPromptTemplate: true,
-          aiReplyMarkup: true,
-          postIntervalSec: true,
-          lastPostAt: true,
+  const task = await withPrismaRetry(
+    () =>
+      prisma.dispatchTask.findUnique({
+        where: { id: dispatchTaskId },
+        include: {
+          channel: {
+            select: {
+              id: true,
+              name: true,
+              tgChatId: true,
+              defaultBotId: true,
+              aiModelProfileId: true,
+              aiSystemPromptTemplate: true,
+              aiReplyMarkup: true,
+              postIntervalSec: true,
+              lastPostAt: true,
+            },
+          },
+          mediaAsset: {
+            select: {
+              id: true,
+              telegramFileId: true,
+              status: true,
+              originalName: true,
+              aiGeneratedCaption: true,
+              durationSec: true,
+              sourceMeta: true,
+            },
+          },
         },
-      },
-      mediaAsset: {
-        select: {
-          id: true,
-          telegramFileId: true,
-          status: true,
-          originalName: true,
-          aiGeneratedCaption: true,
-          durationSec: true,
-          sourceMeta: true,
-        },
-      },
-    },
-  });
+      }),
+    { label: 'dispatch.handleDispatchJob.findTask' },
+  );
 
   if (!task) {
     throw new Error(`未找到分发任务: ${dispatchTaskIdRaw}`);
   }
 
-  await prisma.dispatchTask.update({
-    where: { id: dispatchTaskId },
-    data: {
-      status: TaskStatus.running,
-      startedAt: new Date(),
-    },
-  });
+  await withPrismaRetry(
+    () =>
+      prisma.dispatchTask.update({
+        where: { id: dispatchTaskId },
+        data: {
+          status: TaskStatus.running,
+          startedAt: new Date(),
+        },
+      }),
+    { label: 'dispatch.handleDispatchJob.markRunning' },
+  );
 
-  await prisma.dispatchTaskLog.create({
-    data: {
-      dispatchTaskId,
-      action: 'task_running',
-      detail: {
-        jobId,
-        attemptsMade,
-      },
-    },
-  });
+  await withPrismaRetry(
+    () =>
+      prisma.dispatchTaskLog.create({
+        data: {
+          dispatchTaskId,
+          action: 'task_running',
+          detail: {
+            jobId,
+            attemptsMade,
+          },
+        },
+      }),
+    { label: 'dispatch.handleDispatchJob.logRunning' },
+  );
 
   try {
     if (!task.mediaAsset.telegramFileId) {
@@ -310,13 +322,17 @@ export async function handleDispatchJob(
       throw new Error('分发任务或频道未配置机器人');
     }
 
-    const bot = await prisma.bot.findFirst({
-      where: {
-        id: resolvedBotId,
-        status: 'active',
-      },
-      select: { id: true, tokenEncrypted: true },
-    });
+    const bot = await withPrismaRetry(
+      () =>
+        prisma.bot.findFirst({
+          where: {
+            id: resolvedBotId,
+            status: 'active',
+          },
+          select: { id: true, tokenEncrypted: true },
+        }),
+      { label: 'dispatch.handleDispatchJob.findActiveBot' },
+    );
 
     if (!bot) {
       throw new Error(
@@ -407,24 +423,28 @@ export async function handleDispatchJob(
       }
     }
 
-    await prisma.$transaction([
-      prisma.dispatchTask.update({
-        where: { id: dispatchTaskId },
-        data: {
-          status: TaskStatus.success,
-          finishedAt: new Date(),
-          botId: bot.id,
-          telegramMessageId: BigInt(sendResult.messageId),
-          telegramMessageLink: sendResult.messageLink,
-          telegramErrorCode: null,
-          telegramErrorMessage: null,
-        },
-      }),
-      prisma.channel.update({
-        where: { id: task.channelId },
-        data: { lastPostAt: new Date() },
-      }),
-    ]);
+    await withPrismaRetry(
+      () =>
+        prisma.$transaction([
+          prisma.dispatchTask.update({
+            where: { id: dispatchTaskId },
+            data: {
+              status: TaskStatus.success,
+              finishedAt: new Date(),
+              botId: bot.id,
+              telegramMessageId: BigInt(sendResult.messageId),
+              telegramMessageLink: sendResult.messageLink,
+              telegramErrorCode: null,
+              telegramErrorMessage: null,
+            },
+          }),
+          prisma.channel.update({
+            where: { id: task.channelId },
+            data: { lastPostAt: new Date() },
+          }),
+        ]),
+      { label: 'dispatch.handleDispatchJob.markSuccessAndUpdateChannel' },
+    );
 
     await prisma.dispatchTaskLog.create({
       data: {
@@ -478,51 +498,63 @@ export async function handleDispatchJob(
 
     const nextStatus = exceeded || deterministic ? TaskStatus.dead : TaskStatus.failed;
 
-    await prisma.dispatchTask.update({
-      where: { id: dispatchTaskId },
-      data: {
-        status: nextStatus,
-        retryCount: nextRetryCount,
-        nextRunAt: nextStatus === TaskStatus.dead ? task.nextRunAt : nextRunAt,
-        telegramErrorCode: code,
-        telegramErrorMessage: message,
-        finishedAt: now,
-      },
-    });
-
-    await prisma.dispatchTaskLog.create({
-      data: {
-        dispatchTaskId,
-        action: nextStatus === TaskStatus.dead ? 'task_dead' : 'task_failed',
-        detail: {
-          errorCode: code,
-          errorMessage: message,
-          retryCount: nextRetryCount,
-          nextRunAt: nextStatus === TaskStatus.dead ? null : nextRunAt,
-          deterministic,
-        },
-      },
-    });
-
-    if (code === 'TG_429' || code === 'TG_403') {
-      await prisma.riskEvent.create({
-        data: {
-          level: code === 'TG_429' ? 'high' : 'critical',
-          eventType:
-            code === 'TG_429'
-              ? 'telegram_rate_limit'
-              : 'telegram_permission_denied',
-          botId: task.botId ?? task.channel.defaultBotId,
-          channelId: task.channelId,
-          dispatchTaskId: task.id,
-          payload: {
+    await withPrismaRetry(
+      () =>
+        prisma.dispatchTask.update({
+          where: { id: dispatchTaskId },
+          data: {
+            status: nextStatus,
+            retryCount: nextRetryCount,
+            nextRunAt: nextStatus === TaskStatus.dead ? task.nextRunAt : nextRunAt,
             telegramErrorCode: code,
             telegramErrorMessage: message,
-            retryCount: nextRetryCount,
-            jobId,
+            finishedAt: now,
           },
-        },
-      });
+        }),
+      { label: 'dispatch.handleDispatchJob.markFailedOrDead' },
+    );
+
+    await withPrismaRetry(
+      () =>
+        prisma.dispatchTaskLog.create({
+          data: {
+            dispatchTaskId,
+            action: nextStatus === TaskStatus.dead ? 'task_dead' : 'task_failed',
+            detail: {
+              errorCode: code,
+              errorMessage: message,
+              retryCount: nextRetryCount,
+              nextRunAt: nextStatus === TaskStatus.dead ? null : nextRunAt,
+              deterministic,
+            },
+          },
+        }),
+      { label: 'dispatch.handleDispatchJob.logFailedOrDead' },
+    );
+
+    if (code === 'TG_429' || code === 'TG_403') {
+      await withPrismaRetry(
+        () =>
+          prisma.riskEvent.create({
+            data: {
+              level: code === 'TG_429' ? 'high' : 'critical',
+              eventType:
+                code === 'TG_429'
+                  ? 'telegram_rate_limit'
+                  : 'telegram_permission_denied',
+              botId: task.botId ?? task.channel.defaultBotId,
+              channelId: task.channelId,
+              dispatchTaskId: task.id,
+              payload: {
+                telegramErrorCode: code,
+                telegramErrorMessage: message,
+                retryCount: nextRetryCount,
+                jobId,
+              },
+            },
+          }),
+        { label: 'dispatch.handleDispatchJob.createRiskEvent' },
+      );
     }
 
     throw error;

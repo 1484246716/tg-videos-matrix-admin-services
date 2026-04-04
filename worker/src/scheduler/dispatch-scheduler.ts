@@ -1,9 +1,13 @@
 import { MediaStatus, TaskStatus } from '@prisma/client';
 import {
+  COLLECTION_AUTO_BYPASS_AFTER_MINUTES,
+  COLLECTION_AUTO_BYPASS_ENABLED,
+  COLLECTION_AUTO_BYPASS_MARK,
+  COLLECTION_AUTO_BYPASS_ON_MAX_RETRIES,
   DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED,
   MAX_SCHEDULE_BATCH,
 } from '../config/env';
-import { prisma, getTaskDefinitionModel } from '../infra/prisma';
+import { prisma, getTaskDefinitionModel, withPrismaRetry } from '../infra/prisma';
 import { dispatchQueue } from '../infra/redis';
 import { logger } from '../logger';
 import { releaseChannelLock, tryAcquireChannelLock } from '../shared/channel-lock';
@@ -13,6 +17,11 @@ const DISPATCH_HEAD_BYPASS_RETRY_THRESHOLD = 2;
 const DISPATCH_HEAD_BYPASS_DELAY_SEC = 10 * 60;
 const COLLECTION_SKIP_GRACE_MS = 5 * 60 * 1000;
 const COLLECTION_SKIP_REASON = 'auto_skip_missing_after_grace';
+
+type CollectionGateEvalStats = {
+  autoBypassCount: number;
+  blockedCount: number;
+};
 
 function parseEpisodeNoFromText(text: string) {
   const patterns = [
@@ -105,22 +114,27 @@ async function canDispatchCollectionEpisode(args: {
   collectionName: string;
   episodeNo: number;
   now: Date;
+  stats?: CollectionGateEvalStats;
 }) {
-  const collectionAssets = await prisma.mediaAsset.findMany({
-    where: {
-      channelId: args.channelId,
-      sourceMeta: {
-        path: ['collectionName'],
-        equals: args.collectionName,
-      },
-    },
-    select: {
-      id: true,
-      sourceMeta: true,
-      status: true,
-      updatedAt: true,
-    },
-  });
+  const collectionAssets = await withPrismaRetry(
+    () =>
+      prisma.mediaAsset.findMany({
+        where: {
+          channelId: args.channelId,
+          sourceMeta: {
+            path: ['collectionName'],
+            equals: args.collectionName,
+          },
+        },
+        select: {
+          id: true,
+          sourceMeta: true,
+          status: true,
+          updatedAt: true,
+        },
+      }),
+    { label: 'dispatch.canDispatchCollectionEpisode.collectionAssets' },
+  );
 
   const prevEpisodes = collectionAssets
     .map((asset) => ({ id: asset.id, meta: parseCollectionMeta(asset.sourceMeta), status: asset.status, updatedAt: asset.updatedAt }))
@@ -138,19 +152,140 @@ async function canDispatchCollectionEpisode(args: {
 
   const prevEpisodeAssetIds = prevEpisodes.map((item) => item.id);
 
-  const successRows = await prisma.dispatchTask.findMany({
-    where: {
-      mediaAssetId: { in: prevEpisodeAssetIds },
-      status: TaskStatus.success,
-    },
-    select: { mediaAssetId: true },
-    distinct: ['mediaAssetId'],
-  });
+  const successRows = await withPrismaRetry(
+    () =>
+      prisma.dispatchTask.findMany({
+        where: {
+          mediaAssetId: { in: prevEpisodeAssetIds },
+          status: TaskStatus.success,
+        },
+        select: { mediaAssetId: true },
+        distinct: ['mediaAssetId'],
+      }),
+    { label: 'dispatch.canDispatchCollectionEpisode.successRows' },
+  );
 
   const successSet = new Set(successRows.map((row) => row.mediaAssetId.toString()));
 
+  const latestDispatchRows = await withPrismaRetry(
+    () =>
+      prisma.dispatchTask.findMany({
+        where: {
+          mediaAssetId: { in: prevEpisodeAssetIds },
+        },
+        orderBy: [{ mediaAssetId: 'asc' }, { id: 'desc' }],
+        select: {
+          id: true,
+          mediaAssetId: true,
+          status: true,
+          retryCount: true,
+          maxRetries: true,
+          updatedAt: true,
+        },
+      }),
+    { label: 'dispatch.canDispatchCollectionEpisode.latestDispatchRows' },
+  );
+
+  const latestDispatchMap = new Map<string, {
+    id: bigint;
+    status: TaskStatus;
+    retryCount: number;
+    maxRetries: number;
+    updatedAt: Date;
+  }>();
+
+  for (const row of latestDispatchRows) {
+    const key = row.mediaAssetId.toString();
+    if (latestDispatchMap.has(key)) continue;
+    latestDispatchMap.set(key, {
+      id: row.id,
+      status: row.status,
+      retryCount: row.retryCount,
+      maxRetries: row.maxRetries,
+      updatedAt: row.updatedAt,
+    });
+  }
+
   for (const prev of prevEpisodes) {
     if (successSet.has(prev.id.toString())) continue;
+
+    const assetIdStr = prev.id.toString();
+    const latestDispatch = latestDispatchMap.get(assetIdStr);
+    const latestDispatchElapsedMs = latestDispatch
+      ? args.now.getTime() - latestDispatch.updatedAt.getTime()
+      : null;
+
+    if (COLLECTION_AUTO_BYPASS_ENABLED) {
+      const hitMaxRetries =
+        COLLECTION_AUTO_BYPASS_ON_MAX_RETRIES &&
+        latestDispatch &&
+        latestDispatch.status !== TaskStatus.success &&
+        latestDispatch.retryCount >= latestDispatch.maxRetries;
+
+      const hitTimeout =
+        latestDispatch &&
+        latestDispatch.status !== TaskStatus.success &&
+        Number.isFinite(latestDispatchElapsedMs) &&
+        (latestDispatchElapsedMs as number) >= COLLECTION_AUTO_BYPASS_AFTER_MINUTES * 60 * 1000;
+
+      if (hitMaxRetries || hitTimeout) {
+        const sourceMeta = collectionAssets.find((asset) => asset.id === prev.id)?.sourceMeta;
+        const metaObj = sourceMeta && typeof sourceMeta === 'object'
+          ? (sourceMeta as Record<string, unknown>)
+          : {};
+
+        await withPrismaRetry(
+          () =>
+            prisma.mediaAsset.update({
+              where: { id: prev.id },
+              data: {
+                sourceMeta: {
+                  ...metaObj,
+                  skipStatus: COLLECTION_AUTO_BYPASS_MARK,
+                  skipReason: 'auto_bypass_after_retry_or_timeout',
+                  skipAt: args.now.toISOString(),
+                },
+              },
+            }),
+          { label: 'dispatch.collection.autoBypass.updateMediaAsset' },
+        );
+
+        await withPrismaRetry(
+          () =>
+            prisma.riskEvent.create({
+              data: {
+                level: 'medium',
+                eventType: 'collection_episode_auto_bypass',
+                channelId: args.channelId,
+                dispatchTaskId: latestDispatch?.id,
+                payload: {
+                  collectionName: args.collectionName,
+                  blockedByEpisodeNo: prev.meta.episodeNo,
+                  autoBypassAfterMinutes: COLLECTION_AUTO_BYPASS_AFTER_MINUTES,
+                  reason: hitMaxRetries ? 'max_retries_exhausted' : 'timeout_exceeded',
+                },
+              },
+            }),
+          { label: 'dispatch.collection.autoBypass.riskEvent' },
+        );
+
+        if (args.stats) args.stats.autoBypassCount += 1;
+
+        logger.warn('[scheduler] 合集顺序闸门自动旁路前置集', {
+          channelId: args.channelId.toString(),
+          collectionName: args.collectionName,
+          blockedByEpisodeNo: prev.meta.episodeNo,
+          mediaAssetId: assetIdStr,
+          reason: hitMaxRetries ? 'max_retries_exhausted' : 'timeout_exceeded',
+          collection_gate_auto_bypass_total: 1,
+          collectionAutoBypassEnabled: COLLECTION_AUTO_BYPASS_ENABLED,
+          collectionAutoBypassAfterMinutes: COLLECTION_AUTO_BYPASS_AFTER_MINUTES,
+          collectionAutoBypassOnMaxRetries: COLLECTION_AUTO_BYPASS_ON_MAX_RETRIES,
+        });
+
+        continue;
+      }
+    }
 
     const isFailedOrDeleted = prev.status === MediaStatus.failed || prev.status === MediaStatus.deleted;
     if (!isFailedOrDeleted) continue;
@@ -162,24 +297,32 @@ async function canDispatchCollectionEpisode(args: {
         ? (sourceMeta as Record<string, unknown>)
         : {};
 
-      await prisma.mediaAsset.update({
-        where: { id: prev.id },
-        data: {
-          sourceMeta: {
-            ...metaObj,
-            skipStatus: 'skipped_missing',
-            skipReason: COLLECTION_SKIP_REASON,
-            skipAt: args.now.toISOString(),
-          },
-        },
-      });
+      await withPrismaRetry(
+        () =>
+          prisma.mediaAsset.update({
+            where: { id: prev.id },
+            data: {
+              sourceMeta: {
+                ...metaObj,
+                skipStatus: 'skipped_missing',
+                skipReason: COLLECTION_SKIP_REASON,
+                skipAt: args.now.toISOString(),
+              },
+            },
+          }),
+        { label: 'dispatch.collection.skipMissing.updateMediaAsset' },
+      );
     }
   }
 
-  const refreshedAssets = await prisma.mediaAsset.findMany({
-    where: { id: { in: prevEpisodeAssetIds } },
-    select: { id: true, sourceMeta: true },
-  });
+  const refreshedAssets = await withPrismaRetry(
+    () =>
+      prisma.mediaAsset.findMany({
+        where: { id: { in: prevEpisodeAssetIds } },
+        select: { id: true, sourceMeta: true },
+      }),
+    { label: 'dispatch.canDispatchCollectionEpisode.refreshedAssets' },
+  );
 
   const skippedSet = new Set(
     refreshedAssets
@@ -187,7 +330,7 @@ async function canDispatchCollectionEpisode(args: {
         const meta = asset.sourceMeta && typeof asset.sourceMeta === 'object'
           ? (asset.sourceMeta as Record<string, unknown>)
           : {};
-        return meta.skipStatus === 'skipped_missing';
+        return meta.skipStatus === 'skipped_missing' || meta.skipStatus === COLLECTION_AUTO_BYPASS_MARK;
       })
       .map((asset) => asset.id.toString()),
   );
@@ -200,6 +343,8 @@ async function canDispatchCollectionEpisode(args: {
     return { allowed: true as const, blockedByEpisodeNo: null as number | null };
   }
 
+  if (args.stats) args.stats.blockedCount += 1;
+
   return {
     allowed: false as const,
     blockedByEpisodeNo: blocked.meta.episodeNo ?? null,
@@ -208,37 +353,45 @@ async function canDispatchCollectionEpisode(args: {
 
 export async function scheduleDueDispatchTasks() {
   const now = new Date();
+  const gateStats: CollectionGateEvalStats = {
+    autoBypassCount: 0,
+    blockedCount: 0,
+  };
 
-  const dueTasks = await prisma.dispatchTask.findMany({
-    where: {
-      status: { in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed] },
-      nextRunAt: { lte: now },
-    },
-    orderBy: [{ priority: 'asc' }, { nextRunAt: 'asc' }],
-    take: MAX_SCHEDULE_BATCH,
-    select: {
-      id: true,
-      status: true,
-      channelId: true,
-      mediaAssetId: true,
-      retryCount: true,
-      maxRetries: true,
-      nextRunAt: true,
-      channel: {
-        select: {
-          postIntervalSec: true,
-          lastPostAt: true,
-          navReplyMarkup: true,
+  const dueTasks = await withPrismaRetry(
+    () =>
+      prisma.dispatchTask.findMany({
+        where: {
+          status: { in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed] },
+          nextRunAt: { lte: now },
         },
-      },
-      mediaAsset: {
+        orderBy: [{ priority: 'asc' }, { nextRunAt: 'asc' }],
+        take: MAX_SCHEDULE_BATCH,
         select: {
-          sourceMeta: true,
-          originalName: true,
+          id: true,
+          status: true,
+          channelId: true,
+          mediaAssetId: true,
+          retryCount: true,
+          maxRetries: true,
+          nextRunAt: true,
+          channel: {
+            select: {
+              postIntervalSec: true,
+              lastPostAt: true,
+              navReplyMarkup: true,
+            },
+          },
+          mediaAsset: {
+            select: {
+              sourceMeta: true,
+              originalName: true,
+            },
+          },
         },
-      },
-    },
-  });
+      }),
+    { label: 'dispatch.scheduleDueDispatchTasks.findDueTasks' },
+  );
 
   const queuedChannelIds = new Set<string>();
   let queuedCount = 0;
@@ -262,16 +415,20 @@ export async function scheduleDueDispatchTasks() {
             ? (sourceMetaRaw as Record<string, unknown>)
             : {};
 
-        await prisma.mediaAsset.update({
-          where: { id: task.mediaAssetId },
-          data: {
-            sourceMeta: {
-              ...sourceMetaObj,
-              episodeNo: fallbackEpisodeNo,
-              episodeParseFailed: false,
-            },
-          },
-        });
+        await withPrismaRetry(
+          () =>
+            prisma.mediaAsset.update({
+              where: { id: task.mediaAssetId },
+              data: {
+                sourceMeta: {
+                  ...sourceMetaObj,
+                  episodeNo: fallbackEpisodeNo,
+                  episodeParseFailed: false,
+                },
+              },
+            }),
+          { label: 'dispatch.scheduleDueDispatchTasks.fixEpisodeNo' },
+        );
 
         collectionMeta = {
           collectionName: collectionMeta.collectionName,
@@ -298,13 +455,17 @@ export async function scheduleDueDispatchTasks() {
 
     if (shouldBypassHead) {
       const bypassNextRunAt = new Date(Date.now() + DISPATCH_HEAD_BYPASS_DELAY_SEC * 1000);
-      await prisma.dispatchTask.update({
-        where: { id: task.id },
-        data: {
-          status: TaskStatus.failed,
-          nextRunAt: bypassNextRunAt,
-        },
-      });
+      await withPrismaRetry(
+        () =>
+          prisma.dispatchTask.update({
+            where: { id: task.id },
+            data: {
+              status: TaskStatus.failed,
+              nextRunAt: bypassNextRunAt,
+            },
+          }),
+        { label: 'dispatch.scheduleDueDispatchTasks.bypassHead' },
+      );
 
       logger.warn('[scheduler] 分发头阻塞旁路，临时延后高重试任务', {
         taskId: task.id.toString(),
@@ -318,13 +479,17 @@ export async function scheduleDueDispatchTasks() {
     }
 
     if (collectionMeta?.episodeParseFailed) {
-      await prisma.dispatchTask.update({
-        where: { id: task.id },
-        data: {
-          status: TaskStatus.scheduled,
-          nextRunAt: new Date(Date.now() + 10 * 60 * 1000),
-        },
-      });
+      await withPrismaRetry(
+        () =>
+          prisma.dispatchTask.update({
+            where: { id: task.id },
+            data: {
+              status: TaskStatus.scheduled,
+              nextRunAt: new Date(Date.now() + 10 * 60 * 1000),
+            },
+          }),
+        { label: 'dispatch.scheduleDueDispatchTasks.episodeParseFailedDelay' },
+      );
 
       logger.warn('[scheduler] 合集集号解析失败，阻塞分发等待人工改名重扫', {
         taskId: task.id.toString(),
@@ -346,6 +511,7 @@ export async function scheduleDueDispatchTasks() {
         collectionName: collectionMeta.collectionName,
         episodeNo: collectionMeta.episodeNo,
         now,
+        stats: gateStats,
       });
 
       if (!gateResult.allowed) {
@@ -358,13 +524,17 @@ export async function scheduleDueDispatchTasks() {
           const bypassNextRunAt = new Date(
             Date.now() + collectionCfg.collectionHeadBypassMinutes * 60 * 1000,
           );
-          await prisma.dispatchTask.update({
-            where: { id: task.id },
-            data: {
-              status: TaskStatus.failed,
-              nextRunAt: bypassNextRunAt,
-            },
-          });
+          await withPrismaRetry(
+            () =>
+              prisma.dispatchTask.update({
+                where: { id: task.id },
+                data: {
+                  status: TaskStatus.failed,
+                  nextRunAt: bypassNextRunAt,
+                },
+              }),
+            { label: 'dispatch.scheduleDueDispatchTasks.collectionBypassHead' },
+          );
 
           logger.warn('[scheduler] 合集头部阻塞旁路生效，延后重试', {
             taskId: task.id.toString(),
@@ -379,13 +549,17 @@ export async function scheduleDueDispatchTasks() {
           continue;
         }
 
-        await prisma.dispatchTask.update({
-          where: { id: task.id },
-          data: {
-            status: TaskStatus.scheduled,
-            nextRunAt: new Date(Date.now() + 60 * 1000),
-          },
-        });
+        await withPrismaRetry(
+          () =>
+            prisma.dispatchTask.update({
+              where: { id: task.id },
+              data: {
+                status: TaskStatus.scheduled,
+                nextRunAt: new Date(Date.now() + 60 * 1000),
+              },
+            }),
+          { label: 'dispatch.scheduleDueDispatchTasks.collectionGateDelay' },
+        );
 
         logger.info('[scheduler] 合集顺序闸门阻塞当前分发任务', {
           taskId: task.id.toString(),
@@ -407,13 +581,17 @@ export async function scheduleDueDispatchTasks() {
       });
 
       if (nextAllowedAt.getTime() > now.getTime()) {
-        await prisma.dispatchTask.update({
-          where: { id: task.id },
-          data: {
-            status: TaskStatus.scheduled,
-            nextRunAt: nextAllowedAt,
-          },
-        });
+        await withPrismaRetry(
+          () =>
+            prisma.dispatchTask.update({
+              where: { id: task.id },
+              data: {
+                status: TaskStatus.scheduled,
+                nextRunAt: nextAllowedAt,
+              },
+            }),
+          { label: 'dispatch.scheduleDueDispatchTasks.channelWindowDelay' },
+        );
 
         logger.info('[scheduler] 分发任务未到频道发送窗口，已延后', {
           taskId: task.id.toString(),
@@ -441,17 +619,21 @@ export async function scheduleDueDispatchTasks() {
     }
 
     try {
-      const updated = await prisma.dispatchTask.updateMany({
-        where: {
-          id: task.id,
-          status: {
-            in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed],
-          },
-        },
-        data: {
-          status: TaskStatus.scheduled,
-        },
-      });
+      const updated = await withPrismaRetry(
+        () =>
+          prisma.dispatchTask.updateMany({
+            where: {
+              id: task.id,
+              status: {
+                in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed],
+              },
+            },
+            data: {
+              status: TaskStatus.scheduled,
+            },
+          }),
+        { label: 'dispatch.scheduleDueDispatchTasks.markScheduled' },
+      );
 
       if (updated.count === 0) continue;
 
@@ -477,9 +659,24 @@ export async function scheduleDueDispatchTasks() {
     }
   }
 
+  logger.info('[typeb_metrics] dispatch scheduler tick', {
+    typeb_enqueue_total: queuedCount,
+    collection_gate_auto_bypass_total: gateStats.autoBypassCount,
+    collection_gate_block_total: gateStats.blockedCount,
+    collectionAutoBypassEnabled: COLLECTION_AUTO_BYPASS_ENABLED,
+    collectionAutoBypassAfterMinutes: COLLECTION_AUTO_BYPASS_AFTER_MINUTES,
+    collectionAutoBypassOnMaxRetries: COLLECTION_AUTO_BYPASS_ON_MAX_RETRIES,
+  });
+
   if (queuedCount > 0) {
     logger.info('[scheduler] 已入队分发任务', { count: queuedCount });
   }
+
+  return {
+    queuedCount,
+    autoBypassCount: gateStats.autoBypassCount,
+    blockedCount: gateStats.blockedCount,
+  };
 }
 
 export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
@@ -493,42 +690,50 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
       throw new Error(`未找到任务定义: ${taskDefinitionId}`);
     }
 
-    const unscheduledAssets = await prisma.mediaAsset.findMany({
-      where: {
-        status: MediaStatus.relay_uploaded,
-        telegramFileId: { not: null },
-        dispatchTasks: {
-          none: {},
-        },
-      },
-      select: {
-        id: true,
-        channelId: true,
-      },
-      take: 200,
-    });
+    const unscheduledAssets = await withPrismaRetry(
+      () =>
+        prisma.mediaAsset.findMany({
+          where: {
+            status: MediaStatus.relay_uploaded,
+            telegramFileId: { not: null },
+            dispatchTasks: {
+              none: {},
+            },
+          },
+          select: {
+            id: true,
+            channelId: true,
+          },
+          take: 200,
+        }),
+      { label: 'dispatch.scheduleDispatchForDefinition.findUnscheduledAssets' },
+    );
 
     let createdCount = 0;
     const now = new Date();
 
     for (const asset of unscheduledAssets) {
-      await prisma.dispatchTask.create({
-        data: {
-          channelId: asset.channelId,
-          mediaAssetId: asset.id,
-          status: TaskStatus.pending,
-          scheduleSlot: now,
-          plannedAt: now,
-          nextRunAt: now,
-          priority: definition.priority ?? 100,
-        },
-        select: { id: true },
-      });
+      await withPrismaRetry(
+        () =>
+          prisma.dispatchTask.create({
+            data: {
+              channelId: asset.channelId,
+              mediaAssetId: asset.id,
+              status: TaskStatus.pending,
+              scheduleSlot: now,
+              plannedAt: now,
+              nextRunAt: now,
+              priority: definition.priority ?? 100,
+            },
+            select: { id: true },
+          }),
+        { label: 'dispatch.scheduleDispatchForDefinition.createDispatchTask' },
+      );
 
       createdCount += 1;
     }
 
-    await scheduleDueDispatchTasks();
+    const tickSummary = await scheduleDueDispatchTasks();
 
     await updateTaskDefinitionRunStatus({
       taskDefinitionId,
@@ -536,6 +741,12 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
       summary: {
         executor: 'dispatch_send',
         createdTasks: createdCount,
+        queuedCount: tickSummary.queuedCount,
+        autoBypassCount: tickSummary.autoBypassCount,
+        blockedCount: tickSummary.blockedCount,
+        collectionAutoBypassEnabled: COLLECTION_AUTO_BYPASS_ENABLED,
+        collectionAutoBypassAfterMinutes: COLLECTION_AUTO_BYPASS_AFTER_MINUTES,
+        collectionAutoBypassOnMaxRetries: COLLECTION_AUTO_BYPASS_ON_MAX_RETRIES,
         message: '自动扫描并入队分发任务',
       },
     });

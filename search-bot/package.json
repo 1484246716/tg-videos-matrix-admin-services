@@ -6,6 +6,8 @@
     "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
+    "smoke:webhook": "ts-node --transpile-only scripts/smoke-webhook.ts",
+    "set:webhook": "ts-node --transpile-only scripts/set-webhook.ts",
     "lint": "echo \"lint placeholder\"",
     "format": "echo \"format placeholder\""
   },
@@ -19,6 +21,7 @@
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/node": "^24.3.1",
+    "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.6.3"
   }

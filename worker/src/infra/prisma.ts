@@ -4,6 +4,50 @@ import { logger } from '../logger';
 
 export const prisma = new PrismaClient();
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function isPrismaRetryableConnectionError(error: unknown) {
+  if (!error || typeof error !== 'object') return false;
+  const maybe = error as { code?: string; message?: string; name?: string };
+  const code = maybe.code ?? '';
+  const message = maybe.message ?? '';
+  return code === 'P1017' || /Server has closed the connection/i.test(message);
+}
+
+export async function withPrismaRetry<T>(
+  action: () => Promise<T>,
+  options?: { maxAttempts?: number; baseDelayMs?: number; label?: string },
+): Promise<T> {
+  const maxAttempts = Math.max(1, Math.floor(options?.maxAttempts ?? 3));
+  const baseDelayMs = Math.max(100, Math.floor(options?.baseDelayMs ?? 1000));
+
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await action();
+    } catch (error) {
+      lastError = error;
+      if (!isPrismaRetryableConnectionError(error) || attempt >= maxAttempts) {
+        throw error;
+      }
+
+      const delayMs = Math.min(4000, baseDelayMs * 2 ** (attempt - 1));
+      logger.warn('[prisma_retry] 命中可重试数据库连接错误，准备重试', {
+        label: options?.label ?? null,
+        attempt,
+        maxAttempts,
+        delayMs,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('未知 Prisma 重试错误');
+}
+
 function assertModelAvailable(model: unknown, modelName: string) {
   if (!model) {
     throw new Error(

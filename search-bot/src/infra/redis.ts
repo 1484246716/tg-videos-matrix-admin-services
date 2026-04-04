@@ -7,11 +7,15 @@ export const redis = new Redis(env.REDIS_URL, {
   enableReadyCheck: true,
 });
 
+async function ensureRedisReady() {
+  if (redis.status !== 'ready') {
+    await redis.connect();
+  }
+}
+
 export async function checkRedisHealth() {
   try {
-    if (redis.status !== 'ready') {
-      await redis.connect();
-    }
+    await ensureRedisReady();
     const pong = await redis.ping();
     return pong === 'PONG';
   } catch {
@@ -20,7 +24,20 @@ export async function checkRedisHealth() {
 }
 
 export async function markUpdateIdempotent(updateId: number): Promise<boolean> {
+  await ensureRedisReady();
   const key = `sb:idem:update:${updateId}`;
   const result = await redis.set(key, '1', 'EX', 120, 'NX');
   return result === 'OK';
+}
+
+export async function setJsonWithTtl(key: string, value: unknown, ttlSec: number): Promise<void> {
+  await ensureRedisReady();
+  await redis.set(key, JSON.stringify(value), 'EX', ttlSec);
+}
+
+export async function getJson<T>(key: string): Promise<T | null> {
+  await ensureRedisReady();
+  const raw = await redis.get(key);
+  if (!raw) return null;
+  return JSON.parse(raw) as T;
 }

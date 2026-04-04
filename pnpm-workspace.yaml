@@ -1,6 +1,7 @@
 packages:
   - api
   - worker
+  - search-bot
 
 ignoredBuiltDependencies:
   - '@nestjs/core'
