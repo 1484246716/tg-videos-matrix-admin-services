@@ -4,14 +4,17 @@
   "private": true,
   "workspaces": [
     "api",
-    "worker"
+    "worker",
+    "search-bot"
   ],
   "scripts": {
     "dev:api": "npm run start:dev -w @tg-crm/api",
     "dev:worker": "npm run dev -w @tg-crm/worker",
+    "dev:search-bot": "npm run dev -w @tg-crm/search-bot",
     "build": "npm run build -ws",
     "build:api": "npm run build -w @tg-crm/api",
     "build:worker": "npm run build -w @tg-crm/worker",
+    "build:search-bot": "npm run build -w @tg-crm/search-bot",
     "prisma:generate": "npm run prisma:generate -w @tg-crm/api"
   }
 }
