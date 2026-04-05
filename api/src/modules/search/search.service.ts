@@ -175,13 +175,13 @@ export class SearchService {
     return Math.min(max, Math.max(min, Math.trunc(value)));
   }
 
-  private async attachChannelTgChatId<T extends { channelId?: string | number }>(rows: T[]) {
+  private async attachChannelTgChatId<T extends Record<string, unknown>>(rows: T[]) {
     if (!rows.length) return rows;
 
     const channelIds = Array.from(
       new Set(
         rows
-          .map((row) => row.channelId)
+          .map((row) => row.channelId ?? row.channel_id)
           .filter((id): id is string | number => id !== undefined && id !== null)
           .map((id) => String(id)),
       ),
@@ -196,10 +196,13 @@ export class SearchService {
 
     const tgChatIdByChannelId = new Map(channels.map((c) => [c.id.toString(), c.tgChatId]));
 
-    return rows.map((row) => ({
-      ...row,
-      channelTgChatId: row.channelId ? tgChatIdByChannelId.get(String(row.channelId)) ?? null : null,
-    }));
+    return rows.map((row) => {
+      const channelId = row.channelId ?? row.channel_id;
+      return {
+        ...row,
+        channelTgChatId: channelId ? tgChatIdByChannelId.get(String(channelId)) ?? null : null,
+      };
+    });
   }
 
   async resolveChannelIdsByTgChatIds(tgChatIds: string[]): Promise<string[]> {

@@ -7,10 +7,30 @@ export const redis = new Redis(env.REDIS_URL, {
   enableReadyCheck: true,
 });
 
+let connectingPromise: Promise<void> | null = null;
+
 async function ensureRedisReady() {
-  if (redis.status !== 'ready') {
-    await redis.connect();
+  if (redis.status === 'ready') return;
+
+  if (redis.status === 'connecting' && connectingPromise) {
+    await connectingPromise;
+    return;
   }
+
+  if (redis.status === 'end' || redis.status === 'wait' || redis.status === 'close' || redis.status === 'reconnecting') {
+    connectingPromise = redis.connect().then(() => undefined).finally(() => {
+      connectingPromise = null;
+    });
+    await connectingPromise;
+    return;
+  }
+
+  if (!connectingPromise) {
+    connectingPromise = redis.connect().then(() => undefined).finally(() => {
+      connectingPromise = null;
+    });
+  }
+  await connectingPromise;
 }
 
 export async function checkRedisHealth() {
