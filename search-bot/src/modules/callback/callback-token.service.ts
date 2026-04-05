@@ -8,6 +8,12 @@ export interface CallbackState {
   requesterId: string;
   page: number;
   pageSize: number;
+  mode?: 'page' | 'detail' | 'copy';
+  item?: Record<string, unknown>;
+  fromChatId?: string;
+  messageId?: number;
+  targetChatId?: string;
+  docId?: string;
 }
 
 function buildKey(token: string) {

@@ -27,7 +27,7 @@ function fallbackResponse(): SearchQueryResponse {
     results: [],
     total: 0,
     hasMore: false,
-    route: 'db',
+    route: 'search-engine',
   };
 }
 
@@ -60,7 +60,7 @@ export async function searchWithCache(args: SearchArgs): Promise<SearchQueryResp
       channelIds: [args.channelId],
       limit: args.limit,
       offset: args.offset,
-      fallbackToDb: true,
+      fallbackToDb: false,
     });
 
     logger.info('search.api_result', {

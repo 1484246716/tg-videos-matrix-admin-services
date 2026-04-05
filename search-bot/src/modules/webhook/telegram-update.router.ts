@@ -1,11 +1,13 @@
 import { parseSearchCommand } from '../command/command.parser';
-import { logger } from '../../infra/logger';
 import { renderSearchMessage } from '../render/message.renderer';
-import { renderPagerKeyboard } from '../render/keyboard.renderer';
 import { createCallbackToken } from '../callback/callback-token.service';
 import { handleCallbackQuery } from '../callback/callback-handler';
 import { allowChannelRequest, allowUserRequest } from '../security/rate-limit.service';
 import { searchWithCache } from '../search/search.orchestrator';
+import { logger } from '../../infra/logger';
+import { renderResultKeyboard } from '../render/keyboard.renderer';
+import { buildDeepLink, createDeepLinkToken } from '../deeplink/deeplink.service';
+import { handleStartCommand } from '../start/start-handler';
 
 export interface TelegramMessage {
   message_id?: number;
@@ -32,6 +34,17 @@ export interface TelegramUpdate {
 
 export async function routeTelegramUpdate(update: TelegramUpdate) {
   if (update.message) {
+    const text = update.message.text || '';
+    if (text.startsWith('/start')) {
+      const chatId = update.message.chat?.id;
+      if (typeof chatId === 'number') {
+        return handleStartCommand({
+          chatId,
+          fromId: update.message.from?.id,
+          text,
+        });
+      }
+    }
     return handleTextMessage(update.message, 'message');
   }
 
@@ -75,7 +88,6 @@ async function handleTextMessage(message: TelegramMessage, routed: 'message' | '
     return { routed, ok: false, action: 'invalid_context' };
   }
 
-  // 频道帖子可能没有 from，使用通配符允许 callback 由任意点击者翻页
   const requesterIdRaw = message.from?.id;
   const requesterId = typeof requesterIdRaw === 'number' ? String(requesterIdRaw) : '*';
 
@@ -123,15 +135,72 @@ async function handleTextMessage(message: TelegramMessage, routed: 'message' | '
         requesterId,
         page: page + 1,
         pageSize,
+        mode: 'page',
       })
     : null;
+
+  const renderItems: Array<{ title?: string; year?: number | null; actors?: string[]; deepLink?: string }> = [];
+  const copyButtons: Array<{ text: string; token: string }> = [];
+
+  for (let index = 0; index < Math.min(result.results.length, pageSize); index += 1) {
+    const item = result.results[index] as Record<string, unknown>;
+    const fromChatId = String(item.channelTgChatId ?? item.channel_tg_chat_id ?? '');
+    const messageIdRaw = item.telegramMessageId ?? item.telegram_message_id ?? 0;
+    const messageId = Number(messageIdRaw);
+
+    if (fromChatId && Number.isFinite(messageId) && messageId > 0) {
+      const shortToken = await createDeepLinkToken({
+        fromChatId,
+        messageId,
+        targetChatId: channelId,
+        requesterId: requesterId === '*' ? undefined : requesterId,
+        title: String(item.title ?? ''),
+        telegramMessageLink: String(item.telegramMessageLink ?? ''),
+      });
+
+      renderItems.push({
+        title: String(item.title ?? ''),
+        year: typeof item.year === 'number' ? item.year : null,
+        actors: Array.isArray(item.actors) ? (item.actors as string[]) : [],
+        deepLink: buildDeepLink(shortToken),
+      });
+
+      const copyToken = await createCallbackToken({
+        keyword: parsed.keyword,
+        channelId,
+        requesterId,
+        page,
+        pageSize,
+        mode: 'copy',
+        docId: String(item.docId ?? ''),
+        fromChatId,
+        messageId,
+        targetChatId: channelId,
+        item: {
+          title: item.title,
+          telegramMessageLink: item.telegramMessageLink,
+        },
+      });
+
+      copyButtons.push({
+        text: `发送 ${String(index + 1).padStart(2, '0')}`,
+        token: copyToken,
+      });
+    } else {
+      renderItems.push({
+        title: String(item.title ?? ''),
+        year: typeof item.year === 'number' ? item.year : null,
+        actors: Array.isArray(item.actors) ? (item.actors as string[]) : [],
+      });
+    }
+  }
 
   const text = renderSearchMessage({
     keyword: parsed.keyword,
     page,
     pageSize,
     total: result.total,
-    items: result.results,
+    items: renderItems,
   });
 
   return {
@@ -141,7 +210,12 @@ async function handleTextMessage(message: TelegramMessage, routed: 'message' | '
     send: {
       chatId,
       text,
-      replyMarkup: renderPagerKeyboard({ prevToken: null, nextToken }),
+      parseMode: 'HTML',
+      replyMarkup: renderResultKeyboard({
+        copyButtons,
+        prevToken: null,
+        nextToken,
+      }),
       degraded: result.total === 0,
     },
   };

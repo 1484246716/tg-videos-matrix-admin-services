@@ -10,3 +10,4 @@ apps/api/prisma/migrations
 
 # Ignore local data directory
 data/
+apps/data/

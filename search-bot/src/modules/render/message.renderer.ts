@@ -2,8 +2,7 @@ export interface RenderItem {
   title?: string;
   year?: number | null;
   actors?: string[];
-  telegram_message_link?: string | null;
-  telegramMessageLink?: string | null;
+  deepLink?: string;
 }
 
 export function renderSearchMessage(args: {
@@ -16,8 +15,8 @@ export function renderSearchMessage(args: {
   const totalPages = Math.max(1, Math.ceil(args.total / args.pageSize));
   const lines: string[] = [];
 
-  lines.push(`搜索关键词：${args.keyword}`);
-  lines.push(`第 ${args.page}/${totalPages} 页，共 ${args.total} 条`);
+  lines.push(`<b>搜索关键词：</b>${escapeHtml(args.keyword)}`);
+  lines.push(`<b>第 ${args.page}/${totalPages} 页，共 ${args.total} 条</b>`);
   lines.push('');
 
   if (args.items.length === 0) {
@@ -27,14 +26,26 @@ export function renderSearchMessage(args: {
 
   args.items.forEach((item, idx) => {
     const no = (args.page - 1) * args.pageSize + idx + 1;
-    const title = item.title || '未命名资源';
+    const title = escapeHtml(item.title || '未命名资源');
     const year = item.year ? ` (${item.year})` : '';
-    const actors = item.actors?.length ? `｜主演：${item.actors.slice(0, 3).join(' / ')}` : '';
-    const link = item.telegramMessageLink || item.telegram_message_link;
+    const actors = item.actors?.length ? `｜主演：${escapeHtml(item.actors.slice(0, 3).join(' / '))}` : '';
+    const prefix = `${String(no).padStart(2, '0')}. `;
 
-    lines.push(`${no}. ${title}${year}${actors}`);
-    if (link) lines.push(`   链接：${link}`);
+    if (item.deepLink) {
+      lines.push(`${prefix}<a href="${escapeHtml(item.deepLink)}">${title}${year}</a>${actors}`);
+    } else {
+      lines.push(`${prefix}${title}${year}${actors}`);
+    }
   });
 
   return lines.join('\n');
+}
+
+function escapeHtml(input: string): string {
+  return input
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }

@@ -36,7 +36,7 @@ export async function querySearch(payload: SearchQueryRequest): Promise<SearchQu
       logger.info('search.api_request', {
         attempt: attempts,
         baseURL: env.API_BASE_URL,
-        endpoint: '/api/search',
+        endpoint: '/api/search/internal',
         keyword: payload.keyword,
         channelIds: payload.channelIds,
         limit: payload.limit,

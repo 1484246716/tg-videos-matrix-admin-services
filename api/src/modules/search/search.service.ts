@@ -29,28 +29,31 @@ export class SearchService {
       return { results: [], total: 0, hasMore: false, route: 'db' as const };
     }
 
-    if (!fallbackToDb) {
+    const trimmed = keyword.trim();
+    const effectiveChannelIds = await this.resolveAllowedChannelIds({ channelIds, userId, role });
+
+    try {
       const openSearchResult = await this.searchIndexerService.searchViaReadAlias({
-        keyword: keyword.trim(),
-        channelIds: await this.resolveAllowedChannelIds({ channelIds, userId, role }),
+        keyword: trimmed,
+        channelIds: effectiveChannelIds,
         limit,
         offset,
       });
 
       if (openSearchResult.enabled) {
+        const enrichedResults = await this.attachChannelTgChatId(openSearchResult.results);
         return {
-          results: openSearchResult.results,
+          results: enrichedResults,
           total: openSearchResult.total,
           hasMore: offset + openSearchResult.results.length < openSearchResult.total,
           route: 'search-engine' as const,
         };
       }
-
-      return { results: [], total: 0, hasMore: false, route: 'search-engine' as const };
+    } catch {
+      if (!fallbackToDb) {
+        return { results: [], total: 0, hasMore: false, route: 'search-engine' as const };
+      }
     }
-
-    const trimmed = keyword.trim();
-    const effectiveChannelIds = await this.resolveAllowedChannelIds({ channelIds, userId, role });
 
     if (effectiveChannelIds.length === 0) {
       return { results: [], total: 0, hasMore: false, route: 'db' as const };
@@ -61,6 +64,7 @@ export class SearchService {
     const whereSql = Prisma.sql`
       is_active = true
       AND is_deleted = false
+      AND doc_type <> 'collection'
       AND channel_id = ANY(${effectiveChannelIds}::bigint[])
       AND (
         search_tsv @@ plainto_tsquery('simple', ${trimmed})
@@ -117,8 +121,10 @@ export class SearchService {
 
     const total = Number(countRows[0]?.count ?? 0);
 
+    const enrichedRows = await this.attachChannelTgChatId(rows);
+
     return {
-      results: rows,
+      results: enrichedRows,
       total,
       hasMore: offset + rows.length < total,
       route: 'db' as const,
@@ -167,6 +173,33 @@ export class SearchService {
   private sanitizeNumber(value: number | undefined, fallback: number, min: number, max: number) {
     if (typeof value !== 'number' || Number.isNaN(value)) return fallback;
     return Math.min(max, Math.max(min, Math.trunc(value)));
+  }
+
+  private async attachChannelTgChatId<T extends { channelId?: string | number }>(rows: T[]) {
+    if (!rows.length) return rows;
+
+    const channelIds = Array.from(
+      new Set(
+        rows
+          .map((row) => row.channelId)
+          .filter((id): id is string | number => id !== undefined && id !== null)
+          .map((id) => String(id)),
+      ),
+    );
+
+    if (!channelIds.length) return rows;
+
+    const channels = await this.prisma.channel.findMany({
+      where: { id: { in: channelIds.map((id) => BigInt(id)) } },
+      select: { id: true, tgChatId: true },
+    });
+
+    const tgChatIdByChannelId = new Map(channels.map((c) => [c.id.toString(), c.tgChatId]));
+
+    return rows.map((row) => ({
+      ...row,
+      channelTgChatId: row.channelId ? tgChatIdByChannelId.get(String(row.channelId)) ?? null : null,
+    }));
   }
 
   async resolveChannelIdsByTgChatIds(tgChatIds: string[]): Promise<string[]> {

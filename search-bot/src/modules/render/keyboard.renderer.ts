@@ -1,27 +1,36 @@
-export interface InlineKeyboardButton {
+export interface TelegramInlineKeyboardButton {
   text: string;
   callback_data: string;
 }
 
-export interface InlineKeyboardMarkup {
-  inline_keyboard: InlineKeyboardButton[][];
+export interface TelegramInlineKeyboardMarkup {
+  inline_keyboard: TelegramInlineKeyboardButton[][];
 }
 
-export function renderPagerKeyboard(args: {
+export interface CopyActionButton {
+  text: string;
+  token: string;
+}
+
+export function renderResultKeyboard(args: {
+  copyButtons?: CopyActionButton[];
   prevToken?: string | null;
   nextToken?: string | null;
-}): InlineKeyboardMarkup {
-  const row: InlineKeyboardButton[] = [];
+}): TelegramInlineKeyboardMarkup | undefined {
+  const rows: TelegramInlineKeyboardButton[][] = [];
 
-  if (args.prevToken) {
-    row.push({ text: '上一页', callback_data: `sp:${args.prevToken}` });
+  const copyButtons = args.copyButtons || [];
+
+  for (const btn of copyButtons) {
+    if (!btn.token) continue;
+    rows.push([{ text: btn.text, callback_data: `sc:${btn.token}` }]);
   }
 
-  if (args.nextToken) {
-    row.push({ text: '下一页', callback_data: `sp:${args.nextToken}` });
-  }
+  const pager: TelegramInlineKeyboardButton[] = [];
+  if (args.prevToken) pager.push({ text: '上一页', callback_data: `sp:${args.prevToken}` });
+  if (args.nextToken) pager.push({ text: '下一页', callback_data: `sp:${args.nextToken}` });
+  if (pager.length > 0) rows.push(pager);
 
-  return {
-    inline_keyboard: row.length > 0 ? [row] : [],
-  };
+  if (rows.length === 0) return undefined;
+  return { inline_keyboard: rows };
 }

@@ -35,6 +35,12 @@ export async function setJsonWithTtl(key: string, value: unknown, ttlSec: number
   await redis.set(key, JSON.stringify(value), 'EX', ttlSec);
 }
 
+export async function setIfAbsent(key: string, value: string, ttlSec: number): Promise<boolean> {
+  await ensureRedisReady();
+  const result = await redis.set(key, value, 'EX', ttlSec, 'NX');
+  return result === 'OK';
+}
+
 export async function getJson<T>(key: string): Promise<T | null> {
   await ensureRedisReady();
   const raw = await redis.get(key);
