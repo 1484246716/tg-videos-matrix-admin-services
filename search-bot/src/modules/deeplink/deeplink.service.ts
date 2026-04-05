@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { env } from '../../config/env';
 import { getJson, setIfAbsent, setJsonWithTtl } from '../../infra/redis';
+import { logger } from '../../infra/logger';
 
 interface DeepLinkState {
   v: 1;
@@ -62,16 +63,38 @@ export async function createDeepLinkToken(args: {
   };
 
   await setJsonWithTtl(`sb:dl:${shortToken}`, fullState, env.SEARCH_BOT_DEEPLINK_TTL_SEC);
+
+  logger.info('深链令牌已创建', {
+    shortToken,
+    fromChatId: args.fromChatId,
+    messageId: args.messageId,
+    targetChatId: args.targetChatId,
+    ttlSec: env.SEARCH_BOT_DEEPLINK_TTL_SEC,
+    requesterBound: Boolean(args.requesterId),
+  });
+
   return shortToken;
 }
 
 export function buildDeepLink(shortToken: string): string {
-  return `https://t.me/${env.SEARCH_BOT_BOT_USERNAME}?start=cp_${shortToken}`;
+  const link = `https://t.me/${env.SEARCH_BOT_BOT_USERNAME}?start=cp_${shortToken}`;
+  logger.info('深链地址已生成', {
+    shortToken,
+    botUsername: env.SEARCH_BOT_BOT_USERNAME,
+    link,
+  });
+  return link;
 }
 
-export async function verifyDeepLinkToken(shortToken: string, requesterId?: string) {
+export async function verifyDeepLinkToken(
+  shortToken: string,
+  requesterId?: string,
+  options?: { consumeNonce?: boolean },
+) {
+  const consumeNonce = options?.consumeNonce ?? true;
   const state = await getJson<DeepLinkState>(`sb:dl:${shortToken}`);
   if (!state) {
+    logger.warn('深链校验失败', { shortToken, reason: 'expired_or_missing' });
     return { ok: false as const, reason: 'expired' as const };
   }
 
@@ -90,21 +113,34 @@ export async function verifyDeepLinkToken(shortToken: string, requesterId?: stri
   );
 
   if (rawSig !== state.sig) {
+    logger.warn('深链校验失败', { shortToken, reason: 'tampered' });
     return { ok: false as const, reason: 'tampered' as const };
   }
 
   if (Math.floor(Date.now() / 1000) > state.exp) {
+    logger.warn('深链校验失败', { shortToken, reason: 'expired', exp: state.exp });
     return { ok: false as const, reason: 'expired' as const };
   }
 
   if (state.requesterId && requesterId && state.requesterId !== requesterId) {
+    logger.warn('深链校验失败', { shortToken, reason: 'forbidden', requesterId });
     return { ok: false as const, reason: 'forbidden' as const };
   }
 
-  const nonceFirstSeen = await setIfAbsent(`sb:dl:nonce:${state.nonce}`, '1', env.SEARCH_BOT_DEEPLINK_TTL_SEC);
-  if (!nonceFirstSeen) {
-    return { ok: false as const, reason: 'replayed' as const };
+  if (consumeNonce) {
+    const nonceFirstSeen = await setIfAbsent(`sb:dl:nonce:${state.nonce}`, '1', env.SEARCH_BOT_DEEPLINK_TTL_SEC);
+    if (!nonceFirstSeen) {
+      logger.warn('深链校验失败', { shortToken, reason: 'replayed', nonce: state.nonce });
+      return { ok: false as const, reason: 'replayed' as const };
+    }
   }
+
+  logger.info('深链校验通过', {
+    shortToken,
+    fromChatId: state.fromChatId,
+    targetChatId: state.targetChatId,
+    consumeNonce,
+  });
 
   return {
     ok: true as const,

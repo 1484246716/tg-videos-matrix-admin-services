@@ -5,16 +5,20 @@
   "workspaces": [
     "api",
     "worker",
-    "search-bot"
+    "search-bot",
+    "mtproto-executor"
   ],
   "scripts": {
     "dev:api": "npm run start:dev -w @tg-crm/api",
     "dev:worker": "npm run dev -w @tg-crm/worker",
     "dev:search-bot": "pnpm --filter @tg-crm/search-bot dev",
+    "dev:mtproto-executor": "pnpm --filter @tg-crm/mtproto-executor dev",
+    "dev:mtproto-executor": "pnpm --filter @tg-crm/mtproto-executor dev",
     "build": "npm run build -ws",
     "build:api": "npm run build -w @tg-crm/api",
     "build:worker": "npm run build -w @tg-crm/worker",
     "build:search-bot": "npm run build -w @tg-crm/search-bot",
+    "build:mtproto-executor": "npm run build -w @tg-crm/mtproto-executor",
     "prisma:generate": "npm run prisma:generate -w @tg-crm/api"
   }
 }

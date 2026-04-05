@@ -42,6 +42,7 @@ export async function routeTelegramUpdate(update: TelegramUpdate) {
           chatId,
           fromId: update.message.from?.id,
           text,
+          routed: 'message',
         });
       }
     }
@@ -49,6 +50,19 @@ export async function routeTelegramUpdate(update: TelegramUpdate) {
   }
 
   if (update.channel_post) {
+    const text = update.channel_post.text || '';
+    if (text.startsWith('/start')) {
+      const chatId = update.channel_post.chat?.id;
+      if (typeof chatId === 'number') {
+        return handleStartCommand({
+          chatId,
+          fromId: update.channel_post.from?.id,
+          text,
+          routed: 'channel_post',
+        });
+      }
+    }
+
     return handleTextMessage(update.channel_post, 'channel_post');
   }
 
