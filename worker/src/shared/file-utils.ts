@@ -318,6 +318,33 @@ export async function hashFile(filePath: string): Promise<string> {
   });
 }
 
+export function normalizeRelayPath(filePath: string): string {
+  let normalized = filePath.trim().replace(/\\/g, '/');
+  normalized = normalized.replace(/\/+/g, '/');
+
+  if (process.platform === 'win32') {
+    normalized = normalized.toLowerCase();
+  }
+
+  if (normalized.length > 1) {
+    normalized = normalized.replace(/\/+$/, '');
+  }
+
+  return normalized;
+}
+
+export function buildRelayPathFingerprint(channelId: bigint, filePath: string): {
+  pathNormalized: string;
+  pathFingerprint: string;
+} {
+  const pathNormalized = normalizeRelayPath(filePath);
+  const pathFingerprint = createHash('sha256')
+    .update(`${channelId.toString()}|${pathNormalized}`)
+    .digest('hex');
+
+  return { pathNormalized, pathFingerprint };
+}
+
 export async function scanChannelVideos(folderPath: string) {
   const rawRoot = (process.env.CHANNELS_ROOT_DIR || './data/channels').trim();
 

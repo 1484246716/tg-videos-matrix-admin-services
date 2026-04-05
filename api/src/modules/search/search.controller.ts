@@ -3,6 +3,7 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PermissionsGuard } from '../auth/permissions.guard';
 import { Permissions } from '../auth/permissions.decorator';
 import { SearchService } from './search.service';
+import { InternalTokenGuard } from './internal-token.guard';
 
 interface AuthRequest {
   user: { userId: string; username: string; role: string; permissions?: string[] };
@@ -42,6 +43,33 @@ export class SearchController {
       fallbackToDb: fallbackToDbRaw ? fallbackToDbRaw !== 'false' : true,
       userId: req?.user.userId,
       role: req?.user.role,
+    });
+  }
+
+  /**
+   * GET /api/search/internal?keyword=xxx&channelTgChatId=-100xxx&limit=20&offset=0&fallbackToDb=true
+   * 机器人内部搜索接口（X-Internal-Token 鉴权）
+   */
+  @UseGuards(InternalTokenGuard)
+  @Get('internal')
+  async internalSearch(
+    @Query('keyword') keyword: string,
+    @Query('channelTgChatId') channelTgChatId?: string,
+    @Query('limit') limitRaw?: string,
+    @Query('offset') offsetRaw?: string,
+    @Query('fallbackToDb') fallbackToDbRaw?: string,
+  ) {
+    const resolvedChannelIds = channelTgChatId
+      ? await this.searchService.resolveChannelIdsByTgChatIds([channelTgChatId])
+      : undefined;
+
+    return this.searchService.search({
+      keyword,
+      channelIds: resolvedChannelIds,
+      limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
+      offset: offsetRaw ? Number.parseInt(offsetRaw, 10) : undefined,
+      fallbackToDb: fallbackToDbRaw ? fallbackToDbRaw !== 'false' : true,
+      role: 'admin',
     });
   }
 

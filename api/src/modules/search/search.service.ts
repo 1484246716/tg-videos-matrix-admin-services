@@ -169,6 +169,21 @@ export class SearchService {
     return Math.min(max, Math.max(min, Math.trunc(value)));
   }
 
+  async resolveChannelIdsByTgChatIds(tgChatIds: string[]): Promise<string[]> {
+    const normalized = tgChatIds.map((id) => id.trim()).filter(Boolean);
+    if (normalized.length === 0) return [];
+
+    const channels = await this.prisma.channel.findMany({
+      where: {
+        tgChatId: { in: normalized },
+        status: 'active',
+      },
+      select: { id: true },
+    });
+
+    return channels.map((c) => c.id.toString());
+  }
+
   private async resolveAllowedChannelIds(args: {
     channelIds?: string[];
     userId?: string;

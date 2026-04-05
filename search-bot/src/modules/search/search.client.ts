@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { env } from '../../config/env';
+import { logger } from '../../infra/logger';
 
 export interface SearchQueryRequest {
   keyword: string;
@@ -32,10 +33,40 @@ export async function querySearch(payload: SearchQueryRequest): Promise<SearchQu
   while (attempts < 2) {
     attempts += 1;
     try {
-      const response = await http.post<SearchQueryResponse>('/api/search/query', payload);
+      logger.info('search.api_request', {
+        attempt: attempts,
+        baseURL: env.API_BASE_URL,
+        endpoint: '/api/search',
+        keyword: payload.keyword,
+        channelIds: payload.channelIds,
+        limit: payload.limit,
+        offset: payload.offset,
+      });
+
+      const response = await http.get<SearchQueryResponse>('/api/search/internal', {
+        params: {
+          keyword: payload.keyword,
+          channelTgChatId: payload.channelIds[0],
+          limit: payload.limit,
+          offset: payload.offset,
+          fallbackToDb: payload.fallbackToDb,
+        },
+      });
+
+      logger.info('search.api_response', {
+        attempt: attempts,
+        status: response.status,
+        total: response.data?.total,
+        hasMore: response.data?.hasMore,
+      });
+
       return response.data;
     } catch (error) {
       lastError = error;
+      logger.error('search.api_error', {
+        attempt: attempts,
+        error: error instanceof Error ? error.message : String(error),
+      });
       if (attempts >= 2) break;
       await wait(80 * attempts);
     }

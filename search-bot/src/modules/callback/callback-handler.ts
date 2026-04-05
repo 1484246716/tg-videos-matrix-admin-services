@@ -31,13 +31,16 @@ export async function handleCallbackQuery(callback: TelegramCallbackQuery) {
   }
 
   const requesterId = String(callback.from?.id ?? '');
-  if (!requesterId || requesterId !== state.requesterId) {
+  const allowAnyRequester = state.requesterId === '*';
+  if (!allowAnyRequester && (!requesterId || requesterId !== state.requesterId)) {
     return { routed: 'callback_query', ok: true, action: 'forbidden' };
   }
 
-  const allowedByUser = await allowUserRequest(requesterId);
-  if (!allowedByUser) {
-    return { routed: 'callback_query', ok: true, action: 'rate_limited_user' };
+  if (!allowAnyRequester) {
+    const allowedByUser = await allowUserRequest(requesterId);
+    if (!allowedByUser) {
+      return { routed: 'callback_query', ok: true, action: 'rate_limited_user' };
+    }
   }
 
   const allowedByChannel = await allowChannelRequest(state.channelId);

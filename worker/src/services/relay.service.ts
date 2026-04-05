@@ -4,7 +4,12 @@ import { MediaStatus } from '@prisma/client';
 import { TYPEA_MAX_UPLOAD_SIZE_MB } from '../config/env';
 import { prisma, getTaskDefinitionModel } from '../infra/prisma';
 import { logger } from '../logger';
-import { hashFile, scanChannelVideos, waitForFileStable } from '../shared/file-utils';
+import {
+  buildRelayPathFingerprint,
+  hashFile,
+  scanChannelVideos,
+  waitForFileStable,
+} from '../shared/file-utils';
 import { tryAcquireRelayPathLock, releaseRelayPathLock } from '../shared/relay-path-lock';
 import { TYPEA_INGEST_ERROR_CODE, TYPEA_INGEST_FINAL_REASON } from '../shared/metrics';
 
@@ -147,24 +152,33 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
 
       try {
         const s = await stat(filePath);
+        const { pathNormalized, pathFingerprint } = buildRelayPathFingerprint(channel.id, filePath);
 
-      const existedByPath = await prisma.mediaAsset.findFirst({
-        where: {
-          localPath: filePath,
-          status: { in: [MediaStatus.ready, MediaStatus.ingesting, MediaStatus.relay_uploaded] },
-        },
-        select: { id: true, status: true },
-      });
-
-      if (existedByPath) {
-        logger.info('[relay] 扫描跳过：localPath 已存在活跃记录', {
-          filePath,
-          existedMediaAssetId: existedByPath.id.toString(),
-          existedStatus: existedByPath.status,
-          reason: 'path_dedup_skip',
+        const existedByPathFingerprint = await prisma.mediaAsset.findFirst({
+          where: {
+            channelId: channel.id,
+            pathFingerprint,
+          },
+          select: {
+            id: true,
+            status: true,
+            sourceMeta: true,
+            telegramFileId: true,
+            relayMessageId: true,
+          },
         });
-        continue;
-      }
+
+        if (existedByPathFingerprint) {
+          logger.info('[中转] 路径指纹命中去重，复用已有资产', {
+            频道ID: channel.id.toString(),
+            文件路径: filePath,
+            归一化路径: pathNormalized,
+            路径指纹: pathFingerprint,
+            资产ID: existedByPathFingerprint.id.toString(),
+            处理动作: '命中去重',
+            结果: '复用已有资产',
+          });
+        }
 
       if (s.size > maxUploadSizeBytes) {
         const ingestError = `FILE_TOO_LARGE: file size ${s.size} exceeds ${maxUploadSizeBytes} bytes (${TYPEA_MAX_UPLOAD_SIZE_MB}MB policy)`;
@@ -209,6 +223,8 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
               channelId: channel.id,
               originalName: basename(filePath),
               localPath: filePath,
+              pathNormalized,
+              pathFingerprint,
               fileSize: BigInt(s.size),
               fileHash,
               status: MediaStatus.failed,
@@ -375,12 +391,10 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
         });
       }
 
-      let asset = await prisma.mediaAsset.findUnique({
+      let asset = await prisma.mediaAsset.findFirst({
         where: {
-          fileHash_fileSize: {
-            fileHash,
-            fileSize: s.size,
-          },
+          channelId: channel.id,
+          pathFingerprint,
         },
         select: {
           id: true,
@@ -392,22 +406,11 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
       });
 
       if (!asset) {
-        asset = await prisma.mediaAsset.create({
-          data: {
-            channelId: channel.id,
-            originalName: basename(filePath),
-            localPath: filePath,
-            fileSize: BigInt(s.size),
-            fileHash,
-            status: MediaStatus.ready,
-            sourceMeta: {
-              relayChannelId: definition.relayChannelId.toString(),
-              taskDefinitionId: definition.id.toString(),
-              relayEnqueueAt: new Date().toISOString(),
-              relayPriority: definition.priority,
-              relayMaxRetries: definition.maxRetries,
-              ingestRetryCount: 0,
-              ...(collectionMeta ?? {}),
+        asset = await prisma.mediaAsset.findUnique({
+          where: {
+            fileHash_fileSize: {
+              fileHash,
+              fileSize: s.size,
             },
           },
           select: {
@@ -418,7 +421,78 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
             relayMessageId: true,
           },
         });
-        createdAssets += 1;
+      }
+
+      if (!asset) {
+        try {
+          asset = await prisma.mediaAsset.create({
+            data: {
+              channelId: channel.id,
+              originalName: basename(filePath),
+              localPath: filePath,
+              pathNormalized,
+              pathFingerprint,
+              fileSize: BigInt(s.size),
+              fileHash,
+              status: MediaStatus.ready,
+              sourceMeta: {
+                relayChannelId: definition.relayChannelId.toString(),
+                taskDefinitionId: definition.id.toString(),
+                relayEnqueueAt: new Date().toISOString(),
+                relayPriority: definition.priority,
+                relayMaxRetries: definition.maxRetries,
+                ingestRetryCount: 0,
+                ...(collectionMeta ?? {}),
+              },
+            },
+            select: {
+              id: true,
+              status: true,
+              sourceMeta: true,
+              telegramFileId: true,
+              relayMessageId: true,
+            },
+          });
+          createdAssets += 1;
+          logger.info('[中转] 路径指纹未命中，已创建资产', {
+            频道ID: channel.id.toString(),
+            文件路径: filePath,
+            归一化路径: pathNormalized,
+            路径指纹: pathFingerprint,
+            资产ID: asset.id.toString(),
+            处理动作: '新建资产',
+            结果: '成功',
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (!message.toLowerCase().includes('unique')) {
+            throw error;
+          }
+
+          logger.warn('[中转] 路径指纹唯一冲突已自动恢复', {
+            频道ID: channel.id.toString(),
+            文件路径: filePath,
+            归一化路径: pathNormalized,
+            路径指纹: pathFingerprint,
+            处理动作: '冲突恢复',
+            结果: '回退查询',
+            原因: message,
+          });
+
+          asset = await prisma.mediaAsset.findFirst({
+            where: {
+              channelId: channel.id,
+              pathFingerprint,
+            },
+            select: {
+              id: true,
+              status: true,
+              sourceMeta: true,
+              telegramFileId: true,
+              relayMessageId: true,
+            },
+          });
+        }
       }
 
       if (!asset) {

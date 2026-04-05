@@ -9,6 +9,11 @@
             "date": 1775178475798,
             "name": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\worker-2026-04-03.log",
             "hash": "d019ef0c7dca64e55f4641af5f35904708f0e35c8147812a2725f630b47aa12d"
+        },
+        {
+            "date": 1775360588353,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\worker\\logs\\worker-2026-04-05.log",
+            "hash": "c014d5edd04158c217ce731775f4d35b0277b01994ca99c7db314db956745c7b"
         }
     ],
     "hashType": "sha256"

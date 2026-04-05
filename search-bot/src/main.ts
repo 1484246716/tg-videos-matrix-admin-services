@@ -3,6 +3,7 @@ import express from 'express';
 import { env } from './config/env';
 import { checkRedisHealth, markUpdateIdempotent } from './infra/redis';
 import { routeTelegramUpdate } from './modules/webhook/telegram-update.router';
+import { answerCallbackQuery, editMessage, sendMessage } from './modules/telegram/telegram.client';
 
 dotenv.config();
 
@@ -46,7 +47,7 @@ app.post('/telegram/webhook/:secret', async (req, res) => {
     return res.status(403).json({ ok: false, message: 'forbidden' });
   }
 
-  const update = req.body as { update_id?: number; message?: unknown; callback_query?: unknown };
+  const update = req.body as { update_id?: number; callback_query?: { id?: string } };
   const updateId = update?.update_id;
 
   if (typeof updateId !== 'number') {
@@ -59,7 +60,43 @@ app.post('/telegram/webhook/:secret', async (req, res) => {
   }
 
   try {
-    const routed = await routeTelegramUpdate(update);
+    const routed = await routeTelegramUpdate(req.body);
+
+    if (routed.action === 'send_message' && routed.send) {
+      await sendMessage({
+        chatId: routed.send.chatId,
+        text: routed.send.text,
+        replyMarkup: routed.send.replyMarkup,
+      });
+    }
+
+    if (routed.action === 'edit_message' && routed.edit) {
+      await editMessage({
+        chatId: routed.edit.chatId,
+        messageId: routed.edit.messageId,
+        text: routed.edit.text,
+        replyMarkup: routed.edit.replyMarkup,
+      });
+    }
+
+    if (update.callback_query?.id) {
+      const notifyText =
+        routed.action === 'expired'
+          ? '分页已过期，请重新搜索'
+          : routed.action === 'forbidden'
+            ? '你无权操作此分页'
+            : routed.action === 'rate_limited_user'
+              ? '你操作过于频繁，请稍后再试'
+              : routed.action === 'rate_limited_channel'
+                ? '当前频道操作频繁，请稍后再试'
+                : undefined;
+
+      await answerCallbackQuery({
+        callbackQueryId: update.callback_query.id,
+        text: notifyText,
+      });
+    }
+
     return res.status(200).json({ ok: true, ...routed });
   } catch (error) {
     return res.status(500).json({
