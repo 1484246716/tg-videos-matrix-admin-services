@@ -3,7 +3,7 @@ import express from 'express';
 import { env } from './config/env';
 import { checkRedisHealth, markUpdateIdempotent } from './infra/redis';
 import { routeTelegramUpdate } from './modules/webhook/telegram-update.router';
-import { answerCallbackQuery, editMessage, sendMessage } from './modules/telegram/telegram.client';
+import { answerCallbackQuery, editMessage, sendMessage, setMyCommands } from './modules/telegram/telegram.client';
 import { logger } from './infra/logger';
 import axios from 'axios';
 
@@ -102,7 +102,28 @@ app.post('/telegram/webhook/:secret', async (req, res) => {
           axiosStatus: axios.isAxiosError(error) ? error.response?.status : undefined,
           axiosData: axios.isAxiosError(error) ? error.response?.data : undefined,
         });
-        throw error;
+
+        if (typeof routed.edit.chatId === 'number') {
+          try {
+            await sendMessage({
+              chatId: routed.edit.chatId,
+              text: routed.edit.text,
+              parseMode: routed.edit.parseMode,
+              replyMarkup: routed.edit.replyMarkup,
+            });
+          } catch (sendError) {
+            logger.error('telegram.edit_fallback_send_failed', {
+              chatId: routed.edit.chatId,
+              messageId: routed.edit.messageId,
+              error: sendError instanceof Error ? sendError.message : String(sendError),
+              axiosStatus: axios.isAxiosError(sendError) ? sendError.response?.status : undefined,
+              axiosData: axios.isAxiosError(sendError) ? sendError.response?.data : undefined,
+            });
+            throw sendError;
+          }
+        } else {
+          throw error;
+        }
       }
     }
 
@@ -158,7 +179,25 @@ app.post('/telegram/webhook/:secret', async (req, res) => {
   }
 });
 
-app.listen(env.SEARCH_BOT_PORT, () => {
+app.listen(env.SEARCH_BOT_PORT, async () => {
   // eslint-disable-next-line no-console
   console.log(`[search-bot] listening on port ${env.SEARCH_BOT_PORT}`);
+
+  try {
+    await setMyCommands({
+      commands: [
+        { command: 'start', description: '开始' },
+        { command: 'rm', description: '近期热门推荐' },
+        { command: 'tags', description: '电影类型分类' },
+      ],
+    });
+
+    logger.info('telegram.set_my_commands.ok', {
+      commands: ['start', 'rm', 'tags'],
+    });
+  } catch (error) {
+    logger.warn('telegram.set_my_commands.failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 });

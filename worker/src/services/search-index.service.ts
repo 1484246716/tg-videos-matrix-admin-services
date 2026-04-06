@@ -202,11 +202,36 @@ async function upsertSearchDocument(doc: SearchDocOutput): Promise<void> {
     indexedAt: doc.indexedAt,
   };
 
-  await prisma.searchDocument.upsert({
+  const upserted = await prisma.searchDocument.upsert({
     where: { docId: doc.docId },
     create: { docId: doc.docId, ...data },
     update: data,
+    select: { id: true, mediaAssetId: true },
   });
+
+  if (upserted.mediaAssetId) {
+    const level2Rows = await prisma.$queryRawUnsafe<Array<{ level2_id: bigint }>>(
+      `SELECT level2_id FROM media_asset_categories WHERE media_asset_id = $1`,
+      upserted.mediaAssetId,
+    );
+
+    await prisma.$executeRawUnsafe(
+      `DELETE FROM search_document_categories WHERE search_document_id = $1`,
+      upserted.id,
+    );
+
+    for (const row of level2Rows) {
+      await prisma.$executeRawUnsafe(
+        `
+        INSERT INTO search_document_categories(search_document_id, level2_id, created_at)
+        VALUES ($1, $2, now())
+        ON CONFLICT (search_document_id, level2_id) DO NOTHING
+      `,
+        upserted.id,
+        row.level2_id,
+      );
+    }
+  }
 
   // 写 outbox（用于后续同步 OpenSearch）
   await prisma.searchIndexOutbox.create({

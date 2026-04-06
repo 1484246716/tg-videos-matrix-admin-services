@@ -17,6 +17,28 @@ export interface SearchQueryResponse {
   route?: 'search-engine' | 'db';
 }
 
+export interface HotQueryResponse {
+  results: Array<Record<string, unknown>>;
+  total: number;
+  hasMore: boolean;
+  route?: 'search-engine' | 'db';
+}
+
+export interface TagItem {
+  id: string;
+  name: string;
+  level: number;
+  level1Name?: string;
+  count: number;
+}
+
+export interface TagsQueryResponse {
+  tags: TagItem[];
+  total: number;
+  hasMore: boolean;
+  route?: 'search-engine' | 'db';
+}
+
 const http = axios.create({
   baseURL: env.API_BASE_URL,
   timeout: 800,
@@ -73,6 +95,100 @@ export async function querySearch(payload: SearchQueryRequest): Promise<SearchQu
   }
 
   throw lastError;
+}
+
+export async function queryHot(payload: {
+  channelIds: string[];
+  limit?: number;
+  offset?: number;
+  period?: '3d' | '7d' | '30d';
+  fallbackToDb?: boolean;
+}): Promise<HotQueryResponse> {
+  const startedAt = Date.now();
+  const response = await http.get<HotQueryResponse>('/api/search/internal/hot', {
+    params: {
+      channelTgChatId: payload.channelIds[0],
+      limit: payload.limit,
+      offset: payload.offset,
+      period: payload.period || '7d',
+      fallbackToDb: payload.fallbackToDb,
+    },
+  });
+
+  logger.info('search.route_metric', {
+    feature: 'rm',
+    route: response.data?.route,
+    total: response.data?.total,
+    durationMs: Date.now() - startedAt,
+    channelId: payload.channelIds[0],
+  });
+
+  return response.data;
+}
+
+export async function queryTags(payload: {
+  channelIds: string[];
+  limit?: number;
+  offset?: number;
+}): Promise<TagsQueryResponse> {
+  const response = await http.get<TagsQueryResponse>('/api/search/internal/tags', {
+    params: {
+      channelTgChatId: payload.channelIds[0],
+      limit: payload.limit,
+      offset: payload.offset,
+    },
+  });
+  return response.data;
+}
+
+export async function queryLevel2Tags(payload: {
+  channelIds: string[];
+  level1Id: string;
+  limit?: number;
+  offset?: number;
+}): Promise<TagsQueryResponse> {
+  const response = await http.get<TagsQueryResponse>('/api/search/internal/tags/level2', {
+    params: {
+      channelTgChatId: payload.channelIds[0],
+      level1Id: payload.level1Id,
+      limit: payload.limit,
+      offset: payload.offset,
+    },
+  });
+  return response.data;
+}
+
+export async function queryByTag(payload: {
+  channelIds: string[];
+  tagId?: string;
+  tagName?: string;
+  limit?: number;
+  offset?: number;
+  fallbackToDb?: boolean;
+}): Promise<SearchQueryResponse> {
+  const startedAt = Date.now();
+  const response = await http.get<SearchQueryResponse>('/api/search/internal/by-tag', {
+    params: {
+      channelTgChatId: payload.channelIds[0],
+      tagId: payload.tagId,
+      tagName: payload.tagName,
+      limit: payload.limit,
+      offset: payload.offset,
+      fallbackToDb: payload.fallbackToDb,
+    },
+  });
+
+  logger.info('search.route_metric', {
+    feature: 'tags',
+    route: response.data?.route,
+    total: response.data?.total,
+    durationMs: Date.now() - startedAt,
+    channelId: payload.channelIds[0],
+    tagId: payload.tagId,
+    tagName: payload.tagName,
+  });
+
+  return response.data;
 }
 
 function wait(ms: number) {

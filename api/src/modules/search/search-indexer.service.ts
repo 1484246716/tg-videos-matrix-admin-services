@@ -189,6 +189,114 @@ export class SearchIndexerService {
     };
   }
 
+  async searchHotViaReadAlias(args: {
+    channelIds: bigint[];
+    limit: number;
+    offset: number;
+    periodDays: number;
+  }) {
+    if (!this.openSearchEnabled || !this.client) {
+      return { enabled: false as const, results: [], total: 0 };
+    }
+
+    const result = await this.client.search({
+      index: this.openSearchReadAlias,
+      body: {
+        from: args.offset,
+        size: args.limit,
+        query: {
+          bool: {
+            filter: [
+              { term: { is_active: true } },
+              { term: { is_deleted: false } },
+              { terms: { channel_id: args.channelIds.map((id) => Number(id)) } },
+              {
+                range: {
+                  published_at: {
+                    gte: `now-${args.periodDays}d/d`,
+                  },
+                },
+              },
+            ],
+          },
+        },
+        sort: [
+          { popularity_score: { order: 'desc', unmapped_type: 'float' } },
+          { published_at: { order: 'desc', unmapped_type: 'date' } },
+          { quality_score: { order: 'desc', unmapped_type: 'float' } },
+        ],
+      },
+    });
+
+    const body: any = result.body;
+    const hits = body?.hits?.hits ?? [];
+    const totalRaw = body?.hits?.total?.value ?? body?.hits?.total ?? 0;
+
+    return {
+      enabled: true as const,
+      results: hits.map((hit: any) => ({
+        ...hit._source,
+        score: hit._score,
+      })),
+      total: Number(totalRaw),
+    };
+  }
+
+  async searchByTagViaReadAlias(args: {
+    channelIds: bigint[];
+    limit: number;
+    offset: number;
+    tagName?: string;
+  }) {
+    if (!this.openSearchEnabled || !this.client || !args.tagName) {
+      return { enabled: false as const, results: [], total: 0 };
+    }
+
+    const result = await this.client.search({
+      index: this.openSearchReadAlias,
+      body: {
+        from: args.offset,
+        size: args.limit,
+        query: {
+          bool: {
+            must: [
+              {
+                multi_match: {
+                  query: args.tagName,
+                  type: 'best_fields',
+                  fields: ['genres^4', 'keywords^3', 'title^1.5', 'description'],
+                },
+              },
+            ],
+            filter: [
+              { term: { is_active: true } },
+              { term: { is_deleted: false } },
+              { terms: { channel_id: args.channelIds.map((id) => Number(id)) } },
+            ],
+          },
+        },
+        sort: [
+          { _score: { order: 'desc' } },
+          { popularity_score: { order: 'desc', unmapped_type: 'float' } },
+          { published_at: { order: 'desc', unmapped_type: 'date' } },
+        ],
+      },
+    });
+
+    const body: any = result.body;
+    const hits = body?.hits?.hits ?? [];
+    const totalRaw = body?.hits?.total?.value ?? body?.hits?.total ?? 0;
+
+    return {
+      enabled: true as const,
+      results: hits.map((hit: any) => ({
+        ...hit._source,
+        score: hit._score,
+      })),
+      total: Number(totalRaw),
+    };
+  }
+
   async switchAliases(targetIndex: string) {
     if (!this.openSearchEnabled || !this.client) {
       return {

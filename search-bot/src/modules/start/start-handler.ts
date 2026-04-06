@@ -25,7 +25,13 @@ export async function handleStartCommand(args: {
       action: 'send_message',
       send: {
         chatId: args.chatId,
-        text: '欢迎使用搜索机器人。你可以直接发送关键词进行搜索。',
+        text: '欢迎使用搜索机器人。\n\n发送 /s 关键词 可搜索资源\n发送 /rm 查看近期热门\n发送 /tags 查看分类检索。',
+        replyMarkup: {
+          inline_keyboard: [
+            [{ text: '查看热门', callback_data: 'rm:p:start' }],
+            [{ text: '分类检索', callback_data: 'tg:m:start' }],
+          ],
+        },
       },
     };
   }

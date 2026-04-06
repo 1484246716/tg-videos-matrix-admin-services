@@ -19,6 +19,8 @@ const EnvSchema = z.object({
   SEARCH_BOT_BOT_USERNAME: z.string().min(1).default('dev_search_bot'),
   SEARCH_BOT_DEEPLINK_TTL_SEC: z.coerce.number().int().min(60).max(3600).default(600),
   SEARCH_BOT_START_DELETE_TRIGGER_MESSAGE: z.coerce.boolean().default(true),
+  SEARCH_BOT_ENABLE_RM: z.coerce.boolean().default(true),
+  SEARCH_BOT_ENABLE_TAGS: z.coerce.boolean().default(true),
 });
 
 export type AppEnv = z.infer<typeof EnvSchema>;

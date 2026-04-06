@@ -2,7 +2,6 @@ packages:
   - api
   - worker
   - search-bot
-  - mtproto-executor
 
 ignoredBuiltDependencies:
   - '@nestjs/core'

@@ -3,17 +3,21 @@ import { env } from '../../config/env';
 import { getJson, setJsonWithTtl } from '../../infra/redis';
 
 export interface CallbackState {
-  keyword: string;
+  keyword?: string;
   channelId: string;
   requesterId: string;
   page: number;
   pageSize: number;
-  mode?: 'page' | 'detail' | 'copy';
+  mode?: 'page' | 'detail' | 'copy' | 'rm_page' | 'tag_menu' | 'tag_level2' | 'tag_result';
   item?: Record<string, unknown>;
   fromChatId?: string;
   messageId?: number;
   targetChatId?: string;
   docId?: string;
+  tagId?: string;
+  tagName?: string;
+  level1Id?: string;
+  level1Name?: string;
 }
 
 function buildKey(token: string) {

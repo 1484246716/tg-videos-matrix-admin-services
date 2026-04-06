@@ -13,6 +13,36 @@ export interface SearchQueryDto {
   fallbackToDb?: boolean;
 }
 
+export interface SearchHotQueryDto {
+  channelIds?: string[];
+  limit?: number;
+  offset?: number;
+  period?: string;
+  userId?: string;
+  role?: string;
+  fallbackToDb?: boolean;
+}
+
+export interface SearchTagsQueryDto {
+  channelIds?: string[];
+  limit?: number;
+  offset?: number;
+  userId?: string;
+  role?: string;
+}
+
+export interface SearchByTagQueryDto {
+  tagId?: number;
+  tagName?: string;
+  level1Id?: number;
+  channelIds?: string[];
+  limit?: number;
+  offset?: number;
+  userId?: string;
+  role?: string;
+  fallbackToDb?: boolean;
+}
+
 @Injectable()
 export class SearchService {
   constructor(
@@ -131,6 +161,339 @@ export class SearchService {
     };
   }
 
+  async searchHot(query: SearchHotQueryDto) {
+    const { channelIds, userId, role, fallbackToDb = true } = query;
+    const limit = this.sanitizeNumber(query.limit, 20, 1, 50);
+    const offset = this.sanitizeNumber(query.offset, 0, 0, 100000);
+    const effectiveChannelIds = await this.resolveAllowedChannelIds({ channelIds, userId, role });
+
+    const periodDays = this.parsePeriodDays(query.period);
+
+    try {
+      const openSearchResult = await this.searchIndexerService.searchHotViaReadAlias({
+        channelIds: effectiveChannelIds,
+        limit,
+        offset,
+        periodDays,
+      });
+
+      if (openSearchResult.enabled) {
+        const enrichedResults = await this.attachChannelTgChatId(openSearchResult.results);
+        return {
+          results: enrichedResults,
+          total: openSearchResult.total,
+          hasMore: offset + openSearchResult.results.length < openSearchResult.total,
+          route: 'search-engine' as const,
+        };
+      }
+    } catch {
+      if (!fallbackToDb) {
+        return { results: [], total: 0, hasMore: false, route: 'search-engine' as const };
+      }
+    }
+
+    if (effectiveChannelIds.length === 0) {
+      return { results: [], total: 0, hasMore: false, route: 'db' as const };
+    }
+
+    const periodSql = Prisma.sql`AND (published_at IS NULL OR published_at >= now() - (${periodDays} || ' days')::interval)`;
+
+    const rows = await this.prisma.$queryRaw<any[]>(Prisma.sql`
+      SELECT
+        sd.doc_id AS "docId",
+        sd.doc_type AS "docType",
+        sd.title,
+        sd.original_title AS "originalTitle",
+        sd.aliases,
+        sd.actors,
+        sd.year,
+        sd.region,
+        sd.description,
+        sd.telegram_message_link AS "telegramMessageLink",
+        sd.telegram_message_id::text AS "telegramMessageId",
+        sd.published_at AS "publishedAt",
+        sd.quality_score::float AS "qualityScore",
+        sd.popularity_score::float AS "popularityScore",
+        sd.manual_weight::float AS "manualWeight",
+        sd.collection_id::text AS "collectionId",
+        sd.channel_id::text AS "channelId"
+      FROM search_documents sd
+      WHERE
+        sd.is_active = true
+        AND sd.is_deleted = false
+        AND sd.doc_type <> 'collection'
+        AND sd.channel_id = ANY(${effectiveChannelIds}::bigint[])
+        ${periodSql}
+      ORDER BY
+        COALESCE(sd.popularity_score, 0) DESC,
+        sd.published_at DESC NULLS LAST,
+        COALESCE(sd.quality_score, 0) DESC,
+        sd.updated_at DESC
+      LIMIT ${limit}
+      OFFSET ${offset}
+    `);
+
+    const countRows = await this.prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+      SELECT COUNT(*)::bigint AS count
+      FROM search_documents sd
+      WHERE
+        sd.is_active = true
+        AND sd.is_deleted = false
+        AND sd.doc_type <> 'collection'
+        AND sd.channel_id = ANY(${effectiveChannelIds}::bigint[])
+        ${periodSql}
+    `);
+
+    const total = Number(countRows[0]?.count ?? 0);
+    const enrichedRows = await this.attachChannelTgChatId(rows);
+
+    return {
+      results: enrichedRows,
+      total,
+      hasMore: offset + rows.length < total,
+      route: 'db' as const,
+    };
+  }
+
+  async listTags(query: SearchTagsQueryDto) {
+    const { channelIds, userId, role } = query;
+    const limit = this.sanitizeNumber(query.limit, 30, 1, 100);
+    const offset = this.sanitizeNumber(query.offset, 0, 0, 100000);
+    const effectiveChannelIds = await this.resolveAllowedChannelIds({ channelIds, userId, role });
+
+    if (effectiveChannelIds.length === 0) {
+      return { tags: [], total: 0, hasMore: false, route: 'db' as const };
+    }
+
+    const rows = await this.prisma.$queryRaw<Array<{ id: bigint; name: string; count: bigint }>>(Prisma.sql`
+      SELECT
+        l1.id,
+        l1.name,
+        COUNT(DISTINCT sd.id)::bigint AS count
+      FROM category_level1 l1
+      INNER JOIN category_level2 l2 ON l2.level1_id = l1.id
+      INNER JOIN search_document_categories sdc ON sdc.level2_id = l2.id
+      INNER JOIN search_documents sd ON sd.id = sdc.search_document_id
+      WHERE
+        l1.status = 'active'
+        AND l2.status = 'active'
+        AND sd.is_active = true
+        AND sd.is_deleted = false
+        AND sd.doc_type <> 'collection'
+        AND sd.channel_id = ANY(${effectiveChannelIds}::bigint[])
+      GROUP BY l1.id, l1.name
+      ORDER BY l1.name ASC
+      LIMIT ${limit}
+      OFFSET ${offset}
+    `);
+
+    const countRows = await this.prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+      SELECT COUNT(*)::bigint AS count
+      FROM (
+        SELECT l1.id
+        FROM category_level1 l1
+        INNER JOIN category_level2 l2 ON l2.level1_id = l1.id
+        INNER JOIN search_document_categories sdc ON sdc.level2_id = l2.id
+        INNER JOIN search_documents sd ON sd.id = sdc.search_document_id
+        WHERE
+          l1.status = 'active'
+          AND l2.status = 'active'
+          AND sd.is_active = true
+          AND sd.is_deleted = false
+          AND sd.doc_type <> 'collection'
+          AND sd.channel_id = ANY(${effectiveChannelIds}::bigint[])
+        GROUP BY l1.id
+      ) t
+    `);
+
+    const total = Number(countRows[0]?.count ?? 0);
+
+    return {
+      tags: rows.map((row) => ({
+        id: row.id.toString(),
+        name: row.name,
+        level: 1,
+        count: Number(row.count),
+      })),
+      total,
+      hasMore: offset + rows.length < total,
+      route: 'db' as const,
+    };
+  }
+
+  async listLevel2Tags(query: SearchTagsQueryDto & { level1Id: number }) {
+    const { channelIds, userId, role, level1Id } = query;
+    const limit = this.sanitizeNumber(query.limit, 30, 1, 100);
+    const offset = this.sanitizeNumber(query.offset, 0, 0, 100000);
+    const effectiveChannelIds = await this.resolveAllowedChannelIds({ channelIds, userId, role });
+
+    if (effectiveChannelIds.length === 0) {
+      return { tags: [], total: 0, hasMore: false, route: 'db' as const };
+    }
+
+    const rows = await this.prisma.$queryRaw<Array<{ id: bigint; name: string; level1Name: string; count: bigint }>>(Prisma.sql`
+      SELECT
+        l2.id,
+        l2.name,
+        l1.name AS "level1Name",
+        COUNT(DISTINCT sd.id)::bigint AS count
+      FROM category_level2 l2
+      INNER JOIN category_level1 l1 ON l1.id = l2.level1_id
+      INNER JOIN search_document_categories sdc ON sdc.level2_id = l2.id
+      INNER JOIN search_documents sd ON sd.id = sdc.search_document_id
+      WHERE
+        l2.status = 'active'
+        AND l1.status = 'active'
+        AND l2.level1_id = ${BigInt(level1Id)}
+        AND sd.is_active = true
+        AND sd.is_deleted = false
+        AND sd.doc_type <> 'collection'
+        AND sd.channel_id = ANY(${effectiveChannelIds}::bigint[])
+      GROUP BY l2.id, l2.name, l1.name
+      ORDER BY l2.name ASC
+      LIMIT ${limit}
+      OFFSET ${offset}
+    `);
+
+    const countRows = await this.prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+      SELECT COUNT(*)::bigint AS count
+      FROM (
+        SELECT l2.id
+        FROM category_level2 l2
+        INNER JOIN search_document_categories sdc ON sdc.level2_id = l2.id
+        INNER JOIN search_documents sd ON sd.id = sdc.search_document_id
+        WHERE
+          l2.status = 'active'
+          AND l2.level1_id = ${BigInt(level1Id)}
+          AND sd.is_active = true
+          AND sd.is_deleted = false
+          AND sd.doc_type <> 'collection'
+          AND sd.channel_id = ANY(${effectiveChannelIds}::bigint[])
+        GROUP BY l2.id
+      ) t
+    `);
+
+    const total = Number(countRows[0]?.count ?? 0);
+
+    return {
+      tags: rows.map((row) => ({
+        id: row.id.toString(),
+        name: row.name,
+        level: 2,
+        level1Name: row.level1Name,
+        count: Number(row.count),
+      })),
+      total,
+      hasMore: offset + rows.length < total,
+      route: 'db' as const,
+    };
+  }
+
+  async searchByTag(query: SearchByTagQueryDto) {
+    const { tagId, tagName, level1Id, channelIds, userId, role, fallbackToDb = true } = query;
+    const limit = this.sanitizeNumber(query.limit, 20, 1, 50);
+    const offset = this.sanitizeNumber(query.offset, 0, 0, 100000);
+    const effectiveChannelIds = await this.resolveAllowedChannelIds({ channelIds, userId, role });
+
+    if (!tagId && !tagName) {
+      return { results: [], total: 0, hasMore: false, route: 'db' as const };
+    }
+
+    try {
+      const openSearchResult = await this.searchIndexerService.searchByTagViaReadAlias({
+        channelIds: effectiveChannelIds,
+        limit,
+        offset,
+        tagName: tagName?.trim(),
+      });
+
+      if (openSearchResult.enabled) {
+        const enrichedResults = await this.attachChannelTgChatId(openSearchResult.results);
+        return {
+          results: enrichedResults,
+          total: openSearchResult.total,
+          hasMore: offset + openSearchResult.results.length < openSearchResult.total,
+          route: 'search-engine' as const,
+        };
+      }
+    } catch {
+      if (!fallbackToDb) {
+        return { results: [], total: 0, hasMore: false, route: 'search-engine' as const };
+      }
+    }
+
+    if (effectiveChannelIds.length === 0) {
+      return { results: [], total: 0, hasMore: false, route: 'db' as const };
+    }
+
+    const tagFilterSql = tagId
+      ? Prisma.sql`AND l2.id = ${BigInt(tagId)}`
+      : Prisma.sql`AND l2.name = ${String(tagName || '').trim()}`;
+
+    const level1FilterSql = level1Id ? Prisma.sql`AND l2.level1_id = ${BigInt(level1Id)}` : Prisma.sql``;
+
+    const rows = await this.prisma.$queryRaw<any[]>(Prisma.sql`
+      SELECT
+        sd.doc_id AS "docId",
+        sd.doc_type AS "docType",
+        sd.title,
+        sd.original_title AS "originalTitle",
+        sd.aliases,
+        sd.actors,
+        sd.year,
+        sd.region,
+        sd.description,
+        sd.telegram_message_link AS "telegramMessageLink",
+        sd.telegram_message_id::text AS "telegramMessageId",
+        sd.published_at AS "publishedAt",
+        sd.quality_score::float AS "qualityScore",
+        sd.popularity_score::float AS "popularityScore",
+        sd.manual_weight::float AS "manualWeight",
+        sd.collection_id::text AS "collectionId",
+        sd.channel_id::text AS "channelId"
+      FROM search_document_categories sdc
+      INNER JOIN search_documents sd ON sd.id = sdc.search_document_id
+      INNER JOIN category_level2 l2 ON l2.id = sdc.level2_id
+      WHERE
+        sd.is_active = true
+        AND sd.is_deleted = false
+        AND sd.doc_type <> 'collection'
+        AND sd.channel_id = ANY(${effectiveChannelIds}::bigint[])
+        ${tagFilterSql}
+        ${level1FilterSql}
+      ORDER BY
+        COALESCE(sd.popularity_score, 0) DESC,
+        sd.published_at DESC NULLS LAST,
+        COALESCE(sd.quality_score, 0) DESC,
+        sd.updated_at DESC
+      LIMIT ${limit}
+      OFFSET ${offset}
+    `);
+
+    const countRows = await this.prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+      SELECT COUNT(*)::bigint AS count
+      FROM search_document_categories sdc
+      INNER JOIN search_documents sd ON sd.id = sdc.search_document_id
+      INNER JOIN category_level2 l2 ON l2.id = sdc.level2_id
+      WHERE
+        sd.is_active = true
+        AND sd.is_deleted = false
+        AND sd.doc_type <> 'collection'
+        AND sd.channel_id = ANY(${effectiveChannelIds}::bigint[])
+        ${tagFilterSql}
+    `);
+
+    const total = Number(countRows[0]?.count ?? 0);
+    const enrichedRows = await this.attachChannelTgChatId(rows);
+
+    return {
+      results: enrichedRows,
+      total,
+      hasMore: offset + rows.length < total,
+      route: 'db' as const,
+    };
+  }
+
   async getStats() {
     const [totalDocs, activeByType, outboxStats] = await Promise.all([
       this.prisma.searchDocument.count(),
@@ -173,6 +536,13 @@ export class SearchService {
   private sanitizeNumber(value: number | undefined, fallback: number, min: number, max: number) {
     if (typeof value !== 'number' || Number.isNaN(value)) return fallback;
     return Math.min(max, Math.max(min, Math.trunc(value)));
+  }
+
+  private parsePeriodDays(period: string | undefined): number {
+    const normalized = String(period || '').trim().toLowerCase();
+    if (normalized === '3d') return 3;
+    if (normalized === '30d') return 30;
+    return 7;
   }
 
   private async attachChannelTgChatId<T extends Record<string, unknown>>(rows: T[]) {

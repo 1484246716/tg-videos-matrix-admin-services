@@ -231,31 +231,32 @@ model MassMessageItem {
 }
 
 model MediaAsset {
-  id                   BigInt             @id @default(autoincrement())
-  channelId            BigInt             @map("channel_id")
-  originalName         String             @map("original_name") @db.VarChar(255)
-  localPath            String             @map("local_path") @db.VarChar(512)
-  pathNormalized       String?            @map("path_normalized")
-  pathFingerprint      String?            @map("path_fingerprint") @db.VarChar(64)
-  archivePath          String?            @map("archive_path") @db.VarChar(512)
-  fileSize             BigInt             @map("file_size")
-  fileHash             String             @map("file_hash") @db.VarChar(128)
-  durationSec          Int?               @map("duration_sec")
-  status               MediaStatus        @default(new)
-  relayMessageId       BigInt?            @map("relay_message_id")
-  telegramFileId       String?            @map("telegram_file_id")
-  telegramFileUniqueId String?            @map("telegram_file_unique_id")
-  aiGeneratedCaption   String?            @map("ai_generated_caption")
-  sourceMeta           Json?              @map("source_meta")
-  ingestError          String?            @map("ingest_error")
-  createdAt            DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt            DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
-  ingestStartedAt      DateTime?          @map("ingest_started_at") @db.Timestamptz(6)
-  ingestFinishedAt     DateTime?          @map("ingest_finished_at") @db.Timestamptz(6)
-  ingestDurationSec    Int?               @map("ingest_duration_sec")
+  id                   BigInt               @id @default(autoincrement())
+  channelId            BigInt               @map("channel_id")
+  originalName         String               @map("original_name") @db.VarChar(255)
+  localPath            String               @map("local_path") @db.VarChar(512)
+  pathNormalized       String?              @map("path_normalized")
+  pathFingerprint      String?              @map("path_fingerprint") @db.VarChar(64)
+  archivePath          String?              @map("archive_path") @db.VarChar(512)
+  fileSize             BigInt               @map("file_size")
+  fileHash             String               @map("file_hash") @db.VarChar(128)
+  durationSec          Int?                 @map("duration_sec")
+  status               MediaStatus          @default(new)
+  relayMessageId       BigInt?              @map("relay_message_id")
+  telegramFileId       String?              @map("telegram_file_id")
+  telegramFileUniqueId String?              @map("telegram_file_unique_id")
+  aiGeneratedCaption   String?              @map("ai_generated_caption")
+  sourceMeta           Json?                @map("source_meta")
+  ingestError          String?              @map("ingest_error")
+  createdAt            DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime             @updatedAt @map("updated_at") @db.Timestamptz(6)
+  ingestStartedAt      DateTime?            @map("ingest_started_at") @db.Timestamptz(6)
+  ingestFinishedAt     DateTime?            @map("ingest_finished_at") @db.Timestamptz(6)
+  ingestDurationSec    Int?                 @map("ingest_duration_sec")
   collectionEpisode    CollectionEpisode?
   dispatchTasks        DispatchTask[]
-  channel              Channel            @relation(fields: [channelId], references: [id])
+  categories           MediaAssetCategory[]
+  channel              Channel              @relation(fields: [channelId], references: [id])
 
   @@unique([fileHash, fileSize])
   @@unique([channelId, pathFingerprint], map: "ux_media_assets_channel_path_fp")
@@ -625,54 +626,112 @@ enum MassMessageItemStatus {
 // ─── 搜索索引层 ─────────────────────────────────────────────────
 
 model SearchDocument {
-  id              BigInt    @id @default(autoincrement())
-  docId           String    @unique @map("doc_id") @db.VarChar(128)
-  docType         String    @map("doc_type") @db.VarChar(32)
-  schemaVersion   Int       @default(1) @map("schema_version")
+  id              BigInt                   @id @default(autoincrement())
+  docId           String                   @unique @map("doc_id") @db.VarChar(128)
+  docType         String                   @map("doc_type") @db.VarChar(32)
+  schemaVersion   Int                      @default(1) @map("schema_version")
 
-  channelId       BigInt    @map("channel_id")
-  collectionId    BigInt?   @map("collection_id")
-  mediaAssetId    BigInt?   @map("media_asset_id")
-  episodeId       BigInt?   @map("episode_id")
+  channelId       BigInt                   @map("channel_id")
+  collectionId    BigInt?                  @map("collection_id")
+  mediaAssetId    BigInt?                  @map("media_asset_id")
+  episodeId       BigInt?                  @map("episode_id")
 
-  title           String    @db.VarChar(255)
-  originalTitle   String?   @map("original_title") @db.VarChar(255)
-  aliases         String[]  @default([])
-  actors          String[]  @default([])
-  directors       String[]  @default([])
-  genres          String[]  @default([])
-  keywords        String[]  @default([])
+  title           String                   @db.VarChar(255)
+  originalTitle   String?                  @map("original_title") @db.VarChar(255)
+  aliases         String[]                 @default([])
+  actors          String[]                 @default([])
+  directors       String[]                 @default([])
+  genres          String[]                 @default([])
+  keywords        String[]                 @default([])
 
   year            Int?
-  region          String?   @db.VarChar(64)
-  language        String?   @db.VarChar(64)
+  region          String?                  @db.VarChar(64)
+  language        String?                  @db.VarChar(64)
   description     String?
 
-  searchText      String    @map("search_text")
+  searchText      String                   @map("search_text")
   // 注意：tsvector 不被 Prisma 原生支持，通过迁移后手动 SQL 追加
 
-  telegramMessageLink String?  @map("telegram_message_link") @db.VarChar(512)
-  telegramMessageId   BigInt?  @map("telegram_message_id")
-  publishedAt         DateTime? @map("published_at") @db.Timestamptz(6)
+  telegramMessageLink String?              @map("telegram_message_link") @db.VarChar(512)
+  telegramMessageId   BigInt?              @map("telegram_message_id")
+  publishedAt         DateTime?            @map("published_at") @db.Timestamptz(6)
 
-  qualityScore    Decimal   @default(1.0) @map("quality_score") @db.Decimal(8, 4)
-  popularityScore Decimal   @default(0) @map("popularity_score") @db.Decimal(8, 4)
-  manualWeight    Decimal   @default(1.0) @map("manual_weight") @db.Decimal(8, 4)
+  qualityScore    Decimal                  @default(1.0) @map("quality_score") @db.Decimal(8, 4)
+  popularityScore Decimal                  @default(0) @map("popularity_score") @db.Decimal(8, 4)
+  manualWeight    Decimal                  @default(1.0) @map("manual_weight") @db.Decimal(8, 4)
 
-  visibility      String    @default("public") @db.VarChar(32)
-  isActive        Boolean   @default(true) @map("is_active")
-  isDeleted       Boolean   @default(false) @map("is_deleted")
+  visibility      String                   @default("public") @db.VarChar(32)
+  isActive        Boolean                  @default(true) @map("is_active")
+  isDeleted       Boolean                  @default(false) @map("is_deleted")
 
   ext             Json?
+  categories      SearchDocumentCategory[]
 
-  sourceUpdatedAt DateTime  @map("source_updated_at") @db.Timestamptz(6)
-  indexedAt       DateTime  @default(now()) @map("indexed_at") @db.Timestamptz(6)
-  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
-  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  sourceUpdatedAt DateTime                 @map("source_updated_at") @db.Timestamptz(6)
+  indexedAt       DateTime                 @default(now()) @map("indexed_at") @db.Timestamptz(6)
+  updatedAt       DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdAt       DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
 
   @@index([channelId, isActive, isDeleted])
   @@index([updatedAt(sort: Desc)])
   @@map("search_documents")
+}
+
+model CategoryLevel1 {
+  id         BigInt           @id @default(autoincrement())
+  name       String           @unique @db.VarChar(64)
+  slug       String           @unique @db.VarChar(64)
+  sort       Int              @default(0)
+  status     String           @default("active") @db.VarChar(16)
+  createdAt  DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+  level2List CategoryLevel2[]
+
+  @@map("category_level1")
+}
+
+model CategoryLevel2 {
+  id              BigInt                   @id @default(autoincrement())
+  level1Id        BigInt                   @map("level1_id")
+  name            String                   @db.VarChar(64)
+  slug            String                   @unique @db.VarChar(64)
+  sort            Int                      @default(0)
+  status          String                   @default("active") @db.VarChar(16)
+  createdAt       DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(6)
+  level1          CategoryLevel1           @relation(fields: [level1Id], references: [id], onDelete: Restrict)
+  mediaAssets     MediaAssetCategory[]
+  searchDocuments SearchDocumentCategory[]
+
+  @@unique([level1Id, name])
+  @@index([level1Id, status, sort])
+  @@map("category_level2")
+}
+
+model MediaAssetCategory {
+  id          BigInt         @id @default(autoincrement())
+  mediaAssetId BigInt        @map("media_asset_id")
+  level2Id    BigInt         @map("level2_id")
+  createdAt   DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  mediaAsset  MediaAsset     @relation(fields: [mediaAssetId], references: [id], onDelete: Cascade)
+  level2      CategoryLevel2 @relation(fields: [level2Id], references: [id], onDelete: Restrict)
+
+  @@unique([mediaAssetId, level2Id])
+  @@index([level2Id, mediaAssetId])
+  @@map("media_asset_categories")
+}
+
+model SearchDocumentCategory {
+  id               BigInt          @id @default(autoincrement())
+  searchDocumentId BigInt          @map("search_document_id")
+  level2Id         BigInt          @map("level2_id")
+  createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  searchDocument   SearchDocument  @relation(fields: [searchDocumentId], references: [id], onDelete: Cascade)
+  level2           CategoryLevel2  @relation(fields: [level2Id], references: [id], onDelete: Restrict)
+
+  @@unique([searchDocumentId, level2Id])
+  @@index([level2Id, searchDocumentId])
+  @@map("search_document_categories")
 }
 
 model SearchIndexOutbox {

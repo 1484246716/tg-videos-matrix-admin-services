@@ -113,3 +113,13 @@ export async function deleteMessage(args: {
 
   return Boolean(response.data?.result);
 }
+
+export async function setMyCommands(args: {
+  commands: Array<{ command: string; description: string }>;
+}): Promise<boolean> {
+  const response = await tg.post('/setMyCommands', {
+    commands: args.commands,
+  });
+
+  return Boolean(response.data?.ok);
+}

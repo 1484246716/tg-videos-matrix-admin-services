@@ -7,6 +7,9 @@ import { renderResultKeyboard } from '../render/keyboard.renderer';
 import { copyMessage, forwardMessage, getChatMember, getMe } from '../telegram/telegram.client';
 import { env } from '../../config/env';
 import { setIfAbsent } from '../../infra/redis';
+import { handleRmCommand } from '../rm/rm-handler';
+import { handleLevel2Tags, handleTagResult, handleTagsCommand } from '../tags/tags-handler';
+import { logger } from '../../infra/logger';
 
 export interface TelegramCallbackQuery {
   id?: string;
@@ -71,6 +74,205 @@ export async function handleCallbackQuery(callback: TelegramCallbackQuery) {
   const data = callback.data;
   if (!data) {
     return { routed: 'callback_query', ok: true, action: 'noop' };
+  }
+
+  if (data === 'rm:p:start') {
+    if (!env.SEARCH_BOT_ENABLE_RM) {
+      return { routed: 'callback_query', ok: true, action: 'noop' };
+    }
+
+    const requesterId = String(callback.from?.id ?? '*');
+    const chatId = callback.message?.chat?.id;
+    if (typeof chatId !== 'number') {
+      return { routed: 'callback_query', ok: true, action: 'noop' };
+    }
+
+    const rm = await handleRmCommand({
+      channelId: String(chatId),
+      requesterId,
+      page: 1,
+    });
+
+    return {
+      routed: 'callback_query',
+      ok: true,
+      action: 'edit_message',
+      edit: {
+        chatId,
+        messageId: callback.message?.message_id,
+        text: rm.send.text,
+        parseMode: rm.send.parseMode,
+        replyMarkup: rm.send.replyMarkup,
+      },
+    };
+  }
+
+  if (data.startsWith('rm:p:')) {
+    if (!env.SEARCH_BOT_ENABLE_RM) {
+      return { routed: 'callback_query', ok: true, action: 'noop' };
+    }
+
+    const token = data.slice(5);
+    const state = await readCallbackToken(token);
+    if (!state || state.mode !== 'rm_page') {
+      return { routed: 'callback_query', ok: true, action: 'expired' };
+    }
+
+    const requesterId = String(callback.from?.id ?? '');
+    if (state.requesterId !== '*' && requesterId !== state.requesterId) {
+      return { routed: 'callback_query', ok: true, action: 'forbidden' };
+    }
+
+    const rm = await handleRmCommand({
+      channelId: state.channelId,
+      requesterId: state.requesterId,
+      page: state.page,
+    });
+
+    return {
+      routed: 'callback_query',
+      ok: true,
+      action: 'edit_message',
+      edit: {
+        chatId: callback.message?.chat?.id,
+        messageId: callback.message?.message_id,
+        text: rm.send.text,
+        parseMode: rm.send.parseMode,
+        replyMarkup: rm.send.replyMarkup,
+      },
+    };
+  }
+
+  if (data === 'tg:m:start') {
+    if (!env.SEARCH_BOT_ENABLE_TAGS) {
+      return { routed: 'callback_query', ok: true, action: 'noop' };
+    }
+
+    const requesterId = String(callback.from?.id ?? '*');
+    const chatId = callback.message?.chat?.id;
+    if (typeof chatId !== 'number') {
+      return { routed: 'callback_query', ok: true, action: 'noop' };
+    }
+
+    const tags = await handleTagsCommand({
+      channelId: String(chatId),
+      requesterId,
+      page: 1,
+    });
+
+    return {
+      routed: 'callback_query',
+      ok: true,
+      action: 'edit_message',
+      edit: {
+        chatId,
+        messageId: callback.message?.message_id,
+        text: tags.send.text,
+        parseMode: tags.send.parseMode,
+        replyMarkup: tags.send.replyMarkup,
+      },
+    };
+  }
+
+  if (data.startsWith('tg:m:')) {
+    const token = data.slice(5);
+    const state = await readCallbackToken(token);
+    if (!state || state.mode !== 'tag_menu') {
+      return { routed: 'callback_query', ok: true, action: 'expired' };
+    }
+
+    const requesterId = String(callback.from?.id ?? '');
+    if (state.requesterId !== '*' && requesterId !== state.requesterId) {
+      return { routed: 'callback_query', ok: true, action: 'forbidden' };
+    }
+
+    const tags = await handleTagsCommand({
+      channelId: state.channelId,
+      requesterId: state.requesterId,
+      page: state.page,
+    });
+
+    return {
+      routed: 'callback_query',
+      ok: true,
+      action: 'edit_message',
+      edit: {
+        chatId: callback.message?.chat?.id,
+        messageId: callback.message?.message_id,
+        text: tags.send.text,
+        parseMode: tags.send.parseMode,
+        replyMarkup: tags.send.replyMarkup,
+      },
+    };
+  }
+
+  if (data.startsWith('tg:l1:') || data.startsWith('tg:l2m:')) {
+    const token = data.slice(data.startsWith('tg:l1:') ? 6 : 7);
+    const state = await readCallbackToken(token);
+    if (!state || state.mode !== 'tag_level2' || !state.level1Id) {
+      return { routed: 'callback_query', ok: true, action: 'expired' };
+    }
+
+    const requesterId = String(callback.from?.id ?? '');
+    if (state.requesterId !== '*' && requesterId !== state.requesterId) {
+      return { routed: 'callback_query', ok: true, action: 'forbidden' };
+    }
+
+    const level2 = await handleLevel2Tags({
+      channelId: state.channelId,
+      requesterId: state.requesterId,
+      level1Id: state.level1Id,
+      level1Name: state.level1Name,
+      page: state.page,
+    });
+
+    return {
+      routed: 'callback_query',
+      ok: true,
+      action: 'edit_message',
+      edit: {
+        chatId: callback.message?.chat?.id,
+        messageId: callback.message?.message_id,
+        text: level2.send.text,
+        parseMode: level2.send.parseMode,
+        replyMarkup: level2.send.replyMarkup,
+      },
+    };
+  }
+
+  if (data.startsWith('tg:s:') || data.startsWith('tg:r:')) {
+    const token = data.slice(5);
+    const state = await readCallbackToken(token);
+    if (!state || state.mode !== 'tag_result') {
+      return { routed: 'callback_query', ok: true, action: 'expired' };
+    }
+
+    const requesterId = String(callback.from?.id ?? '');
+    if (state.requesterId !== '*' && requesterId !== state.requesterId) {
+      return { routed: 'callback_query', ok: true, action: 'forbidden' };
+    }
+
+    const tagResult = await handleTagResult({
+      channelId: state.channelId,
+      requesterId: state.requesterId,
+      tagId: state.tagId,
+      tagName: state.tagName,
+      level1Id: state.level1Id,
+      page: state.page,
+    });
+
+    return {
+      routed: 'callback_query',
+      ok: true,
+      action: 'edit_message',
+      edit: {
+        chatId: callback.message?.chat?.id,
+        messageId: callback.message?.message_id,
+        text: tagResult.send.text,
+        parseMode: tagResult.send.parseMode,
+        replyMarkup: tagResult.send.replyMarkup,
+      },
+    };
   }
 
   if (data.startsWith('sc:')) {

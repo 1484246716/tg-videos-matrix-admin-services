@@ -1,4 +1,4 @@
-import { parseSearchCommand } from '../command/command.parser';
+import { parseCommand } from '../command/command.parser';
 import { renderSearchMessage } from '../render/message.renderer';
 import { handleCallbackQuery } from '../callback/callback-handler';
 import { allowUserRequest } from '../security/rate-limit.service';
@@ -6,6 +6,9 @@ import { searchWithCache } from '../search/search.orchestrator';
 import { logger } from '../../infra/logger';
 import { buildDeepLink, createDeepLinkToken } from '../deeplink/deeplink.service';
 import { handleStartCommand } from '../start/start-handler';
+import { handleRmCommand } from '../rm/rm-handler';
+import { handleTagsCommand } from '../tags/tags-handler';
+import { env } from '../../config/env';
 
 export interface TelegramMessage {
   message_id?: number;
@@ -75,10 +78,10 @@ async function handleTextMessage(message: TelegramMessage) {
     fromId: message.from?.id,
   });
 
-  const parsed = parseSearchCommand(message.text);
-  if (!parsed) {
-    logger.info('忽略非搜索命令文本', {
-      reason: 'parse_failed_or_not_search_command',
+  const parsed = parseCommand(message.text);
+  if (parsed.type === 'unknown') {
+    logger.info('忽略非支持命令文本', {
+      reason: 'unsupported_command',
       text: message.text,
     });
     return { routed: 'message', ok: true, action: 'noop' };
@@ -109,6 +112,70 @@ async function handleTextMessage(message: TelegramMessage) {
         },
       };
     }
+  }
+
+  if (parsed.type === 'rm') {
+    if (!env.SEARCH_BOT_ENABLE_RM) {
+      return {
+        routed: 'message',
+        ok: true,
+        action: 'send_message',
+        send: {
+          chatId,
+          text: '热门功能维护中，请稍后再试。',
+        },
+      };
+    }
+
+    const rm = await handleRmCommand({
+      channelId,
+      requesterId,
+      page: 1,
+    });
+
+    return {
+      routed: 'message',
+      ok: true,
+      action: 'send_message',
+      send: {
+        chatId,
+        text: rm.send.text,
+        parseMode: rm.send.parseMode,
+        replyMarkup: rm.send.replyMarkup,
+      },
+    };
+  }
+
+  if (parsed.type === 'tags') {
+    if (!env.SEARCH_BOT_ENABLE_TAGS) {
+      return {
+        routed: 'message',
+        ok: true,
+        action: 'send_message',
+        send: {
+          chatId,
+          text: '分类功能维护中，请稍后再试。',
+        },
+      };
+    }
+
+    const tags = await handleTagsCommand({
+      channelId,
+      requesterId,
+      page: 1,
+    });
+
+    return {
+      routed: 'message',
+      ok: true,
+      action: 'send_message',
+      send: {
+        chatId,
+        text: tags.send.text,
+        parseMode: tags.send.parseMode,
+        replyMarkup: tags.send.replyMarkup,
+      },
+    };
   }
 
   const page = 1;

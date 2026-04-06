@@ -6,6 +6,7 @@ import { searchIndexQueue } from '../infra/redis';
 import { logger, logError } from '../logger';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
 import { sendVideoByTelegram, TelegramError } from '../shared/telegram';
+import { classifyAndAssignForTypeB } from './typeb-category.service';
 
 function isParseEntitiesError(error: { code?: string; message?: string } | null | undefined) {
   const message = (error?.message ?? '').toLowerCase();
@@ -276,6 +277,13 @@ export async function handleDispatchJob(
           await prisma.mediaAsset.update({
             where: { id: task.mediaAsset.id },
             data: { aiGeneratedCaption: finalCaption },
+          });
+
+          await classifyAndAssignForTypeB({
+            mediaAssetId: task.mediaAsset.id,
+            originalName: aiSearchVideoName,
+            aiCaption: finalCaption,
+            profile,
           });
         } catch (aiErr) {
           logError('[q_dispatch] AI 文案生成失败', {

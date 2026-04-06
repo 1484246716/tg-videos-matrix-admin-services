@@ -74,6 +74,112 @@ export class SearchController {
   }
 
   /**
+   * GET /api/search/internal/hot?channelTgChatId=-100xxx&limit=20&offset=0&period=7d&fallbackToDb=true
+   * 机器人内部热门接口（X-Internal-Token 鉴权）
+   */
+  @UseGuards(InternalTokenGuard)
+  @Get('internal/hot')
+  async internalHot(
+    @Query('channelTgChatId') channelTgChatId?: string,
+    @Query('limit') limitRaw?: string,
+    @Query('offset') offsetRaw?: string,
+    @Query('period') period?: string,
+    @Query('fallbackToDb') fallbackToDbRaw?: string,
+  ) {
+    const resolvedChannelIds = channelTgChatId
+      ? await this.searchService.resolveChannelIdsByTgChatIds([channelTgChatId])
+      : undefined;
+
+    return this.searchService.searchHot({
+      channelIds: resolvedChannelIds,
+      limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
+      offset: offsetRaw ? Number.parseInt(offsetRaw, 10) : undefined,
+      period,
+      fallbackToDb: fallbackToDbRaw ? fallbackToDbRaw !== 'false' : true,
+      role: 'admin',
+    });
+  }
+
+  /**
+   * GET /api/search/internal/tags?channelTgChatId=-100xxx&limit=30&offset=0
+   * 机器人内部一级分类面板接口（X-Internal-Token 鉴权）
+   */
+  @UseGuards(InternalTokenGuard)
+  @Get('internal/tags')
+  async internalTags(
+    @Query('channelTgChatId') channelTgChatId?: string,
+    @Query('limit') limitRaw?: string,
+    @Query('offset') offsetRaw?: string,
+  ) {
+    const resolvedChannelIds = channelTgChatId
+      ? await this.searchService.resolveChannelIdsByTgChatIds([channelTgChatId])
+      : undefined;
+
+    return this.searchService.listTags({
+      channelIds: resolvedChannelIds,
+      limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
+      offset: offsetRaw ? Number.parseInt(offsetRaw, 10) : undefined,
+      role: 'admin',
+    });
+  }
+
+  /**
+   * GET /api/search/internal/tags/level2?level1Id=1&channelTgChatId=-100xxx&limit=30&offset=0
+   * 机器人内部二级分类面板接口（X-Internal-Token 鉴权）
+   */
+  @UseGuards(InternalTokenGuard)
+  @Get('internal/tags/level2')
+  async internalLevel2Tags(
+    @Query('level1Id') level1IdRaw?: string,
+    @Query('channelTgChatId') channelTgChatId?: string,
+    @Query('limit') limitRaw?: string,
+    @Query('offset') offsetRaw?: string,
+  ) {
+    const resolvedChannelIds = channelTgChatId
+      ? await this.searchService.resolveChannelIdsByTgChatIds([channelTgChatId])
+      : undefined;
+
+    return this.searchService.listLevel2Tags({
+      level1Id: level1IdRaw ? Number.parseInt(level1IdRaw, 10) : 0,
+      channelIds: resolvedChannelIds,
+      limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
+      offset: offsetRaw ? Number.parseInt(offsetRaw, 10) : undefined,
+      role: 'admin',
+    });
+  }
+
+  /**
+   * GET /api/search/internal/by-tag?tagId=123&channelTgChatId=-100xxx&limit=20&offset=0&fallbackToDb=true
+   * 机器人内部按分类搜索接口（X-Internal-Token 鉴权）
+   */
+  @UseGuards(InternalTokenGuard)
+  @Get('internal/by-tag')
+  async internalByTag(
+    @Query('tagId') tagIdRaw?: string,
+    @Query('tagName') tagName?: string,
+    @Query('level1Id') level1IdRaw?: string,
+    @Query('channelTgChatId') channelTgChatId?: string,
+    @Query('limit') limitRaw?: string,
+    @Query('offset') offsetRaw?: string,
+    @Query('fallbackToDb') fallbackToDbRaw?: string,
+  ) {
+    const resolvedChannelIds = channelTgChatId
+      ? await this.searchService.resolveChannelIdsByTgChatIds([channelTgChatId])
+      : undefined;
+
+    return this.searchService.searchByTag({
+      tagId: tagIdRaw ? Number.parseInt(tagIdRaw, 10) : undefined,
+      tagName,
+      level1Id: level1IdRaw ? Number.parseInt(level1IdRaw, 10) : undefined,
+      channelIds: resolvedChannelIds,
+      limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
+      offset: offsetRaw ? Number.parseInt(offsetRaw, 10) : undefined,
+      fallbackToDb: fallbackToDbRaw ? fallbackToDbRaw !== 'false' : true,
+      role: 'admin',
+    });
+  }
+
+  /**
    * GET /api/search/stats
    * 搜索索引统计信息
    */
