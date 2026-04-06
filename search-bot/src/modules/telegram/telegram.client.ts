@@ -101,3 +101,15 @@ export async function getMe(): Promise<{ id: number } | null> {
   const response = await tg.get('/getMe');
   return response.data?.result ?? null;
 }
+
+export async function deleteMessage(args: {
+  chatId: number | string;
+  messageId: number;
+}): Promise<boolean> {
+  const response = await tg.post('/deleteMessage', {
+    chat_id: args.chatId,
+    message_id: args.messageId,
+  });
+
+  return Boolean(response.data?.result);
+}

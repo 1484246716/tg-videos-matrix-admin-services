@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { readCallbackToken, createCallbackToken } from './callback-token.service';
 import { renderSearchMessage } from '../render/message.renderer';
-import { allowChannelRequest, allowUserRequest } from '../security/rate-limit.service';
+import { allowUserRequest } from '../security/rate-limit.service';
 import { searchWithCache } from '../search/search.orchestrator';
 import { renderResultKeyboard } from '../render/keyboard.renderer';
 import { copyMessage, forwardMessage, getChatMember, getMe } from '../telegram/telegram.client';
@@ -155,11 +155,6 @@ export async function handleCallbackQuery(callback: TelegramCallbackQuery) {
     if (!allowedByUser) {
       return { routed: 'callback_query', ok: true, action: 'rate_limited_user' };
     }
-  }
-
-  const allowedByChannel = await allowChannelRequest(state.channelId);
-  if (!allowedByChannel) {
-    return { routed: 'callback_query', ok: true, action: 'rate_limited_channel' };
   }
 
   const result = await searchWithCache({

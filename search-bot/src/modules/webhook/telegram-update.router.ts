@@ -1,11 +1,9 @@
 import { parseSearchCommand } from '../command/command.parser';
 import { renderSearchMessage } from '../render/message.renderer';
-import { createCallbackToken } from '../callback/callback-token.service';
 import { handleCallbackQuery } from '../callback/callback-handler';
-import { allowChannelRequest, allowUserRequest } from '../security/rate-limit.service';
+import { allowUserRequest } from '../security/rate-limit.service';
 import { searchWithCache } from '../search/search.orchestrator';
 import { logger } from '../../infra/logger';
-import { renderResultKeyboard } from '../render/keyboard.renderer';
 import { buildDeepLink, createDeepLinkToken } from '../deeplink/deeplink.service';
 import { handleStartCommand } from '../start/start-handler';
 
@@ -19,16 +17,11 @@ export interface TelegramMessage {
   from?: {
     id?: number;
   };
-  sender_chat?: {
-    id?: number;
-    type?: string;
-  };
 }
 
 export interface TelegramUpdate {
   update_id?: number;
   message?: TelegramMessage;
-  channel_post?: TelegramMessage;
   callback_query?: Record<string, unknown>;
 }
 
@@ -43,27 +36,12 @@ export async function routeTelegramUpdate(update: TelegramUpdate) {
           fromId: update.message.from?.id,
           text,
           routed: 'message',
-        });
-      }
-    }
-    return handleTextMessage(update.message, 'message');
-  }
-
-  if (update.channel_post) {
-    const text = update.channel_post.text || '';
-    if (text.startsWith('/start')) {
-      const chatId = update.channel_post.chat?.id;
-      if (typeof chatId === 'number') {
-        return handleStartCommand({
-          chatId,
-          fromId: update.channel_post.from?.id,
-          text,
-          routed: 'channel_post',
+          triggerMessageId: update.message.message_id,
         });
       }
     }
 
-    return handleTextMessage(update.channel_post, 'channel_post');
+    return handleTextMessage(update.message);
   }
 
   if (update.callback_query) {
@@ -73,33 +51,46 @@ export async function routeTelegramUpdate(update: TelegramUpdate) {
   return { routed: 'ignored', ok: true };
 }
 
-async function handleTextMessage(message: TelegramMessage, routed: 'message' | 'channel_post') {
-  logger.info('update.text_received', {
-    routed,
+function isCollectionLikeTitle(title: string): boolean {
+  const trimmed = title.trim();
+  if (!trimmed) return false;
+
+  // 常见“合集项”模式：关键词后直接跟纯数字，如 黄宏1 / 黄宏10
+  if (/^[\u4e00-\u9fa5A-Za-z]+\d{1,3}$/.test(trimmed)) {
+    return true;
+  }
+
+  // 显式合集关键词
+  if (/(合集|全集|全季|系列)/.test(trimmed)) {
+    return true;
+  }
+
+  return false;
+}
+
+async function handleTextMessage(message: TelegramMessage) {
+  logger.info('收到私聊文本消息', {
     text: message.text,
     chatId: message.chat?.id,
     fromId: message.from?.id,
-    senderChatId: message.sender_chat?.id,
   });
 
   const parsed = parseSearchCommand(message.text);
   if (!parsed) {
-    logger.info('update.command_ignored', {
-      routed,
+    logger.info('忽略非搜索命令文本', {
       reason: 'parse_failed_or_not_search_command',
       text: message.text,
     });
-    return { routed, ok: true, action: 'noop' };
+    return { routed: 'message', ok: true, action: 'noop' };
   }
 
   const chatId = message.chat?.id;
   const channelId = typeof chatId === 'number' ? String(chatId) : '';
   if (!channelId) {
-    logger.warn('update.invalid_context', {
-      routed,
+    logger.warn('私聊上下文无chatId', {
       reason: 'missing_chat_id',
     });
-    return { routed, ok: false, action: 'invalid_context' };
+    return { routed: 'message', ok: false, action: 'invalid_context' };
   }
 
   const requesterIdRaw = message.from?.id;
@@ -109,7 +100,7 @@ async function handleTextMessage(message: TelegramMessage, routed: 'message' | '
     const allowedByUser = await allowUserRequest(requesterId);
     if (!allowedByUser) {
       return {
-        routed,
+        routed: 'message',
         ok: true,
         action: 'rate_limited_user',
         send: {
@@ -118,19 +109,6 @@ async function handleTextMessage(message: TelegramMessage, routed: 'message' | '
         },
       };
     }
-  }
-
-  const allowedByChannel = await allowChannelRequest(channelId);
-  if (!allowedByChannel) {
-    return {
-      routed,
-      ok: true,
-      action: 'rate_limited_channel',
-      send: {
-        chatId,
-        text: '当前频道搜索请求过多，请稍后重试。',
-      },
-    };
   }
 
   const page = 1;
@@ -142,22 +120,23 @@ async function handleTextMessage(message: TelegramMessage, routed: 'message' | '
     offset: 0,
   });
 
-  const nextToken = result.hasMore
-    ? await createCallbackToken({
-        keyword: parsed.keyword,
-        channelId,
-        requesterId,
-        page: page + 1,
-        pageSize,
-        mode: 'page',
-      })
-    : null;
-
   const renderItems: Array<{ title?: string; year?: number | null; actors?: string[]; deepLink?: string }> = [];
-  const copyButtons: Array<{ text: string; token: string }> = [];
 
-  for (let index = 0; index < Math.min(result.results.length, pageSize); index += 1) {
-    const item = result.results[index] as Record<string, unknown>;
+  const pageRows = result.results
+    .filter((row) => !isCollectionLikeTitle(String((row as Record<string, unknown>).title ?? '')))
+    .slice(0, pageSize);
+
+  if (result.results.length > pageRows.length) {
+    logger.info('搜索结果已过滤合集标题', {
+      keyword: parsed.keyword,
+      originalCount: result.results.length,
+      filteredCount: pageRows.length,
+      removedCount: result.results.length - pageRows.length,
+    });
+  }
+
+  for (let index = 0; index < pageRows.length; index += 1) {
+    const item = pageRows[index] as Record<string, unknown>;
     const fromChatId = String(item.channelTgChatId ?? item.channel_tg_chat_id ?? '');
     const messageIdRaw = item.telegramMessageId ?? item.telegram_message_id ?? 0;
     const messageId = Number(messageIdRaw);
@@ -179,32 +158,14 @@ async function handleTextMessage(message: TelegramMessage, routed: 'message' | '
         deepLink: buildDeepLink(shortToken),
       });
 
-      const copyToken = await createCallbackToken({
-        keyword: parsed.keyword,
-        channelId,
-        requesterId,
-        page,
-        pageSize,
-        mode: 'copy',
-        docId: String(item.docId ?? ''),
-        fromChatId,
-        messageId,
-        targetChatId: channelId,
-        item: {
-          title: item.title,
-          telegramMessageLink: item.telegramMessageLink,
-        },
-      });
 
-      copyButtons.push({
-        text: `发送 ${String(index + 1).padStart(2, '0')}`,
-        token: copyToken,
-      });
     } else {
+      const fallbackLink = String(item.telegramMessageLink ?? item.telegram_message_link ?? '');
       renderItems.push({
         title: String(item.title ?? ''),
         year: typeof item.year === 'number' ? item.year : null,
         actors: Array.isArray(item.actors) ? (item.actors as string[]) : [],
+        deepLink: fallbackLink || undefined,
       });
     }
   }
@@ -213,23 +174,18 @@ async function handleTextMessage(message: TelegramMessage, routed: 'message' | '
     keyword: parsed.keyword,
     page,
     pageSize,
-    total: result.total,
+    total: pageRows.length,
     items: renderItems,
   });
 
   return {
-    routed,
+    routed: 'message',
     ok: true,
     action: 'send_message',
     send: {
       chatId,
       text,
       parseMode: 'HTML',
-      replyMarkup: renderResultKeyboard({
-        copyButtons,
-        prevToken: null,
-        nextToken,
-      }),
       degraded: result.total === 0,
     },
   };

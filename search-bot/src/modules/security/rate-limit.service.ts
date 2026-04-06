@@ -18,7 +18,4 @@ export async function allowUserRequest(userId: string): Promise<boolean> {
   return hitAndCheck(key, env.SEARCH_BOT_USER_RATE_LIMIT);
 }
 
-export async function allowChannelRequest(channelId: string): Promise<boolean> {
-  const key = `sb:rl:channel:${channelId}:${minuteBucket()}`;
-  return hitAndCheck(key, env.SEARCH_BOT_CHANNEL_RATE_LIMIT);
-}
+

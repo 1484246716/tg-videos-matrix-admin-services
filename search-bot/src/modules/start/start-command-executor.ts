@@ -1,8 +1,7 @@
 import axios from 'axios';
 import { verifyDeepLinkToken } from '../deeplink/deeplink.service';
-import { copyMessage, forwardMessage, sendMessage, getChatMember, getMe } from '../telegram/telegram.client';
+import { copyMessage, forwardMessage, sendMessage, getChatMember, getMe, deleteMessage } from '../telegram/telegram.client';
 import { env } from '../../config/env';
-import { setIfAbsent } from '../../infra/redis';
 import { logger } from '../../infra/logger';
 
 function isRetryableError(error: unknown): boolean {
@@ -41,13 +40,29 @@ async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   throw lastError;
 }
 
-async function ensureBotPermission(chatId: string): Promise<boolean> {
+async function ensureBotPermission(chatId: string, mode: 'source' | 'target'): Promise<boolean> {
+  const chatIdNumber = Number(chatId);
+
+  // 私聊目标：不需要频道发帖权限，直接视为可发送
+  if (mode === 'target' && Number.isFinite(chatIdNumber) && chatIdNumber > 0) {
+    return true;
+  }
+
   const me = await getMe();
   if (!me?.id) return false;
+
   const member = await getChatMember({ chatId, userId: me.id });
   if (!member?.status) return false;
-  if (member.status === 'administrator' || member.status === 'creator') return true;
-  return Boolean(member.can_post_messages);
+
+  if (member.status === 'administrator' || member.status === 'creator' || member.status === 'member') {
+    return true;
+  }
+
+  if (typeof member.can_post_messages === 'boolean') {
+    return member.can_post_messages;
+  }
+
+  return false;
 }
 
 export async function executeStartPayload(args: {
@@ -56,6 +71,8 @@ export async function executeStartPayload(args: {
   text: string;
   consumeNonce: boolean;
   withPrivateAck?: boolean;
+  triggerMessageId?: number;
+  deleteTriggerMessage?: boolean;
 }) {
   const match = args.text.match(/^\/start\s+cp_(\S+)/);
   if (!match) {
@@ -67,79 +84,72 @@ export async function executeStartPayload(args: {
 
   const shortToken = match[1];
 
-  logger.info('开始执行频道发送', {
+  logger.info('开始执行私聊发送', {
     shortToken,
     chatId: args.chatId,
     fromId: args.fromId,
     consumeNonce: args.consumeNonce,
   });
 
+  if (args.deleteTriggerMessage && env.SEARCH_BOT_START_DELETE_TRIGGER_MESSAGE && args.triggerMessageId) {
+    try {
+      await deleteMessage({ chatId: args.chatId, messageId: args.triggerMessageId });
+      logger.info('start触发消息删除成功', {
+        chatId: args.chatId,
+        messageId: args.triggerMessageId,
+      });
+    } catch (error) {
+      logger.warn('start触发消息删除失败', {
+        chatId: args.chatId,
+        messageId: args.triggerMessageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   const verify = await verifyDeepLinkToken(shortToken, args.fromId ? String(args.fromId) : undefined, {
     consumeNonce: args.consumeNonce,
   });
 
   if (!verify.ok) {
-    logger.warn('频道发送校验失败', {
+    logger.warn('私聊发送校验失败', {
       shortToken,
       reason: verify.reason,
     });
 
     const message =
       verify.reason === 'expired'
-        ? '链接已过期，请返回频道重新搜索。'
+        ? '链接已过期，请重新搜索。'
         : verify.reason === 'forbidden'
           ? '你无权触发该发送链接。'
           : verify.reason === 'replayed'
             ? '该链接已使用，请勿重复点击。'
             : '链接无效，请重新获取。';
 
-    if (args.withPrivateAck) {
-      await sendMessage({
-        chatId: args.chatId,
-        text: message,
-      });
+    if (args.withPrivateAck !== false) {
+      await sendMessage({ chatId: args.chatId, text: message });
     }
 
-    return {
-      ok: false,
-      message,
-      reason: verify.reason,
-    } as const;
+    return { ok: false, message, reason: verify.reason } as const;
   }
 
   const state = verify.state;
 
-  logger.info('频道发送校验通过', {
+  logger.info('私聊发送校验通过', {
     shortToken,
     fromChatId: state.fromChatId,
     targetChatId: state.targetChatId,
     messageId: state.messageId,
   });
 
-  const idemKey = `sb:copy:idem:${state.fromChatId}:${state.messageId}:${state.targetChatId}`;
-  const firstCopy = await setIfAbsent(idemKey, '1', env.SEARCH_BOT_COPY_IDEMPOTENT_TTL_SEC);
-  if (!firstCopy) {
-    logger.warn('频道发送命中幂等去重', {
-      shortToken,
-      idemKey,
-    });
-
-    const message = '该资源近期已发送，无需重复操作。';
-
-    if (args.withPrivateAck) {
-      await sendMessage({ chatId: args.chatId, text: message });
-    }
-
-    return { ok: false, message, reason: 'duplicated' as const };
-  }
 
   const [sourceAllowed, targetAllowed] = await Promise.all([
-    ensureBotPermission(state.fromChatId),
-    ensureBotPermission(state.targetChatId),
+    ensureBotPermission(state.fromChatId, 'source'),
+    ensureBotPermission(state.targetChatId, 'target'),
   ]);
 
   if (!sourceAllowed || !targetAllowed) {
-    logger.warn('频道发送权限不足', {
+    logger.warn('私聊发送权限不足', {
       shortToken,
       sourceAllowed,
       targetAllowed,
@@ -149,7 +159,7 @@ export async function executeStartPayload(args: {
 
     const message = '机器人权限不足，无法发送该资源，请联系管理员。';
 
-    if (args.withPrivateAck) {
+    if (args.withPrivateAck !== false) {
       await sendMessage({ chatId: args.chatId, text: message });
     }
 
@@ -157,7 +167,7 @@ export async function executeStartPayload(args: {
   }
 
   try {
-    logger.info('频道发送copy开始', {
+    logger.info('私聊发送copy开始', {
       shortToken,
       fromChatId: state.fromChatId,
       targetChatId: state.targetChatId,
@@ -172,26 +182,14 @@ export async function executeStartPayload(args: {
       }),
     );
 
-    await sendMessage({
-      chatId: Number(state.targetChatId),
-      text: `✅ 已由搜索机器人发送：${state.title || '资源消息'}`,
-    });
-
-    logger.info('start.execute_copy_done', {
+    logger.info('私聊发送copy完成', {
       shortToken,
       targetChatId: state.targetChatId,
     });
 
-    if (args.withPrivateAck) {
-      await sendMessage({
-        chatId: args.chatId,
-        text: '发送成功，已投递到目标频道。',
-      });
-    }
-
     return { ok: true, message: 'sent' as const };
   } catch (copyError) {
-    logger.warn('start.execute_copy_failed', {
+    logger.warn('私聊发送copy失败', {
       shortToken,
       error: copyError instanceof Error ? copyError.message : String(copyError),
     });
@@ -205,21 +203,14 @@ export async function executeStartPayload(args: {
         }),
       );
 
-      if (args.withPrivateAck) {
-        await sendMessage({
-          chatId: args.chatId,
-          text: 'copy失败，已自动转发到目标频道。',
-        });
-      }
-
-      logger.info('start.execute_forward_done', {
+      logger.info('私聊发送forward完成', {
         shortToken,
         targetChatId: state.targetChatId,
       });
 
       return { ok: true, message: 'forwarded' as const };
     } catch (forwardError) {
-      logger.error('start.execute_forward_failed', {
+      logger.error('私聊发送forward失败', {
         shortToken,
         error: forwardError instanceof Error ? forwardError.message : String(forwardError),
         fallbackLink: state.telegramMessageLink || null,
@@ -229,7 +220,7 @@ export async function executeStartPayload(args: {
         ? `发送失败，可直接查看原消息：${state.telegramMessageLink}`
         : '发送失败，请稍后重试。';
 
-      if (args.withPrivateAck) {
+      if (args.withPrivateAck !== false) {
         await sendMessage({ chatId: args.chatId, text: message });
       }
 

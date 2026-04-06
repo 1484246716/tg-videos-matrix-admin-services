@@ -114,21 +114,17 @@ app.post('/telegram/webhook/:secret', async (req, res) => {
             ? '你无权操作此分页'
             : routed.action === 'rate_limited_user'
               ? '你操作过于频繁，请稍后再试'
-              : routed.action === 'rate_limited_channel'
-                ? '当前频道操作频繁，请稍后再试'
-                : routed.action === 'copy_success'
-                  ? '搬运成功'
-                  : routed.action === 'copy_fallback_forward'
-                    ? 'copy失败，已自动转发'
-                    : routed.action === 'copy_duplicate'
-                      ? '该资源近期已搬运，无需重复操作'
-                      : routed.action === 'copy_permission_denied'
-                        ? '机器人权限不足，无法搬运'
-                        : routed.action === 'copy_failed'
-                          ? '搬运失败，请稍后重试'
-                          : routed.action === 'copy_disabled'
-                            ? '搬运功能暂时关闭'
-                            : undefined;
+              : routed.action === 'copy_success'
+                ? '发送成功'
+                : routed.action === 'copy_fallback_forward'
+                  ? 'copy失败，已自动转发'
+                  : routed.action === 'copy_duplicate'
+                    ? '该资源近期已发送，无需重复操作'
+                    : routed.action === 'copy_permission_denied'
+                      ? '机器人权限不足，无法发送'
+                      : routed.action === 'copy_failed'
+                        ? '发送失败，请稍后重试'
+                        : undefined;
 
       try {
         await answerCallbackQuery({

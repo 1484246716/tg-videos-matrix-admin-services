@@ -3,7 +3,14 @@ import path from 'path';
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
-const LOG_DIR = path.resolve(process.cwd(), 'search-bot', 'logs');
+function resolveLogDir() {
+  const cwd = process.cwd();
+  return path.basename(cwd) === 'search-bot'
+    ? path.resolve(cwd, 'logs')
+    : path.resolve(cwd, 'search-bot', 'logs');
+}
+
+const LOG_DIR = resolveLogDir();
 const LOG_FILE = path.join(LOG_DIR, 'search-bot.log');
 
 function shouldLog(level: LogLevel) {

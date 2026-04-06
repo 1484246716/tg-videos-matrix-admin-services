@@ -32,7 +32,7 @@ export function renderSearchMessage(args: {
     const prefix = `${String(no).padStart(2, '0')}. `;
 
     if (item.deepLink) {
-      lines.push(`${prefix}<a href="${escapeHtml(item.deepLink)}">${title}${year}</a>${actors}`);
+      lines.push(`${prefix}<a href="${escapeHtml(item.deepLink)}">${title}${year}${actors}</a>`);
     } else {
       lines.push(`${prefix}${title}${year}${actors}`);
     }
