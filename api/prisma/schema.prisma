@@ -749,3 +749,177 @@ model SearchIndexOutbox {
   @@index([status, nextRetryAt, createdAt])
   @@map("search_index_outbox")
 }
+
+model CloneCrawlAccount {
+  id               BigInt             @id @default(autoincrement())
+  accountPhone     String             @unique @map("account_phone") @db.VarChar(32)
+  accountType      CloneAccountType   @default(user) @map("account_type")
+  sessionString    String             @map("session_string")
+  status           CloneAccountStatus @default(active)
+  lastLoginAt      DateTime?          @map("last_login_at") @db.Timestamptz(6)
+  lastCheckAt      DateTime?          @map("last_check_at") @db.Timestamptz(6)
+  lastErrorCode    String?            @map("last_error_code") @db.VarChar(64)
+  lastErrorMessage String?            @map("last_error_message")
+  createdAt        DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([status, updatedAt(sort: Desc)])
+  @@map("clone_crawl_accounts")
+}
+
+model CloneCrawlTask {
+  id                        BigInt                 @id @default(autoincrement())
+  name                      String                 @db.VarChar(128)
+  status                    CloneTaskStatus        @default(draft)
+  scheduleType              CloneScheduleType      @default(once) @map("schedule_type")
+  scheduleCron              String?                @map("schedule_cron") @db.VarChar(64)
+  timezone                  String                 @default("Asia/Shanghai") @db.VarChar(64)
+  crawlMode                 CloneCrawlMode         @default(index_only) @map("crawl_mode")
+  contentTypes              String[]               @default([]) @map("content_types")
+  recentLimit               Int                    @default(100) @map("recent_limit")
+  downloadMaxFileMb         Int?                   @map("download_max_file_mb")
+  globalDownloadConcurrency Int                    @default(4) @map("global_download_concurrency")
+  retryMax                  Int                    @default(5) @map("retry_max")
+  targetPathType            CloneTargetPathType    @default(channel_path) @map("target_path_type")
+  targetPath                String                 @map("target_path") @db.VarChar(512)
+  createdBy                 BigInt?                @map("created_by")
+  createdAt                 DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                 DateTime               @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  channels                  CloneCrawlTaskChannel[]
+  runs                      CloneCrawlRun[]
+
+  @@index([status, updatedAt(sort: Desc)])
+  @@map("clone_crawl_tasks")
+}
+
+model CloneCrawlTaskChannel {
+  id                    BigInt                  @id @default(autoincrement())
+  taskId                BigInt                  @map("task_id")
+  channelUsername       String                  @map("channel_username") @db.VarChar(128)
+  channelTitle          String?                 @map("channel_title") @db.VarChar(255)
+  channelAccessStatus   CloneChannelAccessStatus @default(ok) @map("channel_access_status")
+  lastFetchedMessageId  BigInt?                 @map("last_fetched_message_id")
+  lastRunAt             DateTime?               @map("last_run_at") @db.Timestamptz(6)
+  lastErrorCode         String?                 @map("last_error_code") @db.VarChar(64)
+  lastErrorMessage      String?                 @map("last_error_message")
+  createdAt             DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  task                  CloneCrawlTask          @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, channelUsername])
+  @@index([taskId, channelAccessStatus])
+  @@map("clone_crawl_task_channels")
+}
+
+model CloneCrawlRun {
+  id                 BigInt          @id @default(autoincrement())
+  taskId             BigInt          @map("task_id")
+  status             CloneRunStatus  @default(pending)
+  startedAt          DateTime?       @map("started_at") @db.Timestamptz(6)
+  finishedAt         DateTime?       @map("finished_at") @db.Timestamptz(6)
+  channelTotal       Int             @default(0) @map("channel_total")
+  channelSuccess     Int             @default(0) @map("channel_success")
+  channelFailed      Int             @default(0) @map("channel_failed")
+  indexedCount       Int             @default(0) @map("indexed_count")
+  downloadQueued     Int             @default(0) @map("download_queued")
+  downloadedCount    Int             @default(0) @map("downloaded_count")
+  dedupCount         Int             @default(0) @map("dedup_count")
+  diskUsedPercent    Decimal?        @map("disk_used_percent") @db.Decimal(5, 2)
+  inflightBytes      BigInt?         @map("inflight_bytes")
+  bandwidthMbps      Decimal?        @map("bandwidth_mbps") @db.Decimal(10, 2)
+  createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  task               CloneCrawlTask  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, createdAt(sort: Desc)])
+  @@map("clone_crawl_runs")
+}
+
+model CloneCrawlItem {
+  id                 BigInt              @id @default(autoincrement())
+  taskId             BigInt              @map("task_id")
+  runId              BigInt              @map("run_id")
+  channelUsername    String              @map("channel_username") @db.VarChar(128)
+  messageId          BigInt              @map("message_id")
+  messageDate        DateTime?           @map("message_date") @db.Timestamptz(6)
+  messageText        String?             @map("message_text")
+  hasVideo           Boolean             @default(false) @map("has_video")
+  fileSize           BigInt?             @map("file_size")
+  mimeType           String?             @map("mime_type") @db.VarChar(64)
+  contentHash        String?             @map("content_hash") @db.VarChar(128)
+  localPath          String?             @map("local_path") @db.VarChar(512)
+  downloadStatus     CloneDownloadStatus @default(none) @map("download_status")
+  downloadErrorCode  String?             @map("download_error_code") @db.VarChar(64)
+  downloadError      String?             @map("download_error")
+  retryCount         Int                 @default(0) @map("retry_count")
+  createdAt          DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([channelUsername, messageId])
+  @@index([taskId, runId])
+  @@index([downloadStatus])
+  @@map("clone_crawl_items")
+}
+
+enum CloneAccountType {
+  user
+}
+
+enum CloneAccountStatus {
+  active
+  invalid
+  expired
+}
+
+enum CloneTaskStatus {
+  draft
+  running
+  paused
+  failed
+  partial_success
+  completed
+}
+
+enum CloneScheduleType {
+  once
+  hourly
+  daily
+}
+
+enum CloneCrawlMode {
+  index_only
+  index_and_download
+}
+
+enum CloneTargetPathType {
+  channel_path
+  collection_path
+}
+
+enum CloneChannelAccessStatus {
+  ok
+  private
+  not_found
+  invalid
+}
+
+enum CloneRunStatus {
+  pending
+  running
+  success
+  failed
+  partial_success
+}
+
+enum CloneDownloadStatus {
+  none
+  queued
+  downloading
+  downloaded
+  failed_retryable
+  failed_final
+  paused_by_guard
+}

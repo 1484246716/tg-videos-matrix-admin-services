@@ -14,6 +14,26 @@
             "date": 1775416757955,
             "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-04-06.log",
             "hash": "ad0f7982ce1fae0b65dbb01c63a77ba3abd8abb7820be4c44c81463dddb671dc"
+        },
+        {
+            "date": 1775503581236,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-04-07.log",
+            "hash": "7ce92017db6b03f06cda39269cab964f4f7df58401546a0dd762e5a0937b7f88"
+        },
+        {
+            "date": 1775588988044,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-04-08.log",
+            "hash": "84d152d1c5f52e0f9bbba6890b9b97400e38ee208aa1aae56b5d8e47a632b7df"
+        },
+        {
+            "date": 1775716726142,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-04-09.log",
+            "hash": "8385441b8b0db15a1ddf51c5239871985434d409459442dc7a4aaf45d19eb0f2"
+        },
+        {
+            "date": 1775763624106,
+            "name": "D:\\Project\\tg-videos-matrix\\apps\\api\\logs\\api-2026-04-10.log",
+            "hash": "3706516e259314321f9772fcf52c6b5e4d9070b5cb12ee1c0e0f3cc4a5826ff3"
         }
     ],
     "hashType": "sha256"

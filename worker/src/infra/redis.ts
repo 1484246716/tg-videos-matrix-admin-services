@@ -30,3 +30,19 @@ export const searchIndexQueue = new Queue('q_search_index', {
 export const collectionSnapshotQueue = new Queue('q_collection_snapshot', {
   connection: connection as any,
 });
+
+export const cloneCrawlScheduleQueue = new Queue('q_clone_crawl_schedule', {
+  connection: connection as any,
+});
+
+export const cloneChannelIndexQueue = new Queue('q_clone_channel_index', {
+  connection: connection as any,
+});
+
+export const cloneVideoDownloadQueue = new Queue('q_clone_video_download', {
+  connection: connection as any,
+});
+
+export const cloneRetryQueue = new Queue('q_clone_retry', {
+  connection: connection as any,
+});

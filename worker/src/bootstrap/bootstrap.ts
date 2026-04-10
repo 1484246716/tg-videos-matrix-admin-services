@@ -6,6 +6,10 @@ import {
   relayUploadQueue,
   massMessageQueue,
   searchIndexQueue,
+  cloneCrawlScheduleQueue,
+  cloneChannelIndexQueue,
+  cloneVideoDownloadQueue,
+  cloneRetryQueue,
 } from '../infra/redis';
 import { ensureWorkerPrismaModels, logWorkerDatabaseFingerprint } from '../infra/prisma';
 import { logger, logError } from '../logger';
@@ -23,6 +27,10 @@ import '../workers/catalog.worker';
 import '../workers/mass-message.worker';
 import '../workers/search-index.worker';
 import '../workers/collection-snapshot.worker';
+import '../clone-channels/workers/clone-crawl-schedule.worker';
+import '../clone-channels/workers/clone-channel-index.worker';
+import '../clone-channels/workers/clone-video-download.worker';
+import '../clone-channels/workers/clone-retry.worker';
 
 async function drainStaleRelayJobs() {
   logger.info('[bootstrap] 正在清理过期的中转上传任务...');
@@ -93,6 +101,30 @@ export async function bootstrapWorker() {
     { removeOnComplete: true, removeOnFail: 100 },
   );
 
+  await cloneCrawlScheduleQueue.add(
+    'bootstrap-check',
+    { source: 'worker_startup', timestamp: new Date().toISOString() },
+    { removeOnComplete: true, removeOnFail: 100 },
+  );
+
+  await cloneChannelIndexQueue.add(
+    'bootstrap-check',
+    { source: 'worker_startup', timestamp: new Date().toISOString() },
+    { removeOnComplete: true, removeOnFail: 100 },
+  );
+
+  await cloneVideoDownloadQueue.add(
+    'bootstrap-check',
+    { source: 'worker_startup', timestamp: new Date().toISOString() },
+    { removeOnComplete: true, removeOnFail: 100 },
+  );
+
+  await cloneRetryQueue.add(
+    'bootstrap-check',
+    { source: 'worker_startup', timestamp: new Date().toISOString() },
+    { removeOnComplete: true, removeOnFail: 100 },
+  );
+
   await drainStaleRelayJobs();
 
   logger.info('[bootstrap] Telegram API 地址', { telegramApiBase });
@@ -124,6 +156,19 @@ export async function bootstrapWorker() {
     void scheduleCollectionSnapshotRefresh().catch((err) => {
       logError('[scheduler:collection-snapshot] 增量刷新调度异常', err);
     });
+
+    void cloneCrawlScheduleQueue
+      .add(
+        'clone-crawl-schedule-tick',
+        { source: 'polling_tick', runAt: new Date().toISOString() },
+        { removeOnComplete: true, removeOnFail: 100 },
+      )
+      .then(() => {
+        logger.info('[clone][调度/Scheduler] 已入队 crawl 调度任务 / crawl schedule tick enqueued');
+      })
+      .catch((err) => {
+        logError('[clone][调度/Scheduler] crawl 调度入队失败 / failed to enqueue crawl schedule tick', err);
+      });
   }, SCHEDULER_POLL_MS);
 
   logger.info(

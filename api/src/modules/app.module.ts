@@ -18,6 +18,7 @@ import { MassMessageCampaignModule } from './mass-message-campaign/mass-message-
 import { MassMessageItemModule } from './mass-message-item/mass-message-item.module';
 import { CollectionModule } from './collection/collection.module';
 import { SearchModule } from './search/search.module';
+import { CloneChannelsModule } from './clone-channels/clone-channels.module';
 
 @Module({
   imports: [
@@ -43,6 +44,7 @@ import { SearchModule } from './search/search.module';
     MassMessageItemModule,
     CollectionModule,
     SearchModule,
+    CloneChannelsModule,
   ],
 })
 export class AppModule { }

@@ -125,7 +125,10 @@ export const GRAMJS_API_HASH = process.env.GRAMJS_API_HASH || '';
 /** GramJS Bot Token */
 export const GRAMJS_BOT_TOKEN = process.env.GRAMJS_BOT_TOKEN || '';
 
-/** GramJS 会话串 */
+/** GramJS 用户会话串（推荐用于 clone 抓取） */
+export const GRAMJS_USER_SESSION = process.env.GRAMJS_USER_SESSION || '';
+
+/** GramJS 兼容会话串（历史变量，优先级低于 GRAMJS_USER_SESSION） */
 export const GRAMJS_SESSION = process.env.GRAMJS_SESSION || '';
 
 /** GramJS 转发目标聊天 ID */
