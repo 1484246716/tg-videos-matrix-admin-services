@@ -3,6 +3,7 @@ import path from 'node:path';
 import { prisma } from '../../infra/prisma';
 import {
   CLONE_DISK_FUSE_THRESHOLD,
+  CLONE_DOWNLOAD_CHANNEL_CONCURRENCY,
   CLONE_DOWNLOAD_GLOBAL_CONCURRENCY,
 } from '../constants/clone-queue.constants';
 import { logger } from '../../logger';
@@ -29,15 +30,21 @@ async function getDiskUsagePercent(targetPath?: string | null) {
 export async function collectRuntimeResourceSnapshot(params: {
   targetPath: string;
   channelUsername?: string;
+  excludeItemId?: bigint;
 }): Promise<ResourceSnapshot> {
   const diskUsagePercent = await getDiskUsagePercent(params.targetPath);
 
+  const baseDownloadingWhere = {
+    downloadStatus: 'downloading' as const,
+    ...(params.excludeItemId ? { id: { not: params.excludeItemId } } : {}),
+  };
+
   const [globalDownloadingCount, channelDownloadingCount] = await Promise.all([
-    prisma.cloneCrawlItem.count({ where: { downloadStatus: 'downloading' } }),
+    prisma.cloneCrawlItem.count({ where: baseDownloadingWhere }),
     params.channelUsername
       ? prisma.cloneCrawlItem.count({
           where: {
-            downloadStatus: 'downloading',
+            ...baseDownloadingWhere,
             channelUsername: params.channelUsername,
           },
         })
@@ -63,6 +70,7 @@ export async function checkDownloadGuards(params: {
   const snapshot = await collectRuntimeResourceSnapshot({
     targetPath: params.targetPath,
     channelUsername: params.channelUsername,
+    excludeItemId: params.itemId,
   });
 
   if (snapshot.diskUsagePercent >= CLONE_DISK_FUSE_THRESHOLD) {
@@ -73,10 +81,28 @@ export async function checkDownloadGuards(params: {
     };
   }
 
-  if (snapshot.globalDownloadingCount >= CLONE_DOWNLOAD_GLOBAL_CONCURRENCY) {
+  const taskConfig = await prisma.cloneCrawlTask.findUnique({
+    where: { id: params.taskId },
+    select: { globalDownloadConcurrency: true },
+  });
+
+  const globalLimit =
+    taskConfig?.globalDownloadConcurrency && taskConfig.globalDownloadConcurrency > 0
+      ? taskConfig.globalDownloadConcurrency
+      : CLONE_DOWNLOAD_GLOBAL_CONCURRENCY;
+
+  if (snapshot.globalDownloadingCount >= globalLimit) {
     return {
       pass: false,
       reason: 'global_concurrency_exceeded',
+      retryDelayMs: 10_000,
+    };
+  }
+
+  if (snapshot.channelDownloadingCount >= CLONE_DOWNLOAD_CHANNEL_CONCURRENCY) {
+    return {
+      pass: false,
+      reason: 'per_channel_concurrency_exceeded',
       retryDelayMs: 10_000,
     };
   }

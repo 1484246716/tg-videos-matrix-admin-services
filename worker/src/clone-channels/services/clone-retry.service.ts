@@ -1,4 +1,5 @@
 import { cloneChannelIndexQueue, cloneVideoDownloadQueue } from '../../infra/redis';
+import { prisma } from '../../infra/prisma';
 import { logger } from '../../logger';
 import {
   CLONE_RETRY_BASE_DELAY_MS,
@@ -32,6 +33,52 @@ function computeRetryDelayMs(params: {
   return Math.min(maxDelayMs, expDelay);
 }
 
+function getPayloadTaskId(job: CloneRetryJob): bigint | null {
+  const raw = (job.payload as { taskId?: unknown })?.taskId;
+  if (typeof raw !== 'string' && typeof raw !== 'number' && typeof raw !== 'bigint') return null;
+  try {
+    return BigInt(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function resolveRetryMax(job: CloneRetryJob) {
+  const taskId = getPayloadTaskId(job);
+  if (!taskId) return CLONE_RETRY_MAX;
+
+  const task = await prisma.cloneCrawlTask.findUnique({
+    where: { id: taskId },
+    select: { retryMax: true },
+  });
+
+  if (!task?.retryMax || task.retryMax < 0) return CLONE_RETRY_MAX;
+  return task.retryMax;
+}
+
+async function markDownloadExhaustedIfPossible(job: CloneRetryJob, reason: string, retryCount: number) {
+  if (job.queue !== 'download') return;
+
+  const rawItemId = (job.payload as { itemId?: unknown })?.itemId;
+  if (typeof rawItemId !== 'string' && typeof rawItemId !== 'number' && typeof rawItemId !== 'bigint') return;
+
+  let itemId: bigint;
+  try {
+    itemId = BigInt(rawItemId);
+  } catch {
+    return;
+  }
+
+  await prisma.cloneCrawlItem.updateMany({
+    where: { id: itemId },
+    data: {
+      downloadStatus: 'failed_final',
+      downloadErrorCode: 'retry_exhausted',
+      downloadError: `retry exhausted after ${retryCount} attempts, last_reason=${reason}`,
+    },
+  });
+}
+
 export async function processCloneRetry(job: CloneRetryJob) {
   const retryCount = Math.max(0, job.retryCount ?? 0);
 
@@ -45,11 +92,15 @@ export async function processCloneRetry(job: CloneRetryJob) {
     return;
   }
 
-  if (retryCount >= CLONE_RETRY_MAX) {
+  const retryMax = await resolveRetryMax(job);
+
+  if (retryCount >= retryMax) {
+    await markDownloadExhaustedIfPossible(job, String(job.reason), retryCount);
     logger.warn('[clone] retry exhausted', {
       queue: job.queue,
       reason: job.reason,
       retryCount,
+      retryMax,
     });
     return;
   }
@@ -80,6 +131,7 @@ export async function processCloneRetry(job: CloneRetryJob) {
     queue: job.queue,
     reason: job.reason,
     retryCount: nextRetryCount,
+    retryMax,
     delayMs,
   });
 }

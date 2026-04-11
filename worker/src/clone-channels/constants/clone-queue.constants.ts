@@ -11,6 +11,12 @@ export const CLONE_DOWNLOAD_GLOBAL_CONCURRENCY = (() => {
   return Math.min(32, Math.floor(n));
 })();
 
+export const CLONE_DOWNLOAD_CHANNEL_CONCURRENCY = (() => {
+  const n = Number(process.env.CLONE_DOWNLOAD_CHANNEL_CONCURRENCY ?? '1');
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(8, Math.floor(n));
+})();
+
 export const CLONE_DISK_FUSE_THRESHOLD = (() => {
   const n = Number(process.env.CLONE_DISK_FUSE_THRESHOLD ?? '90');
   if (!Number.isFinite(n) || n < 50) return 90;
@@ -37,6 +43,12 @@ export const CLONE_DOWNLOAD_TIMEOUT_MS = (() => {
 
 export const CLONE_DOWNLOAD_VALIDATE_FFPROBE =
   process.env.CLONE_DOWNLOAD_VALIDATE_FFPROBE === 'true';
+
+export const CLONE_DOWNLOAD_STRICT_VIDEO_ONLY =
+  process.env.CLONE_DOWNLOAD_STRICT_VIDEO_ONLY !== 'false';
+
+export const CLONE_DOWNLOAD_ALLOW_OPAQUE_FALLBACK =
+  process.env.CLONE_DOWNLOAD_ALLOW_OPAQUE_FALLBACK === 'true';
 
 export const CLONE_RETRY_BASE_DELAY_MS = (() => {
   const n = Number(process.env.CLONE_RETRY_BASE_DELAY_MS ?? '1000');

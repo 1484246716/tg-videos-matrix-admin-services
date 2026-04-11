@@ -9,6 +9,7 @@ import {
   cloneCrawlScheduleQueue,
   cloneChannelIndexQueue,
   cloneVideoDownloadQueue,
+  cloneGuardWaitQueue,
   cloneRetryQueue,
 } from '../infra/redis';
 import { ensureWorkerPrismaModels, logWorkerDatabaseFingerprint } from '../infra/prisma';
@@ -21,6 +22,7 @@ import { reconcileTypeAStuckAssets } from '../services/typea-reconcile.service';
 import { auditTypeAHealth } from '../services/typea-audit.service';
 import { enqueueChangedCollectionEpisodes } from '../services/search-index-trigger.service';
 import { TYPEA_RECONCILE_ENABLED } from '../config/env';
+import { auditCloneHealth } from '../clone-channels/services/clone-audit.service';
 import '../workers/dispatch.worker';
 import '../workers/relay-upload.worker';
 import '../workers/catalog.worker';
@@ -30,6 +32,7 @@ import '../workers/collection-snapshot.worker';
 import '../clone-channels/workers/clone-crawl-schedule.worker';
 import '../clone-channels/workers/clone-channel-index.worker';
 import '../clone-channels/workers/clone-video-download.worker';
+import '../clone-channels/workers/clone-guard-wait.worker';
 import '../clone-channels/workers/clone-retry.worker';
 
 async function drainStaleRelayJobs() {
@@ -119,6 +122,12 @@ export async function bootstrapWorker() {
     { removeOnComplete: true, removeOnFail: 100 },
   );
 
+  await cloneGuardWaitQueue.add(
+    'bootstrap-check',
+    { source: 'worker_startup', timestamp: new Date().toISOString() },
+    { removeOnComplete: true, removeOnFail: 100 },
+  );
+
   await cloneRetryQueue.add(
     'bootstrap-check',
     { source: 'worker_startup', timestamp: new Date().toISOString() },
@@ -155,6 +164,10 @@ export async function bootstrapWorker() {
 
     void scheduleCollectionSnapshotRefresh().catch((err) => {
       logError('[scheduler:collection-snapshot] 增量刷新调度异常', err);
+    });
+
+    void auditCloneHealth().catch((err) => {
+      logError('[scheduler:clone-audit] 巡检快照异常', err);
     });
 
     void cloneCrawlScheduleQueue

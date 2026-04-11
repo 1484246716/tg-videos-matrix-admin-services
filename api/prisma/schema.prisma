@@ -774,6 +774,9 @@ model CloneCrawlTask {
   scheduleType              CloneScheduleType      @default(once) @map("schedule_type")
   scheduleCron              String?                @map("schedule_cron") @db.VarChar(64)
   timezone                  String                 @default("Asia/Shanghai") @db.VarChar(64)
+  dailyRunTime              String?                @map("daily_run_time") @db.VarChar(5)
+  nextRunAt                 DateTime?              @map("next_run_at") @db.Timestamptz(6)
+  lastRunAt                 DateTime?              @map("last_run_at") @db.Timestamptz(6)
   crawlMode                 CloneCrawlMode         @default(index_only) @map("crawl_mode")
   contentTypes              String[]               @default([]) @map("content_types")
   recentLimit               Int                    @default(100) @map("recent_limit")
@@ -789,6 +792,7 @@ model CloneCrawlTask {
   channels                  CloneCrawlTaskChannel[]
   runs                      CloneCrawlRun[]
 
+  @@index([status, nextRunAt])
   @@index([status, updatedAt(sort: Desc)])
   @@map("clone_crawl_tasks")
 }

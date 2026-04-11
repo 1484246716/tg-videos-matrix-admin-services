@@ -31,6 +31,8 @@ export type CloneVideoDownloadJob = {
   channelUsername?: string;
   mediaRef?: CloneMediaRef;
   expectedFileSize?: string;
+  expectedMimeType?: string;
+  expectedFileName?: string;
   targetPath?: string;
   priority?: CloneVideoDownloadPriority;
   enqueuedAt?: string;

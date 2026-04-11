@@ -18,6 +18,34 @@ export const SCHEDULER_POLL_MS = (() => {
   return Math.floor(n);
 })();
 
+/** Clone 调度每次处理的到点任务上限 */
+export const CLONE_SCHEDULER_DUE_BATCH_SIZE = (() => {
+  const n = Number(process.env.CLONE_SCHEDULER_DUE_BATCH_SIZE ?? '20');
+  if (!Number.isFinite(n) || n < 1) return 20;
+  return Math.min(200, Math.floor(n));
+})();
+
+/** Clone hourly 任务抖动（秒） */
+export const CLONE_HOURLY_JITTER_SEC = (() => {
+  const n = Number(process.env.CLONE_HOURLY_JITTER_SEC ?? '120');
+  if (!Number.isFinite(n) || n < 0) return 120;
+  return Math.min(1800, Math.floor(n));
+})();
+
+/** Clone daily 任务抖动（秒） */
+export const CLONE_DAILY_JITTER_SEC = (() => {
+  const n = Number(process.env.CLONE_DAILY_JITTER_SEC ?? '120');
+  if (!Number.isFinite(n) || n < 0) return 120;
+  return Math.min(1800, Math.floor(n));
+})();
+
+/** Clone daily 默认触发时刻（HH:mm） */
+export const CLONE_DAILY_DEFAULT_TIME = (process.env.CLONE_DAILY_DEFAULT_TIME || '00:00').trim() || '00:00';
+
+/** Clone 是否启用 nextRunAt 调度（灰度开关） */
+export const CLONE_SCHEDULE_USE_NEXT_RUN_AT =
+  process.env.CLONE_SCHEDULE_USE_NEXT_RUN_AT !== 'false';
+
 /** 单次调度扫描最大任务数 */
 export const MAX_SCHEDULE_BATCH = 100;
 

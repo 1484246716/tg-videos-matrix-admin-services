@@ -119,6 +119,13 @@ export class CloneChannelsService {
     return BigInt(id);
   }
 
+  private computeInitialNextRunAt(scheduleType: 'once' | 'hourly' | 'daily') {
+    if (scheduleType === 'once') return new Date();
+    if (scheduleType === 'hourly') return new Date();
+    if (scheduleType === 'daily') return new Date();
+    return new Date();
+  }
+
   async createTask(dto: CreateCloneTaskDto, userId: string) {
     await this.assertHasActiveCrawlAccount();
 
@@ -127,12 +134,16 @@ export class CloneChannelsService {
       throw new BadRequestException('channels must contain at least one valid item');
     }
 
+    const scheduleType = dto.scheduleType ?? 'once';
+
     const created = await this.taskModel.create({
       data: {
         name: dto.name,
-        scheduleType: dto.scheduleType ?? 'once',
+        scheduleType,
         scheduleCron: dto.scheduleCron,
         timezone: dto.timezone ?? 'Asia/Shanghai',
+        dailyRunTime: dto.dailyRunTime,
+        nextRunAt: this.computeInitialNextRunAt(scheduleType),
         crawlMode: dto.crawlMode ?? 'index_only',
         contentTypes: dto.contentTypes ?? ['text', 'image', 'video'],
         recentLimit: dto.recentLimit ?? 100,
@@ -211,6 +222,8 @@ export class CloneChannelsService {
           scheduleType: dto.scheduleType,
           scheduleCron: dto.scheduleCron,
           timezone: dto.timezone,
+          dailyRunTime: dto.dailyRunTime,
+          nextRunAt: dto.status === 'running' ? new Date() : undefined,
           recentLimit: dto.recentLimit,
           crawlMode: dto.crawlMode,
           contentTypes: dto.contentTypes,
@@ -244,7 +257,7 @@ export class CloneChannelsService {
     await this.getTask(id);
     const updated = await this.taskModel.update({
       where: { id: taskId },
-      data: { status: 'paused' },
+      data: { status: 'paused', nextRunAt: null },
       select: { id: true, status: true, updatedAt: true },
     });
 
@@ -256,7 +269,7 @@ export class CloneChannelsService {
     await this.getTask(id);
     const updated = await this.taskModel.update({
       where: { id: taskId },
-      data: { status: 'running' },
+      data: { status: 'running', nextRunAt: new Date() },
       select: { id: true, status: true, updatedAt: true },
     });
 
@@ -271,7 +284,7 @@ export class CloneChannelsService {
 
     await this.taskModel.update({
       where: { id: taskId },
-      data: { status: 'running' },
+      data: { status: 'running', nextRunAt: new Date() },
     });
 
     return this.serializeBigInt({
@@ -523,7 +536,7 @@ export class CloneChannelsService {
 
     const updated = await this.taskModel.updateMany({
       where: { id: { in: parsedIds } },
-      data: { status: 'running' },
+      data: { status: 'running', nextRunAt: new Date() },
     });
 
     return { resumed: updated.count };
@@ -537,7 +550,7 @@ export class CloneChannelsService {
 
     const updated = await this.taskModel.updateMany({
       where: { id: { in: parsedIds } },
-      data: { status: 'paused' },
+      data: { status: 'paused', nextRunAt: null },
     });
 
     return { paused: updated.count };
@@ -549,25 +562,12 @@ export class CloneChannelsService {
       throw new BadRequestException('ids is required');
     }
 
-    let queued = 0;
-    for (const taskId of parsedIds) {
-      await this.prisma.cloneCrawlRun.create({
-        data: {
-          taskId,
-          status: 'pending',
-          startedAt: new Date(),
-        },
-      });
+    const updated = await this.taskModel.updateMany({
+      where: { id: { in: parsedIds } },
+      data: { status: 'running', nextRunAt: new Date() },
+    });
 
-      await this.taskModel.update({
-        where: { id: taskId },
-        data: { status: 'running' },
-      });
-
-      queued += 1;
-    }
-
-    return { queued };
+    return { queued: updated.count };
   }
 
   async batchRetryFailed(ids: string[]) {

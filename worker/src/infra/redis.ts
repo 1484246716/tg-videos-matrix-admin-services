@@ -43,6 +43,10 @@ export const cloneVideoDownloadQueue = new Queue('q_clone_video_download', {
   connection: connection as any,
 });
 
+export const cloneGuardWaitQueue = new Queue('q_clone_download_guard_wait', {
+  connection: connection as any,
+});
+
 export const cloneRetryQueue = new Queue('q_clone_retry', {
   connection: connection as any,
 });

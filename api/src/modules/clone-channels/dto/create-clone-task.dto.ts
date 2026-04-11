@@ -33,6 +33,10 @@ export class CreateCloneTaskDto {
   timezone?: string;
 
   @IsOptional()
+  @IsString()
+  dailyRunTime?: string;
+
+  @IsOptional()
   @IsIn(CRAWL_MODES)
   crawlMode?: (typeof CRAWL_MODES)[number];
 

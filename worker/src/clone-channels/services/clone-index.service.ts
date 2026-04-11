@@ -1,3 +1,5 @@
+import { mkdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { prisma } from '../../infra/prisma';
 import { cloneRetryQueue, cloneVideoDownloadQueue } from '../../infra/redis';
 import { logger } from '../../logger';
@@ -9,6 +11,7 @@ import {
   IndexedMessageDTO,
 } from '../types/clone-queue.types';
 import { CLONE_RETRY_MAX } from '../constants/clone-queue.constants';
+import { markCloneTaskRunFinished } from './clone-task.service';
 
 function classifyRetryReason(err: unknown): CloneRetryReason {
   const message = err instanceof Error ? err.message.toLowerCase() : '';
@@ -35,6 +38,42 @@ function parseContentTypes(raw: string[] | CloneContentType[] | undefined): Clon
     .map((t) => String(t).toLowerCase())
     .filter((t): t is CloneContentType => allowed.includes(t as CloneContentType));
   return normalized.length ? Array.from(new Set(normalized)) : allowed;
+}
+
+function sanitizeFileName(name: string) {
+  return name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_').replace(/\s+/g, ' ').trim();
+}
+
+function resolveFileExtensionByMime(mimeType?: string | null) {
+  const normalized = (mimeType ?? '').toLowerCase();
+  if (normalized === 'video/mp4') return '.mp4';
+  if (normalized === 'video/webm') return '.webm';
+  if (normalized === 'video/x-matroska' || normalized === 'video/mkv') return '.mkv';
+  return '.mp4';
+}
+
+function resolveVideoBaseName(channelUsername: string, messageId: bigint, mimeType?: string | null) {
+  const channelBase = channelUsername.replace(/^@/, '');
+  const stem = sanitizeFileName(`${channelBase}-${messageId.toString()}`) || 'video';
+  return `${stem}${resolveFileExtensionByMime(mimeType)}`;
+}
+
+async function persistVideoMessageText(params: {
+  targetPath: string;
+  channelUsername: string;
+  messageId: bigint;
+  mimeType?: string | null;
+  messageText?: string;
+}) {
+  const content = (params.messageText ?? '').trim();
+  if (!content) return;
+
+  await mkdir(params.targetPath, { recursive: true });
+
+  const videoName = resolveVideoBaseName(params.channelUsername, params.messageId, params.mimeType);
+  const stem = videoName.replace(/\.(mp4|mkv|webm)$/i, '');
+  const txtPath = path.join(params.targetPath, `${stem}.txt`);
+  await writeFile(txtPath, content, 'utf8');
 }
 
 async function fetchIncrementalMessages(params: {
@@ -182,6 +221,16 @@ async function upsertIndexedItems(params: {
 
     inserted += 1;
 
+    if (row.hasVideo) {
+      await persistVideoMessageText({
+        targetPath: params.targetPath,
+        channelUsername: params.channelUsername,
+        messageId: row.messageId,
+        mimeType: row.mimeType,
+        messageText: row.messageText,
+      });
+    }
+
     if (params.crawlMode === 'index_and_download' && row.hasVideo) {
       await cloneVideoDownloadQueue.add(
         'clone-video-download',
@@ -198,6 +247,8 @@ async function upsertIndexedItems(params: {
               }
             : undefined,
           expectedFileSize: row.fileSize ? row.fileSize.toString() : undefined,
+          expectedMimeType: row.mimeType,
+          expectedFileName: resolveVideoBaseName(params.channelUsername, row.messageId, row.mimeType),
           targetPath: params.targetPath,
           priority:
             row.fileSize && row.fileSize > BigInt(1024 * 1024 * 1024)
@@ -257,6 +308,8 @@ export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
         targetPath: true,
         recentLimit: true,
         contentTypes: true,
+        scheduleType: true,
+        timezone: true,
       },
     });
 
@@ -333,19 +386,30 @@ export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
     const channelTotal = currentRun?.channelTotal ?? 0;
     const shouldFinish = channelTotal > 0 && nextChannelSuccess + (currentRun?.channelFailed ?? 0) >= channelTotal;
 
-    await prisma.cloneCrawlRun.update({
-      where: { id: runId },
-      data: {
-        status: shouldFinish ? 'success' : 'running',
-        indexedCount: { increment: inserted },
-        dedupCount: { increment: deduped },
-        channelSuccess: { increment: 1 },
-        finishedAt: shouldFinish ? new Date() : undefined,
-        downloadQueued:
-          task.crawlMode === 'index_and_download'
-            ? { increment: queuedDownloads }
-            : undefined,
-      },
+    await prisma.$transaction(async (tx) => {
+      await tx.cloneCrawlRun.update({
+        where: { id: runId },
+        data: {
+          status: shouldFinish ? 'success' : 'running',
+          indexedCount: { increment: inserted },
+          dedupCount: { increment: deduped },
+          channelSuccess: { increment: 1 },
+          finishedAt: shouldFinish ? new Date() : undefined,
+          downloadQueued:
+            task.crawlMode === 'index_and_download'
+              ? { increment: queuedDownloads }
+              : undefined,
+        },
+      });
+
+      if (shouldFinish) {
+        await markCloneTaskRunFinished({
+          taskId,
+          scheduleType: task.scheduleType,
+          timezone: task.timezone,
+          tx,
+        });
+      }
     });
 
     logger.info('[clone][索引/Index] 频道索引完成 / channel indexing done', {
@@ -407,12 +471,45 @@ export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
     });
 
     if (!shouldRetry) {
-      await prisma.cloneCrawlRun.updateMany({
+      const run = await prisma.cloneCrawlRun.findUnique({
         where: { id: runId },
-        data: {
-          status: 'failed',
-          channelFailed: { increment: 1 },
+        select: {
+          id: true,
+          channelTotal: true,
+          channelSuccess: true,
+          channelFailed: true,
+          task: {
+            select: {
+              id: true,
+              scheduleType: true,
+              timezone: true,
+            },
+          },
         },
+      });
+
+      const nextFailed = (run?.channelFailed ?? 0) + 1;
+      const total = run?.channelTotal ?? 0;
+      const shouldFinish = total > 0 && (run?.channelSuccess ?? 0) + nextFailed >= total;
+
+      await prisma.$transaction(async (tx) => {
+        await tx.cloneCrawlRun.updateMany({
+          where: { id: runId },
+          data: {
+            status: shouldFinish ? 'failed' : 'running',
+            channelFailed: { increment: 1 },
+            finishedAt: shouldFinish ? new Date() : undefined,
+          },
+        });
+
+        if (shouldFinish && run?.task) {
+          await markCloneTaskRunFinished({
+            taskId: run.task.id,
+            scheduleType: run.task.scheduleType,
+            timezone: run.task.timezone,
+            tx,
+          });
+        }
       });
     }
 

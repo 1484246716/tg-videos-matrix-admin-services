@@ -47,6 +47,10 @@ export class UpdateCloneTaskDto {
   timezone?: string;
 
   @IsOptional()
+  @IsString()
+  dailyRunTime?: string;
+
+  @IsOptional()
   @IsInt()
   @Min(1)
   @Max(5000)

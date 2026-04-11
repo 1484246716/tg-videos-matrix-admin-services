@@ -1,7 +1,17 @@
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../infra/prisma';
 import { cloneChannelIndexQueue } from '../../infra/redis';
 import { logger } from '../../logger';
-import { CloneChannelIndexJob } from '../types/clone-queue.types';
+import {
+  CLONE_DAILY_DEFAULT_TIME,
+  CLONE_DAILY_JITTER_SEC,
+  CLONE_HOURLY_JITTER_SEC,
+  CLONE_SCHEDULE_USE_NEXT_RUN_AT,
+  CLONE_SCHEDULER_DUE_BATCH_SIZE,
+} from '../../config/env';
+import { CloneChannelIndexJob, CloneContentType } from '../types/clone-queue.types';
+
+type CloneScheduleType = 'once' | 'hourly' | 'daily';
 
 function normalizeChannelUsername(raw: string) {
   return raw.trim().replace(/^@+/, '').toLowerCase();
@@ -29,21 +39,168 @@ function buildCloneChannelIndexJobInput(params: {
       ? params.channel.lastFetchedMessageId.toString()
       : undefined,
     recentLimit: params.task.recentLimit,
-    contentTypes: (params.task.contentTypes ?? []) as any,
+    contentTypes: (params.task.contentTypes ?? []) as CloneContentType[],
     enqueuedAt: new Date().toISOString(),
     retryCount: 0,
   };
 }
 
-export async function scheduleCloneTasks() {
-  const tasks = await prisma.cloneCrawlTask.findMany({
-    where: { status: { in: ['running'] } },
-    include: { channels: true },
-    take: 20,
+function parseDailyRunTime(raw?: string | null) {
+  const fallback = CLONE_DAILY_DEFAULT_TIME;
+  const source = (raw ?? fallback).trim();
+  const m = source.match(/^(\d{2}):(\d{2})$/);
+  if (!m) return { hour: 0, minute: 0 };
+  const hour = Number(m[1]);
+  const minute = Number(m[2]);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return { hour: 0, minute: 0 };
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return { hour: 0, minute: 0 };
+  return { hour, minute };
+}
+
+function applyJitter(date: Date, maxJitterSec: number) {
+  if (!Number.isFinite(maxJitterSec) || maxJitterSec <= 0) return date;
+  const jitterMs = Math.floor(Math.random() * (Math.floor(maxJitterSec) + 1)) * 1000;
+  return new Date(date.getTime() + jitterMs);
+}
+
+function zonedDateParts(date: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+
+  const get = (type: string) => Number(parts.find((p) => p.type === type)?.value || '0');
+
+  return {
+    year: get('year'),
+    month: get('month'),
+    day: get('day'),
+    hour: get('hour'),
+    minute: get('minute'),
+    second: get('second'),
+  };
+}
+
+function zonedLocalToUtc(datePart: { year: number; month: number; day: number }, hour: number, minute: number, timeZone: string) {
+  const baseUtc = Date.UTC(datePart.year, datePart.month - 1, datePart.day, hour, minute, 0, 0);
+  const probe = new Date(baseUtc);
+  const probeParts = zonedDateParts(probe, timeZone);
+  const probeAsUtc = Date.UTC(
+    probeParts.year,
+    probeParts.month - 1,
+    probeParts.day,
+    probeParts.hour,
+    probeParts.minute,
+    probeParts.second,
+    0,
+  );
+  const targetAsUtc = Date.UTC(datePart.year, datePart.month - 1, datePart.day, hour, minute, 0, 0);
+  const offsetMs = probeAsUtc - baseUtc;
+  return new Date(targetAsUtc - offsetMs);
+}
+
+export function computeCloneTaskNextRunAt(params: {
+  scheduleType: CloneScheduleType;
+  timezone: string;
+  dailyRunTime?: string | null;
+  from?: Date;
+}): Date | null {
+  const now = params.from ?? new Date();
+
+  if (params.scheduleType === 'once') {
+    return null;
+  }
+
+  if (params.scheduleType === 'hourly') {
+    return applyJitter(new Date(now.getTime() + 60 * 60 * 1000), CLONE_HOURLY_JITTER_SEC);
+  }
+
+  const timeZone = params.timezone || 'Asia/Shanghai';
+  const { hour, minute } = parseDailyRunTime(params.dailyRunTime);
+  const nowZoned = zonedDateParts(now, timeZone);
+
+  const isAfterTodaySlot =
+    nowZoned.hour > hour ||
+    (nowZoned.hour === hour && nowZoned.minute > minute) ||
+    (nowZoned.hour === hour && nowZoned.minute === minute && nowZoned.second > 0);
+
+  const localDate = new Date(Date.UTC(nowZoned.year, nowZoned.month - 1, nowZoned.day));
+  if (isAfterTodaySlot) {
+    localDate.setUTCDate(localDate.getUTCDate() + 1);
+  }
+
+  const target = zonedLocalToUtc(
+    {
+      year: localDate.getUTCFullYear(),
+      month: localDate.getUTCMonth() + 1,
+      day: localDate.getUTCDate(),
+    },
+    hour,
+    minute,
+    timeZone,
+  );
+
+  return applyJitter(target, CLONE_DAILY_JITTER_SEC);
+}
+
+export async function markCloneTaskRunFinished(params: {
+  taskId: bigint;
+  scheduleType: CloneScheduleType;
+  timezone: string;
+  dailyRunTime?: string | null;
+  tx?: Prisma.TransactionClient;
+}) {
+  const db = params.tx ?? prisma;
+  const nextRunAt = computeCloneTaskNextRunAt({
+    scheduleType: params.scheduleType,
+    timezone: params.timezone,
+    dailyRunTime: params.dailyRunTime,
   });
 
-  logger.info('[clone][任务调度/Task Scheduler] 扫描运行中任务 / scanning running tasks', {
-    totalTasks: tasks.length,
+  await (db as any).cloneCrawlTask.update({
+    where: { id: params.taskId },
+    data: {
+      lastRunAt: new Date(),
+      nextRunAt,
+      status: params.scheduleType === 'once' ? 'completed' : undefined,
+    },
+  });
+
+  logger.info('[clone][任务调度/Task Scheduler] 任务 nextRunAt 已推进 / task nextRunAt advanced', {
+    taskId: params.taskId.toString(),
+    scheduleType: params.scheduleType,
+    nextRunAt: nextRunAt?.toISOString() ?? null,
+  });
+}
+
+export async function scheduleCloneTasks() {
+  const now = new Date();
+
+  const dueWhere = CLONE_SCHEDULE_USE_NEXT_RUN_AT
+    ? {
+        status: { in: ['running'] as const },
+        nextRunAt: { lte: now },
+      }
+    : {
+        status: { in: ['running'] as const },
+      };
+
+  const tasks = await (prisma as any).cloneCrawlTask.findMany({
+    where: dueWhere,
+    include: { channels: true },
+    orderBy: CLONE_SCHEDULE_USE_NEXT_RUN_AT ? { nextRunAt: 'asc' } : { updatedAt: 'desc' },
+    take: CLONE_SCHEDULER_DUE_BATCH_SIZE,
+  });
+
+  logger.info('[clone][任务调度/Task Scheduler] 扫描到点任务 / scanning due tasks', {
+    dueCount: tasks.length,
+    batchSize: CLONE_SCHEDULER_DUE_BATCH_SIZE,
   });
 
   for (const task of tasks) {
@@ -86,26 +243,29 @@ export async function scheduleCloneTasks() {
       }
     }
 
-    if (task.scheduleType === 'once') {
-      const hasFinishedRun = await prisma.cloneCrawlRun.findFirst({
-        where: {
-          taskId: task.id,
-          status: { in: ['success', 'failed'] },
-        },
-        select: { id: true, status: true },
-        orderBy: { createdAt: 'desc' },
-      });
+    const acquireWhere = CLONE_SCHEDULE_USE_NEXT_RUN_AT
+      ? {
+          id: task.id,
+          status: 'running',
+          nextRunAt: { lte: now },
+        }
+      : {
+          id: task.id,
+          status: 'running',
+        };
 
-      if (hasFinishedRun) {
-        logger.info('[clone][任务调度/Task Scheduler] 跳过创建 run（once 任务已有完成态）/ skip run creation (once task already finished)', {
-          taskId: task.id.toString(),
-          taskName: task.name,
-          scheduleType: task.scheduleType,
-          lastFinishedRunId: hasFinishedRun.id.toString(),
-          lastFinishedRunStatus: hasFinishedRun.status,
-        });
-        continue;
-      }
+    const acquired = await (prisma as any).cloneCrawlTask.updateMany({
+      where: acquireWhere,
+      data: {
+        lastRunAt: now,
+      },
+    });
+
+    if (acquired.count < 1) {
+      logger.info('[clone][任务调度/Task Scheduler] 跳过创建 run（未抢占到执行权）/ skip run creation (not acquired)', {
+        taskId: task.id.toString(),
+      });
+      continue;
     }
 
     logger.info('[clone][任务调度/Task Scheduler] 准备创建 run / preparing run', {
@@ -163,6 +323,6 @@ export async function scheduleCloneTasks() {
   }
 
   logger.info('[clone][任务调度/Task Scheduler] 本轮调度完成 / scheduling tick finished', {
-    totalTasks: tasks.length,
+    dueCount: tasks.length,
   });
 }
