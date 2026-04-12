@@ -31,6 +31,17 @@ async function removeLocalDuplicateFile(filePath: string, mediaAssetId: string) 
   }
 }
 
+function parseGroupedMeta(filePath: string) {
+  const normalized = filePath.replace(/\\/g, '/');
+  const match = normalized.match(/\/(grouped-\d+|single-\d+)\//i);
+  if (!match || !match[1]) return null;
+  const groupKey = match[1];
+  const groupedId = groupKey.toLowerCase().startsWith('grouped-')
+    ? groupKey.slice('grouped-'.length)
+    : null;
+  return { groupKey, groupedId };
+}
+
 function parseCollectionMeta(filePath: string) {
   const normalizedFile = filePath.replace(/\\/g, '/');
   const marker = '/collection/';
@@ -117,6 +128,9 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
   let createdAssets = 0;
   let enqueuedTasks = 0;
   let rejectedTooLarge = 0;
+  let groupedDiscovered = 0;
+  const groupedKeys = new Set<string>();
+  let textDirectTypeBCount = 0;
 
   for (const channel of channels) {
     let files: string[] = [];
@@ -261,6 +275,13 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
       const fileHash = await hashFile(filePath);
       const hashDurationMs = Date.now() - hashStart;
       const collectionMeta = parseCollectionMeta(filePath);
+      const groupedMeta = parseGroupedMeta(filePath);
+      if (groupedMeta?.groupKey) {
+        groupedDiscovered += 1;
+        groupedKeys.add(groupedMeta.groupKey);
+      }
+      const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+      const isTextOnlyCandidate = ext === 'txt' && !!groupedMeta;
 
       if (collectionMeta?.episodeParseFailed) {
         logger.warn('[relay] 合集集号解析失败，等待重命名后重扫', {
@@ -333,6 +354,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
                 sourceMeta: {
                   ...sourceMetaExisted,
                   ...(collectionMeta ?? {}),
+                ...(groupedMeta ?? {}),
                   episodeConflict: true,
                   episodeConflictPolicy: 'block',
                   episodeConflictAssetIds: conflictIds,
@@ -389,6 +411,19 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
           fileSize: s.size,
           durationMs: hashDurationMs,
         });
+      }
+
+      if (isTextOnlyCandidate) {
+        logger.info('[typea_group] text-only group candidate detected, route to typeb directly', {
+          channelId: channel.id.toString(),
+          filePath,
+          groupKey: groupedMeta?.groupKey ?? null,
+          groupedId: groupedMeta?.groupedId ?? null,
+          routeMode: 'text_direct_typeb',
+        });
+
+        textDirectTypeBCount += 1;
+        continue;
       }
 
       let asset = await prisma.mediaAsset.findFirst({
@@ -627,6 +662,9 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
     createdAssets,
     enqueuedTasks,
     rejectedTooLarge,
+    textDirectTypeBCount,
+    groupedDiscovered,
+    groupedDistinct: groupedKeys.size,
     relayChannelId: definition.relayChannelId.toString(),
   };
 }

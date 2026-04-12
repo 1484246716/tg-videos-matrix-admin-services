@@ -357,7 +357,7 @@ export class CloneChannelsService {
     const rows = await this.prisma.cloneCrawlItem.findMany({
       where: {
         downloadStatus: {
-          in: ['queued', 'downloading', 'failed_retryable', 'failed_final', 'paused_by_guard'],
+          in: ['queued', 'downloading', 'downloaded', 'failed_retryable', 'failed_final', 'paused_by_guard'],
         },
       },
       orderBy: { updatedAt: 'desc' },

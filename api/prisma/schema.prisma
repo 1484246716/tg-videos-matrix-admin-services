@@ -430,6 +430,7 @@ model DispatchTask {
   id                   BigInt            @id @default(autoincrement())
   channelId            BigInt            @map("channel_id")
   mediaAssetId         BigInt            @map("media_asset_id")
+  groupKey             String?           @map("group_key") @db.VarChar(128)
   botId                BigInt?           @map("bot_id")
   scheduleSlot         DateTime          @map("schedule_slot") @db.Timestamptz(6)
   plannedAt            DateTime          @map("planned_at") @db.Timestamptz(6)
@@ -455,6 +456,7 @@ model DispatchTask {
   riskEvents           RiskEvent[]
 
   @@unique([channelId, mediaAssetId, scheduleSlot])
+  @@unique([channelId, scheduleSlot, groupKey])
   @@index([status, nextRunAt])
   @@index([channelId, status])
   @@map("dispatch_tasks")
@@ -848,6 +850,8 @@ model CloneCrawlItem {
   runId              BigInt              @map("run_id")
   channelUsername    String              @map("channel_username") @db.VarChar(128)
   messageId          BigInt              @map("message_id")
+  groupedId          String?             @map("grouped_id") @db.VarChar(128)
+  groupKey           String?             @map("group_key") @db.VarChar(128)
   messageDate        DateTime?           @map("message_date") @db.Timestamptz(6)
   messageText        String?             @map("message_text")
   hasVideo           Boolean             @default(false) @map("has_video")
@@ -856,6 +860,14 @@ model CloneCrawlItem {
   contentHash        String?             @map("content_hash") @db.VarChar(128)
   localPath          String?             @map("local_path") @db.VarChar(512)
   downloadStatus     CloneDownloadStatus @default(none) @map("download_status")
+  downloadLeaseUntil DateTime?           @map("download_lease_until") @db.Timestamptz(6)
+  downloadHeartbeatAt DateTime?          @map("download_heartbeat_at") @db.Timestamptz(6)
+  downloadWorkerJobId String?            @map("download_worker_job_id") @db.VarChar(128)
+  downloadAttempt    Int                 @default(0) @map("download_attempt")
+  downloadRecoverCount Int               @default(0) @map("download_recover_count")
+  downloadProgressPct Int                @default(0) @map("download_progress_pct")
+  downloadedBytes    BigInt?             @map("downloaded_bytes")
+  downloadSpeedMbps  Decimal?            @map("download_speed_mbps") @db.Decimal(10, 2)
   downloadErrorCode  String?             @map("download_error_code") @db.VarChar(64)
   downloadError      String?             @map("download_error")
   retryCount         Int                 @default(0) @map("retry_count")
@@ -864,6 +876,7 @@ model CloneCrawlItem {
 
   @@unique([channelUsername, messageId])
   @@index([taskId, runId])
+  @@index([taskId, groupKey])
   @@index([downloadStatus])
   @@map("clone_crawl_items")
 }

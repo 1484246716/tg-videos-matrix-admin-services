@@ -1,4 +1,4 @@
-import { cloneChannelIndexQueue, cloneVideoDownloadQueue } from '../../infra/redis';
+import { cloneChannelIndexQueue, cloneMediaDownloadQueue } from '../../infra/redis';
 import { prisma } from '../../infra/prisma';
 import { logger } from '../../logger';
 import {
@@ -120,7 +120,7 @@ export async function processCloneRetry(job: CloneRetryJob) {
   }
 
   if (job.queue === 'download') {
-    await cloneVideoDownloadQueue.add('clone-video-download-retry', job.payload, {
+    await cloneMediaDownloadQueue.add('clone-media-download-retry', job.payload, {
       delay: delayMs,
       removeOnComplete: true,
       removeOnFail: 100,

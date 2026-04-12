@@ -82,32 +82,40 @@ export class DispatchService {
       );
     }
 
-    return this.prisma.dispatchTask.create({
-      data: {
-        channelId: BigInt(dto.channelId),
-        mediaAssetId: BigInt(dto.mediaAssetId),
-        botId: dto.botId ? BigInt(dto.botId) : undefined,
-        scheduleSlot,
-        plannedAt,
-        nextRunAt,
-        priority: dto.priority ?? 100,
-        maxRetries: dto.maxRetries ?? 6,
-      },
-      include: {
-        channel: {
-          select: {
-            id: true,
-            name: true,
+    try {
+      return await this.prisma.dispatchTask.create({
+        data: {
+          channelId: BigInt(dto.channelId),
+          mediaAssetId: BigInt(dto.mediaAssetId),
+          groupKey: dto.groupKey?.trim() || undefined,
+          botId: dto.botId ? BigInt(dto.botId) : undefined,
+          scheduleSlot,
+          plannedAt,
+          nextRunAt,
+          priority: dto.priority ?? 100,
+          maxRetries: dto.maxRetries ?? 6,
+        },
+        include: {
+          channel: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
+          mediaAsset: {
+            select: {
+              id: true,
+              originalName: true,
+            },
           },
         },
-        mediaAsset: {
-          select: {
-            id: true,
-            originalName: true,
-          },
-        },
-      },
-    });
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new BadRequestException('dispatch task duplicated by channel/schedule/groupKey constraint');
+      }
+      throw error;
+    }
   }
 
   async updateStatus(id: string, dto: UpdateDispatchTaskStatusDto) {

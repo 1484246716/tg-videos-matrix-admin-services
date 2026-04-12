@@ -8,7 +8,7 @@ import {
   searchIndexQueue,
   cloneCrawlScheduleQueue,
   cloneChannelIndexQueue,
-  cloneVideoDownloadQueue,
+  cloneMediaDownloadQueue,
   cloneGuardWaitQueue,
   cloneRetryQueue,
 } from '../infra/redis';
@@ -21,8 +21,9 @@ import { scheduleCollectionSnapshotRefresh } from '../scheduler/collection-snaps
 import { reconcileTypeAStuckAssets } from '../services/typea-reconcile.service';
 import { auditTypeAHealth } from '../services/typea-audit.service';
 import { enqueueChangedCollectionEpisodes } from '../services/search-index-trigger.service';
-import { TYPEA_RECONCILE_ENABLED } from '../config/env';
+import { TYPEA_RECONCILE_ENABLED, CLONE_DOWNLOAD_RECONCILE_ENABLED } from '../config/env';
 import { auditCloneHealth } from '../clone-channels/services/clone-audit.service';
+import { reconcileCloneDownloadStuck } from '../clone-channels/services/clone-download-reconcile.service';
 import '../workers/dispatch.worker';
 import '../workers/relay-upload.worker';
 import '../workers/catalog.worker';
@@ -116,7 +117,7 @@ export async function bootstrapWorker() {
     { removeOnComplete: true, removeOnFail: 100 },
   );
 
-  await cloneVideoDownloadQueue.add(
+  await cloneMediaDownloadQueue.add(
     'bootstrap-check',
     { source: 'worker_startup', timestamp: new Date().toISOString() },
     { removeOnComplete: true, removeOnFail: 100 },
@@ -169,6 +170,12 @@ export async function bootstrapWorker() {
     void auditCloneHealth().catch((err) => {
       logError('[scheduler:clone-audit] 巡检快照异常', err);
     });
+
+    if (CLONE_DOWNLOAD_RECONCILE_ENABLED) {
+      void reconcileCloneDownloadStuck().catch((err) => {
+        logError('[scheduler:clone-download-reconcile] 下载卡住纠偏异常', err);
+      });
+    }
 
     void cloneCrawlScheduleQueue
       .add(

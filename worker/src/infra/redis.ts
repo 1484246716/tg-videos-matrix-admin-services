@@ -39,7 +39,7 @@ export const cloneChannelIndexQueue = new Queue('q_clone_channel_index', {
   connection: connection as any,
 });
 
-export const cloneVideoDownloadQueue = new Queue('q_clone_video_download', {
+export const cloneMediaDownloadQueue = new Queue('q_clone_media_download', {
   connection: connection as any,
 });
 

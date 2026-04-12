@@ -3,9 +3,24 @@ import { cloneChannelIndexQueue, connection } from '../../infra/redis';
 import { logger, logError } from '../../logger';
 import { processCloneChannelIndex } from '../services/clone-index.service';
 
+function hasRequiredIndexPayload(data: any) {
+  const hasTaskId = typeof data?.taskId === 'string' || typeof data?.taskId === 'number' || typeof data?.taskId === 'bigint';
+  const hasRunId = typeof data?.runId === 'string' || typeof data?.runId === 'number' || typeof data?.runId === 'bigint';
+  const hasChannelUsername = typeof data?.channelUsername === 'string' && data.channelUsername.trim().length > 0;
+  return hasTaskId && hasRunId && hasChannelUsername;
+}
+
 export const cloneChannelIndexWorker = new Worker(
   cloneChannelIndexQueue.name,
   async (job) => {
+    if (!hasRequiredIndexPayload(job.data)) {
+      logger.warn('[clone-channel-index.worker] invalid payload skipped', {
+        jobId: job.id,
+        data: job.data,
+      });
+      return;
+    }
+
     const startedAt = Date.now();
     await processCloneChannelIndex(job.data);
     logger.info('[clone-channel-index.worker] job completed', {

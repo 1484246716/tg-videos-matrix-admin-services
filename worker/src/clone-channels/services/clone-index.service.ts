@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { prisma } from '../../infra/prisma';
-import { cloneRetryQueue, cloneVideoDownloadQueue } from '../../infra/redis';
+import { cloneRetryQueue, cloneMediaDownloadQueue } from '../../infra/redis';
 import { logger } from '../../logger';
 import { withClient } from './clone-session.service';
 import {
@@ -49,16 +49,29 @@ function resolveFileExtensionByMime(mimeType?: string | null) {
   if (normalized === 'video/mp4') return '.mp4';
   if (normalized === 'video/webm') return '.webm';
   if (normalized === 'video/x-matroska' || normalized === 'video/mkv') return '.mkv';
-  return '.mp4';
+  if (normalized === 'image/jpeg' || normalized === 'image/jpg') return '.jpg';
+  if (normalized === 'image/png') return '.png';
+  if (normalized === 'image/webp') return '.webp';
+  if (normalized === 'image/gif') return '.gif';
+  return '.bin';
 }
 
-function resolveVideoBaseName(channelUsername: string, messageId: bigint, mimeType?: string | null) {
+function resolveMediaBaseName(channelUsername: string, messageId: bigint, mimeType?: string | null) {
   const channelBase = channelUsername.replace(/^@/, '');
-  const stem = sanitizeFileName(`${channelBase}-${messageId.toString()}`) || 'video';
+  const stem = sanitizeFileName(`${channelBase}-${messageId.toString()}`) || 'media';
   return `${stem}${resolveFileExtensionByMime(mimeType)}`;
 }
 
-async function persistVideoMessageText(params: {
+function resolveGroupDirName(groupedId: string | undefined, messageId: bigint) {
+  if (groupedId && groupedId.trim()) return `grouped-${sanitizeFileName(groupedId.trim())}`;
+  return `single-${messageId.toString()}`;
+}
+
+function resolveGroupedTargetPath(baseTargetPath: string, groupedId: string | undefined, messageId: bigint) {
+  return path.join(baseTargetPath, resolveGroupDirName(groupedId, messageId));
+}
+
+async function persistMessageText(params: {
   targetPath: string;
   channelUsername: string;
   messageId: bigint;
@@ -70,8 +83,8 @@ async function persistVideoMessageText(params: {
 
   await mkdir(params.targetPath, { recursive: true });
 
-  const videoName = resolveVideoBaseName(params.channelUsername, params.messageId, params.mimeType);
-  const stem = videoName.replace(/\.(mp4|mkv|webm)$/i, '');
+  const mediaName = resolveMediaBaseName(params.channelUsername, params.messageId, params.mimeType);
+  const stem = mediaName.replace(/\.[^.]+$/i, '');
   const txtPath = path.join(params.targetPath, `${stem}.txt`);
   await writeFile(txtPath, content, 'utf8');
 }
@@ -84,22 +97,36 @@ async function fetchIncrementalMessages(params: {
 }): Promise<IndexedMessageDTO[]> {
   const { channelUsername, lastFetchedMessageId, recentLimit, contentTypes } = params;
 
-  const limit = Math.max(1, Math.min(1000, recentLimit || 100));
+  // recentLimit 按“消息组”计数：有 groupedId 的按 groupedId 归组；无 groupedId 视作单条独立组
+  const groupLimit = Math.max(1, Math.min(1000, recentLimit || 100));
+  const rawFetchLimit = Math.max(groupLimit, Math.min(1000, groupLimit * 8));
+
   logger.info('[clone][索引/Index] 开始拉取 Telegram 消息 / start fetch telegram messages', {
     channelUsername,
     lastFetchedMessageId: lastFetchedMessageId?.toString() ?? null,
-    limit,
+    groupLimit,
+    rawFetchLimit,
     contentTypes,
   });
 
   const messages = await withClient({ timeoutMs: 120_000, accountType: 'user' }, async (client) => {
     const entity = await (client as any).getEntity(channelUsername);
     const list = await (client as any).getMessages(entity, {
-      limit,
+      limit: rawFetchLimit,
       minId: lastFetchedMessageId ? Number(lastFetchedMessageId) : undefined,
     });
     return Array.isArray(list) ? list : [];
   });
+
+  const selectedGroupKeys = new Set<string>();
+  for (const msg of messages) {
+    if (selectedGroupKeys.size >= groupLimit) break;
+    const messageIdRaw = (msg as any)?.id;
+    if (!Number.isFinite(messageIdRaw)) continue;
+    const groupedId = (msg as any)?.groupedId ?? (msg as any)?.grouped_id;
+    const groupKey = groupedId != null ? `g:${String(groupedId)}` : `m:${String(messageIdRaw)}`;
+    selectedGroupKeys.add(groupKey);
+  }
 
   const picked: IndexedMessageDTO[] = [];
 
@@ -116,21 +143,30 @@ async function fetchIncrementalMessages(params: {
       continue;
     }
 
+    const groupedId = (msg as any)?.groupedId ?? (msg as any)?.grouped_id;
+    const groupKey = groupedId != null ? `g:${String(groupedId)}` : `m:${String(messageIdRaw)}`;
+    if (!selectedGroupKeys.has(groupKey)) {
+      skippedByType += 1;
+      continue;
+    }
+
     const messageText = ((msg as any)?.message ?? '') as string;
     const media = (msg as any)?.media;
     const document = (media as any)?.document;
+    const photo = (media as any)?.photo;
 
-    const mimeType = typeof document?.mimeType === 'string' ? document.mimeType : undefined;
+    const docMimeType = typeof document?.mimeType === 'string' ? document.mimeType : undefined;
     const maybeSize = Number(document?.size);
     const fileSize = Number.isFinite(maybeSize) && maybeSize > 0 ? BigInt(Math.floor(maybeSize)) : undefined;
 
     const hasVideo = Boolean(
-      mimeType?.toLowerCase().startsWith('video/') ||
+      docMimeType?.toLowerCase().startsWith('video/') ||
       ((document?.attributes ?? []) as any[]).some((attr) => String(attr?.className ?? '').toLowerCase().includes('video')),
     );
 
-    const hasImage = Boolean(mimeType?.toLowerCase().startsWith('image/'));
+    const hasImage = Boolean(docMimeType?.toLowerCase().startsWith('image/') || photo);
     const hasText = Boolean(messageText && messageText.trim().length > 0);
+    const mimeType = hasVideo ? docMimeType : hasImage ? docMimeType ?? 'image/jpeg' : docMimeType;
 
     let include = false;
     if (hasVideo && contentTypes.includes('video')) include = true;
@@ -146,8 +182,12 @@ async function fetchIncrementalMessages(params: {
     else if (hasImage) pickedImage += 1;
     else if (hasText) pickedText += 1;
 
+    const groupedIdString = groupedId != null ? String(groupedId) : undefined;
+
     picked.push({
       messageId: BigInt(Math.floor(messageIdRaw)),
+      groupedId: groupedIdString,
+      groupKey: groupedIdString ? `grouped-${groupedIdString}` : `single-${Math.floor(messageIdRaw)}`,
       messageDate: (msg as any)?.date ? new Date((msg as any).date) : undefined,
       messageText,
       hasVideo,
@@ -160,6 +200,8 @@ async function fetchIncrementalMessages(params: {
   logger.info('[clone][索引/Index] Telegram 消息过滤完成 / telegram message filtering done', {
     channelUsername,
     fetchedRaw: messages.length,
+    groupLimit,
+    selectedGroupCount: selectedGroupKeys.size,
     picked: picked.length,
     pickedVideo,
     pickedImage,
@@ -202,28 +244,33 @@ async function upsertIndexedItems(params: {
       continue;
     }
 
+    const isDownloadableMedia = row.hasVideo || (row.mimeType ?? '').toLowerCase().startsWith('image/');
+    const groupedTargetPath = resolveGroupedTargetPath(params.targetPath, row.groupedId, row.messageId);
+
     const item = await prisma.cloneCrawlItem.create({
       data: {
         taskId: params.taskId,
         runId: params.runId,
         channelUsername: params.channelUsername,
         messageId: row.messageId,
+        groupedId: row.groupedId,
+        groupKey: row.groupKey,
         messageDate: row.messageDate,
         messageText: row.messageText,
         hasVideo: row.hasVideo,
         fileSize: row.fileSize,
         mimeType: row.mimeType,
-        localPath: params.targetPath,
+        localPath: groupedTargetPath,
         downloadStatus:
-          params.crawlMode === 'index_and_download' && row.hasVideo ? 'queued' : 'none',
-      },
+          params.crawlMode === 'index_and_download' && isDownloadableMedia ? 'queued' : 'none',
+      } as any,
     });
 
     inserted += 1;
 
-    if (row.hasVideo) {
-      await persistVideoMessageText({
-        targetPath: params.targetPath,
+    if (row.messageText && row.messageText.trim()) {
+      await persistMessageText({
+        targetPath: groupedTargetPath,
         channelUsername: params.channelUsername,
         messageId: row.messageId,
         mimeType: row.mimeType,
@@ -231,9 +278,9 @@ async function upsertIndexedItems(params: {
       });
     }
 
-    if (params.crawlMode === 'index_and_download' && row.hasVideo) {
-      await cloneVideoDownloadQueue.add(
-        'clone-video-download',
+    if (params.crawlMode === 'index_and_download' && isDownloadableMedia) {
+      await cloneMediaDownloadQueue.add(
+        'clone-media-download',
         {
           taskId: params.taskId.toString(),
           runId: params.runId.toString(),
@@ -248,8 +295,10 @@ async function upsertIndexedItems(params: {
             : undefined,
           expectedFileSize: row.fileSize ? row.fileSize.toString() : undefined,
           expectedMimeType: row.mimeType,
-          expectedFileName: resolveVideoBaseName(params.channelUsername, row.messageId, row.mimeType),
-          targetPath: params.targetPath,
+          groupedId: row.groupedId,
+          groupKey: row.groupKey,
+          expectedFileName: resolveMediaBaseName(params.channelUsername, row.messageId, row.mimeType),
+          targetPath: groupedTargetPath,
           priority:
             row.fileSize && row.fileSize > BigInt(1024 * 1024 * 1024)
               ? 'large'
@@ -262,12 +311,13 @@ async function upsertIndexedItems(params: {
       );
 
       queuedDownloads += 1;
-      logger.info('[clone][索引/Index] 视频下载任务已入队 / video download job enqueued', {
+      logger.info('[clone][索引/Index] 媒体下载任务已入队 / media download job enqueued', {
         taskId: params.taskId.toString(),
         runId: params.runId.toString(),
         channelUsername: params.channelUsername,
         itemId: item.id.toString(),
-        queue: cloneVideoDownloadQueue.name,
+        mimeType: row.mimeType ?? null,
+        queue: cloneMediaDownloadQueue.name,
       });
     }
   }

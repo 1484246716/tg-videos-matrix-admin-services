@@ -39,26 +39,34 @@ export async function scheduleDueRelayUploadTasks() {
     },
   });
 
-  const groupedByChannel = new Map<string, typeof candidateAssets>();
+  const groupedByGroupKey = new Map<string, typeof candidateAssets>();
+  const groupSizeByKey = new Map<string, number>();
   for (const asset of candidateAssets) {
-    const key = asset.channelId.toString();
-    const bucket = groupedByChannel.get(key);
+    const sourceMeta = (asset.sourceMeta ?? {}) as Record<string, unknown>;
+    const groupKeyRaw = sourceMeta.groupKey;
+    const groupKey =
+      typeof groupKeyRaw === 'string' && groupKeyRaw.trim()
+        ? groupKeyRaw.trim()
+        : `asset-${asset.id.toString()}`;
+    const key = `${asset.channelId.toString()}::${groupKey}`;
+    const bucket = groupedByGroupKey.get(key);
     if (bucket) {
       bucket.push(asset);
     } else {
-      groupedByChannel.set(key, [asset]);
+      groupedByGroupKey.set(key, [asset]);
     }
+    groupSizeByKey.set(key, (groupSizeByKey.get(key) ?? 0) + 1);
   }
 
   const selectedAssets: typeof candidateAssets = [];
-  while (selectedAssets.length < MAX_SCHEDULE_BATCH && groupedByChannel.size > 0) {
-    for (const [key, bucket] of groupedByChannel) {
+  while (selectedAssets.length < MAX_SCHEDULE_BATCH && groupedByGroupKey.size > 0) {
+    for (const [key, bucket] of groupedByGroupKey) {
       const next = bucket.shift();
       if (next) {
         selectedAssets.push(next);
       }
       if (bucket.length === 0) {
-        groupedByChannel.delete(key);
+        groupedByGroupKey.delete(key);
       }
       if (selectedAssets.length >= MAX_SCHEDULE_BATCH) {
         break;
@@ -66,15 +74,43 @@ export async function scheduleDueRelayUploadTasks() {
     }
   }
 
+  const selectedGroups = new Map<string, typeof selectedAssets>();
+  for (const asset of selectedAssets) {
+    const sourceMeta = (asset.sourceMeta ?? {}) as Record<string, unknown>;
+    const groupKeyRaw = sourceMeta.groupKey;
+    const groupKey =
+      typeof groupKeyRaw === 'string' && groupKeyRaw.trim()
+        ? groupKeyRaw.trim()
+        : `asset-${asset.id.toString()}`;
+    const key = `${asset.channelId.toString()}::${groupKey}`;
+    const list = selectedGroups.get(key);
+    if (list) list.push(asset);
+    else selectedGroups.set(key, [asset]);
+  }
+
   let queuedCount = 0;
+  let groupedQueueJobs = 0;
+  let singleQueueJobs = 0;
   let staleRecoveredCount = 0;
   let failedFinalCount = 0;
 
-  for (const asset of selectedAssets) {
-    const sourceMeta = (asset.sourceMeta ?? {}) as Record<string, unknown>;
+  for (const [channelGroupKey, groupAssets] of selectedGroups) {
+    const head = groupAssets[0];
+    if (!head) continue;
+    const sourceMeta = (head.sourceMeta ?? {}) as Record<string, unknown>;
     const relayChannelId = sourceMeta.relayChannelId;
+    const groupKeyRaw = sourceMeta.groupKey;
+    const groupKey =
+      typeof groupKeyRaw === 'string' && groupKeyRaw.trim()
+        ? groupKeyRaw.trim()
+        : `asset-${head.id.toString()}`;
+
     if (typeof relayChannelId !== 'string' || !relayChannelId.trim()) continue;
 
+    const preparedAssetIds: string[] = [];
+
+    for (const asset of groupAssets) {
+    const sourceMeta = (asset.sourceMeta ?? {}) as Record<string, unknown>;
     const ingestRetryCountRaw = sourceMeta.ingestRetryCount;
     const ingestRetryCount =
       typeof ingestRetryCountRaw === 'number'
@@ -137,8 +173,19 @@ export async function scheduleDueRelayUploadTasks() {
 
     if (updated.count === 0) continue;
 
-    const jobId = `relay-upload-${asset.id.toString()}`;
-    const existingJob = await relayUploadQueue.getJob(jobId);
+      preparedAssetIds.push(asset.id.toString());
+    }
+
+    if (preparedAssetIds.length === 0) {
+      continue;
+    }
+
+    const isGroupedBatch = preparedAssetIds.length > 1;
+    const groupJobId = isGroupedBatch
+      ? `relay-upload-group-${channelGroupKey}`
+      : `relay-upload-${preparedAssetIds[0]}`;
+
+    const existingJob = await relayUploadQueue.getJob(groupJobId);
     if (existingJob) {
       const state = await existingJob.getState();
       if (state === 'failed') {
@@ -148,26 +195,51 @@ export async function scheduleDueRelayUploadTasks() {
       }
     }
 
-    await relayUploadQueue.add(
-      'relay-upload',
-      {
-        mediaAssetId: asset.id.toString(),
-        relayChannelId,
-      },
-      {
-        jobId,
-        removeOnComplete: true,
-        removeOnFail: 200,
-      },
-    );
-
-    queuedCount += 1;
+    if (isGroupedBatch) {
+      await relayUploadQueue.add(
+        'relay-upload-grouped',
+        {
+          relayChannelId,
+          groupKey,
+          groupBatchSize: preparedAssetIds.length,
+          groupDispatchMode: 'grouped_scan',
+          mediaAssetIds: preparedAssetIds,
+        },
+        {
+          jobId: groupJobId,
+          removeOnComplete: true,
+          removeOnFail: 200,
+        },
+      );
+      queuedCount += preparedAssetIds.length;
+      groupedQueueJobs += 1;
+    } else {
+      await relayUploadQueue.add(
+        'relay-upload',
+        {
+          mediaAssetId: preparedAssetIds[0],
+          relayChannelId,
+          groupKey,
+          groupBatchSize: 1,
+          groupDispatchMode: 'single_fallback',
+        },
+        {
+          jobId: groupJobId,
+          removeOnComplete: true,
+          removeOnFail: 200,
+        },
+      );
+      queuedCount += 1;
+      singleQueueJobs += 1;
+    }
   }
 
   logger.info('[typea_metrics] relay schedule tick', {
     typea_enqueue_total: queuedCount,
     typea_ingesting_stale_total: staleRecoveredCount,
     typea_failed_final_total: failedFinalCount,
+    typea_group_queue_jobs_total: groupedQueueJobs,
+    typea_single_queue_jobs_total: singleQueueJobs,
     task_run_total: queuedCount,
     task_failed_total: 0,
     task_dead_total: failedFinalCount,
@@ -175,6 +247,8 @@ export async function scheduleDueRelayUploadTasks() {
       typea_enqueue_total: 'TypeA 入队总数',
       typea_ingesting_stale_total: 'TypeA ingesting 超时回收总数',
       typea_failed_final_total: 'TypeA 失败终态总数',
+      typea_group_queue_jobs_total: 'TypeA 组级任务入队数',
+      typea_single_queue_jobs_total: 'TypeA 单条任务入队数',
     },
       mode: 'round_robin_by_channel',
     });
@@ -188,10 +262,14 @@ export async function scheduleRelayForDefinition(taskDefinitionId: bigint) {
       typea_scan_files_total: enqueueSummary.scannedFiles,
       typea_enqueue_total: enqueueSummary.enqueuedTasks,
       typea_rejected_too_large_total: enqueueSummary.rejectedTooLarge ?? 0,
+      typea_group_discovered_total: enqueueSummary.groupedDiscovered ?? 0,
+      typea_group_discovered_distinct_total: enqueueSummary.groupedDistinct ?? 0,
       metric_labels: {
         typea_scan_files_total: 'TypeA 扫描文件总数',
         typea_enqueue_total: 'TypeA 入队总数（扫描阶段）',
         typea_rejected_too_large_total: 'TypeA 超大小文件拒绝总数（扫描阶段）',
+        typea_group_discovered_total: 'TypeA grouped/single 扫描命中文件数',
+        typea_group_discovered_distinct_total: 'TypeA grouped/single 扫描命中组数',
       },
       taskDefinitionId: taskDefinitionId.toString(),
     });

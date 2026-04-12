@@ -11,6 +11,10 @@ export class CreateDispatchTaskDto {
   @IsString()
   botId?: string;
 
+  @IsOptional()
+  @IsString()
+  groupKey?: string;
+
   @IsString()
   scheduleSlot!: string;
 

@@ -703,6 +703,8 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
           select: {
             id: true,
             channelId: true,
+            originalName: true,
+            sourceMeta: true,
           },
           take: 200,
         }),
@@ -710,30 +712,68 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
     );
 
     let createdCount = 0;
+    let groupScheduledCount = 0;
     const now = new Date();
 
+    const grouped = new Map<string, typeof unscheduledAssets>();
     for (const asset of unscheduledAssets) {
-      await withPrismaRetry(
-        () =>
-          prisma.dispatchTask.create({
-            data: {
-              channelId: asset.channelId,
-              mediaAssetId: asset.id,
-              status: TaskStatus.pending,
-              scheduleSlot: now,
-              plannedAt: now,
-              nextRunAt: now,
-              priority: definition.priority ?? 100,
-            },
-            select: { id: true },
-          }),
-        { label: 'dispatch.scheduleDispatchForDefinition.createDispatchTask' },
-      );
+      const sourceMeta = (asset.sourceMeta ?? {}) as Record<string, unknown>;
+      const groupKeyRaw = sourceMeta.groupKey;
+      const groupKey =
+        typeof groupKeyRaw === 'string' && groupKeyRaw.trim()
+          ? groupKeyRaw.trim()
+          : `asset-${asset.id.toString()}`;
+      const key = `${asset.channelId.toString()}::${groupKey}`;
+      const bucket = grouped.get(key);
+      if (bucket) bucket.push(asset);
+      else grouped.set(key, [asset]);
+    }
 
-      createdCount += 1;
+    for (const [key, assets] of grouped) {
+      const [, groupKey] = key.split('::');
+      const sorted = [...assets].sort((a, b) =>
+        String(a.originalName || '').localeCompare(String(b.originalName || ''), 'zh-CN'),
+      );
+      if (sorted.length > 1) {
+        groupScheduledCount += 1;
+      }
+
+      for (let i = 0; i < sorted.length; i += 1) {
+        const asset = sorted[i];
+        const slot = new Date(now.getTime() + i * 1000);
+
+        await withPrismaRetry(
+          () =>
+            prisma.dispatchTask.create({
+              data: {
+                channelId: asset.channelId,
+                mediaAssetId: asset.id,
+                groupKey,
+                status: TaskStatus.pending,
+                scheduleSlot: slot,
+                plannedAt: slot,
+                nextRunAt: slot,
+                priority: definition.priority ?? 100,
+              },
+              select: { id: true },
+            }),
+          { label: 'dispatch.scheduleDispatchForDefinition.createDispatchTask' },
+        );
+
+        createdCount += 1;
+      }
     }
 
     const tickSummary = await scheduleDueDispatchTasks();
+
+    logger.info('[typeb_metrics] grouped scheduling summary', {
+      typeb_group_scheduled_total: groupScheduledCount,
+      typeb_group_asset_created_total: createdCount,
+      metric_labels: {
+        typeb_group_scheduled_total: 'TypeB 组级调度批次数',
+        typeb_group_asset_created_total: 'TypeB 组级调度创建任务总数',
+      },
+    });
 
     await updateTaskDefinitionRunStatus({
       taskDefinitionId,
@@ -741,6 +781,7 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
       summary: {
         executor: 'dispatch_send',
         createdTasks: createdCount,
+        groupedBatches: groupScheduledCount,
         queuedCount: tickSummary.queuedCount,
         autoBypassCount: tickSummary.autoBypassCount,
         blockedCount: tickSummary.blockedCount,

@@ -4,7 +4,7 @@ import { unlink } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { PassThrough } from 'node:stream';
 import FormData from 'form-data';
-import { connection } from '../infra/redis';
+import { connection, relayUploadQueue } from '../infra/redis';
 import { prisma } from '../infra/prisma';
 import { logger, logError } from '../logger';
 import {
@@ -126,6 +126,63 @@ export const relayUploadWorker = new Worker(
   async (job) => {
     if (job.name === 'bootstrap-check') {
       return { ok: true, skipped: true, reason: 'bootstrap-check' };
+    }
+
+    if (job.name === 'relay-upload-grouped') {
+      const relayChannelIdRaw = job.data.relayChannelId as string | undefined;
+      const groupKey = job.data.groupKey as string | undefined;
+      const mediaAssetIds = Array.isArray(job.data.mediaAssetIds)
+        ? (job.data.mediaAssetIds as string[]).filter((v) => typeof v === 'string' && v.trim())
+        : [];
+
+      if (!relayChannelIdRaw || mediaAssetIds.length === 0) {
+        throw new Error('grouped relay upload payload invalid');
+      }
+
+      let enqueued = 0;
+      for (const mediaAssetIdRaw of mediaAssetIds) {
+        const childJobId = `relay-upload-${mediaAssetIdRaw}`;
+        const existing = await prisma.mediaAsset.findUnique({
+          where: { id: BigInt(mediaAssetIdRaw) },
+          select: { id: true, status: true, telegramFileId: true, relayMessageId: true },
+        });
+
+        if (!existing || existing.status === MediaStatus.relay_uploaded || existing.telegramFileId || existing.relayMessageId) {
+          continue;
+        }
+
+        const existingJob = await relayUploadQueue.getJob(childJobId);
+        if (existingJob) {
+          const state = await existingJob.getState();
+          if (state !== 'failed') continue;
+          await existingJob.remove();
+        }
+
+        await relayUploadQueue.add(
+          'relay-upload',
+          {
+            mediaAssetId: mediaAssetIdRaw,
+            relayChannelId: relayChannelIdRaw,
+            groupKey,
+            groupDispatchMode: 'grouped_child',
+          },
+          {
+            jobId: childJobId,
+            removeOnComplete: true,
+            removeOnFail: 200,
+          },
+        );
+        enqueued += 1;
+      }
+
+      logger.info('[q_relay_upload] grouped task expanded', {
+        jobId: String(job.id),
+        groupKey: groupKey ?? null,
+        groupSize: mediaAssetIds.length,
+        enqueued,
+      });
+
+      return { ok: true, grouped: true, enqueued };
     }
 
     const mediaAssetIdRaw = job.data.mediaAssetId as string | undefined;

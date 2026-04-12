@@ -1,6 +1,6 @@
-import { cloneVideoDownloadQueue } from '../../infra/redis';
+import { cloneMediaDownloadQueue } from '../../infra/redis';
 import { logger } from '../../logger';
-import { CloneVideoDownloadJob } from '../types/clone-queue.types';
+import { CloneMediaDownloadJob } from '../types/clone-queue.types';
 import {
   dequeueNextGuardWaitJobRoundRobin,
   enqueueGuardWaitJobByChannel,
@@ -13,7 +13,7 @@ function normalizeChannelUsername(raw: string | undefined) {
   return (raw ?? '').trim().replace(/^@+/, '').toLowerCase();
 }
 
-export async function enqueueCloneGuardWait(job: CloneVideoDownloadJob) {
+export async function enqueueCloneGuardWait(job: CloneMediaDownloadJob) {
   const channelUsername = normalizeChannelUsername(job.channelUsername);
   if (!channelUsername) return;
 
@@ -35,7 +35,7 @@ export async function enqueueCloneGuardWait(job: CloneVideoDownloadJob) {
   });
 }
 
-export async function processCloneGuardWait(job: CloneVideoDownloadJob) {
+export async function processCloneGuardWait(job: CloneMediaDownloadJob) {
   await enqueueCloneGuardWait(job);
 
   const next = await dequeueNextGuardWaitJobRoundRobin();
@@ -47,8 +47,8 @@ export async function processCloneGuardWait(job: CloneVideoDownloadJob) {
     return;
   }
 
-  await cloneVideoDownloadQueue.add(
-    'clone-video-download-from-guard-wait-rr',
+  await cloneMediaDownloadQueue.add(
+    'clone-media-download-from-guard-wait-rr',
     {
       ...next.payload,
       retryCount: Number((next.payload as { retryCount?: number }).retryCount ?? 0),

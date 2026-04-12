@@ -11,6 +11,10 @@ import {
   RELAY_MIN_STABLE_CHECKS,
   RELAY_MTIME_COOLDOWN_MS,
   RELAY_STABLE_INTERVAL_MS,
+  TYPEA_GROUP_SCAN_ENABLED,
+  TYPEA_GROUP_SCAN_MAX_DIRS_PER_TICK,
+  TYPEA_GROUP_SCAN_MAX_FILES_PER_TICK,
+  TYPEA_GROUP_SCAN_CONCURRENCY,
 } from '../config/env';
 import { logger } from '../logger';
 
@@ -27,6 +31,10 @@ const SUPPORTED_VIDEO_EXT = new Set([
   '.3gp',
   '.m4v',
 ]);
+
+const SUPPORTED_IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
+const SUPPORTED_TEXT_EXT = new Set(['.txt']);
+
 
 const execFileAsync = promisify(execFile);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -371,14 +379,106 @@ export async function scanChannelVideos(folderPath: string) {
     return [];
   }
 
-  const rootFiles = entries
-    .filter((entry) => entry.isFile())
-    .map((entry) => resolve(absolute, entry.name))
-    .filter((filePath) => SUPPORTED_VIDEO_EXT.has(extname(filePath).toLowerCase()));
+  const groupedDirPattern = /^(grouped-\d+|single-\d+)$/i;
+  const groupedRoots = entries
+    .filter((entry) => entry.isDirectory() && groupedDirPattern.test(entry.name))
+    .map((entry) => resolve(absolute, entry.name));
 
   const collectionDir = entries.find(
     (entry) => entry.isDirectory() && entry.name.toLowerCase() === 'collection',
   );
+
+  const collectionRoots: string[] = [];
+  if (collectionDir) {
+    const collectionRoot = resolve(absolute, collectionDir.name);
+    try {
+      const collectionEntries = await readdir(collectionRoot, { withFileTypes: true, encoding: 'utf8' });
+      for (const dirent of collectionEntries) {
+        if (!dirent.isDirectory()) continue;
+        const albumDir = resolve(collectionRoot, dirent.name);
+        try {
+          const albumEntries = await readdir(albumDir, { withFileTypes: true, encoding: 'utf8' });
+          for (const node of albumEntries) {
+            if (node.isDirectory() && groupedDirPattern.test(node.name)) {
+              collectionRoots.push(resolve(albumDir, node.name));
+            }
+          }
+        } catch (error) {
+          logger.warn('[scan] 合集子目录不可访问，已跳过', {
+            folderPath,
+            albumDir,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    } catch (error) {
+      logger.warn('[scan] Collection 目录不可访问，跳过合集扫描', {
+        folderPath,
+        collectionRoot,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  const allGroupDirs = [...groupedRoots, ...collectionRoots];
+  const discoveredFiles: string[] = [];
+
+  if (TYPEA_GROUP_SCAN_ENABLED && allGroupDirs.length > 0) {
+    const limitedDirs = allGroupDirs.slice(0, TYPEA_GROUP_SCAN_MAX_DIRS_PER_TICK);
+    let cursor = 0;
+    const workerCount = Math.min(TYPEA_GROUP_SCAN_CONCURRENCY, Math.max(1, limitedDirs.length));
+
+    const scanOneDir = async (groupDir: string) => {
+      if (discoveredFiles.length >= TYPEA_GROUP_SCAN_MAX_FILES_PER_TICK) return;
+      try {
+        const files = await readdir(groupDir, { withFileTypes: true, encoding: 'utf8' });
+        for (const item of files) {
+          if (discoveredFiles.length >= TYPEA_GROUP_SCAN_MAX_FILES_PER_TICK) break;
+          if (!item.isFile()) continue;
+          const ext = extname(item.name).toLowerCase();
+          const supported =
+            SUPPORTED_VIDEO_EXT.has(ext) ||
+            SUPPORTED_IMAGE_EXT.has(ext);
+          if (!supported) continue;
+          discoveredFiles.push(resolve(groupDir, item.name));
+        }
+      } catch (error) {
+        logger.warn('[scan] grouped/single 目录不可访问，已跳过', {
+          groupDir,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+
+    const runners = Array.from({ length: workerCount }).map(async () => {
+      while (cursor < limitedDirs.length && discoveredFiles.length < TYPEA_GROUP_SCAN_MAX_FILES_PER_TICK) {
+        const idx = cursor;
+        cursor += 1;
+        const dir = limitedDirs[idx];
+        if (!dir) continue;
+        await scanOneDir(dir);
+      }
+    });
+
+    await Promise.all(runners);
+
+    if (discoveredFiles.length > 0) {
+      logger.info('[scan] grouped/single 文件扫描完成', {
+        folderPath,
+        groupedDirCount: limitedDirs.length,
+        foundFiles: discoveredFiles.length,
+        maxDirsPerTick: TYPEA_GROUP_SCAN_MAX_DIRS_PER_TICK,
+        maxFilesPerTick: TYPEA_GROUP_SCAN_MAX_FILES_PER_TICK,
+      });
+      return discoveredFiles;
+    }
+  }
+
+  // fallback: 保持历史扫描行为，避免影响现有 TypeA
+  const rootFiles = entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => resolve(absolute, entry.name))
+    .filter((filePath) => SUPPORTED_VIDEO_EXT.has(extname(filePath).toLowerCase()));
 
   const collectionFiles: string[] = [];
   if (collectionDir) {

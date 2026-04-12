@@ -6,6 +6,12 @@ const CHANNEL_SLOT_TTL_MS = (() => {
   return Math.min(6 * 60 * 60_000, Math.floor(n));
 })();
 
+const CHANNEL_SLOT_STALE_MS = (() => {
+  const n = Number(process.env.CLONE_DOWNLOAD_CHANNEL_SLOT_STALE_MS ?? '180000');
+  if (!Number.isFinite(n) || n < 30_000) return 180000;
+  return Math.min(60 * 60_000, Math.floor(n));
+})();
+
 function normalizeChannelUsername(raw: string) {
   return raw.trim().replace(/^@+/, '').toLowerCase();
 }
@@ -17,12 +23,49 @@ function buildChannelSlotKey(channelUsername: string) {
 export async function tryAcquireCloneChannelSlot(channelUsername: string) {
   const key = buildChannelSlotKey(channelUsername);
   const token = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const result = await connection.set(key, token, 'PX', CHANNEL_SLOT_TTL_MS, 'NX');
+
+  const lua = `
+    local key = KEYS[1]
+    local token = ARGV[1]
+    local ttl = tonumber(ARGV[2])
+    local staleMs = tonumber(ARGV[3])
+    local nowMs = tonumber(ARGV[4])
+
+    local existing = redis.call("GET", key)
+    if not existing then
+      redis.call("SET", key, token, "PX", ttl, "NX")
+      return "acquired"
+    end
+
+    local dashPos = string.find(existing, "-")
+    local tsRaw = existing
+    if dashPos then
+      tsRaw = string.sub(existing, 1, dashPos - 1)
+    end
+
+    local ts = tonumber(tsRaw)
+    local age = nil
+    if ts then
+      age = nowMs - ts
+    end
+
+    if age and age > staleMs then
+      redis.call("SET", key, token, "PX", ttl)
+      return "acquired_stale_replaced"
+    end
+
+    return "busy"
+  `;
+
+  const result = String(
+    await connection.eval(lua, 1, key, token, CHANNEL_SLOT_TTL_MS, CHANNEL_SLOT_STALE_MS, Date.now()),
+  );
 
   return {
     key,
     token,
-    acquired: result === 'OK',
+    acquired: result === 'acquired' || result === 'acquired_stale_replaced',
+    staleReplaced: result === 'acquired_stale_replaced',
   };
 }
 

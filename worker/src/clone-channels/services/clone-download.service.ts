@@ -10,8 +10,12 @@ import {
   CLONE_DOWNLOAD_TIMEOUT_MS,
   CLONE_RETRY_MAX,
 } from '../constants/clone-queue.constants';
+import {
+  CLONE_DOWNLOAD_HEARTBEAT_INTERVAL_MS,
+  CLONE_DOWNLOAD_LEASE_MS,
+} from '../../config/env';
 import { logger } from '../../logger';
-import { CloneMediaRef, CloneRetryReason, CloneVideoDownloadJob } from '../types/clone-queue.types';
+import { CloneMediaRef, CloneRetryReason, CloneMediaDownloadJob } from '../types/clone-queue.types';
 import { checkDownloadGuards, recordGuardTriggered } from './clone-guard.service';
 import { tryAcquireCloneChannelSlot, releaseCloneChannelSlot } from './clone-channel-fairness.service';
 import { withClient } from './clone-session.service';
@@ -36,12 +40,16 @@ function resolveFileExtensionByMime(mimeType?: string | null) {
   if (normalized === 'video/mp4') return '.mp4';
   if (normalized === 'video/webm') return '.webm';
   if (normalized === 'video/x-matroska' || normalized === 'video/mkv') return '.mkv';
+  if (normalized === 'image/jpeg' || normalized === 'image/jpg') return '.jpg';
+  if (normalized === 'image/png') return '.png';
+  if (normalized === 'image/webp') return '.webp';
+  if (normalized === 'image/gif') return '.gif';
   return '.mp4';
 }
 
 function splitVideoBaseAndExt(fileNameRaw: string) {
-  const cleaned = sanitizeFileName(fileNameRaw || 'video').replace(/\.+$/g, '');
-  const m = cleaned.match(/^(.*?)(\.(mp4|mkv|webm))$/i);
+  const cleaned = sanitizeFileName(fileNameRaw || 'media').replace(/\.+$/g, '');
+  const m = cleaned.match(/^(.*?)(\.(mp4|mkv|webm|jpg|jpeg|png|webp|gif))$/i);
   if (m) {
     return {
       stem: (m[1] || 'video').trim() || 'video',
@@ -50,7 +58,7 @@ function splitVideoBaseAndExt(fileNameRaw: string) {
   }
 
   return {
-    stem: cleaned.trim() || 'video',
+    stem: cleaned.trim() || 'media',
     ext: '',
   };
 }
@@ -122,6 +130,7 @@ async function persistMessageTextFile(params: {
 async function validateDownloadedFile(params: {
   filePath: string;
   expectedSize?: bigint;
+  expectedMimeType?: string;
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
   try {
     const fsStat = await stat(params.filePath);
@@ -133,6 +142,13 @@ async function validateDownloadedFile(params: {
       if (Number.isFinite(expected) && expected > 0 && Math.abs(fsStat.size - expected) > 1024) {
         return { ok: false, reason: `size_mismatch: expected=${expected}, actual=${fsStat.size}` };
       }
+    }
+
+    const expectedMime = (params.expectedMimeType ?? '').toLowerCase();
+    const isImage = expectedMime.startsWith('image/');
+
+    if (isImage) {
+      return { ok: true };
     }
 
     const { stdout } = await execFileAsync('ffprobe', [
@@ -237,6 +253,7 @@ function startProgressLogger(params: {
   channelUsername: string;
   messageId: number;
   expectedSize?: bigint;
+  onProgress?: (data: { downloadedBytes: number; progressPct: number | null; speedMbps: number }) => Promise<void>;
 }) {
   const startedAt = Date.now();
   let lastLoggedSize = -1;
@@ -253,13 +270,24 @@ function startProgressLogger(params: {
       const expected = params.expectedSize ? Number(params.expectedSize) : 0;
       const progressPct = expected > 0 ? Math.min(100, (currentSize / expected) * 100) : null;
 
+      const normalizedProgressPct = progressPct !== null ? Number(progressPct.toFixed(2)) : null;
+      const normalizedSpeedMbps = Number(speedMbps.toFixed(2));
+
+      if (params.onProgress) {
+        await params.onProgress({
+          downloadedBytes: currentSize,
+          progressPct: normalizedProgressPct,
+          speedMbps: normalizedSpeedMbps,
+        });
+      }
+
       logger.info('[clone][下载/Download] 下载进度 / download progress', {
         channelUsername: params.channelUsername,
         messageId: params.messageId,
         downloadedBytes: currentSize,
         expectedBytes: expected > 0 ? expected : null,
-        progressPct: progressPct !== null ? Number(progressPct.toFixed(2)) : null,
-        speedMbps: Number(speedMbps.toFixed(2)),
+        progressPct: normalizedProgressPct,
+        speedMbps: normalizedSpeedMbps,
         elapsedMs,
       });
     } catch {
@@ -322,17 +350,20 @@ async function downloadMediaToTempFile(params: {
         throw new Error(`file_missing: media missing tg://${channelUsername}/${messageId}`);
       }
 
-      const doc = (media as { document?: { mimeType?: string; attributes?: unknown[] } }).document;
+      const doc = (media as { document?: { mimeType?: string; attributes?: unknown[] }; photo?: unknown }).document;
+      const photo = (media as { photo?: unknown }).photo;
       const mimeType = typeof doc?.mimeType === 'string' ? doc.mimeType : undefined;
       const attrs = Array.isArray(doc?.attributes) ? doc.attributes : [];
       const hasVideoAttr = attrs.some((attr) => String((attr as { className?: string })?.className ?? '').toLowerCase().includes('video'));
-      const looksLikeVideo = Boolean((mimeType ?? '').toLowerCase().startsWith('video/') || hasVideoAttr);
+      const isVideo = Boolean((mimeType ?? '').toLowerCase().startsWith('video/') || hasVideoAttr);
+      const isImage = Boolean((mimeType ?? '').toLowerCase().startsWith('image/') || photo);
+      const supportedMedia = isVideo || isImage;
 
-      if (!looksLikeVideo) {
+      if (!supportedMedia) {
         throw new Error(`unsupported_media_type: mime=${mimeType ?? 'unknown'} tg://${channelUsername}/${messageId}`);
       }
 
-      resolvedMimeType = mimeType;
+      resolvedMimeType = mimeType ?? (isImage ? 'image/jpeg' : undefined);
 
       const result = await c.downloadMedia(media, {
         outputFile: tempFilePath,
@@ -365,7 +396,8 @@ async function downloadMediaToTempFile(params: {
         resultPath: typeof result === 'string' ? path.resolve(result) : null,
         resultEqualsTempPath: typeof result === 'string' ? isSamePath(path.resolve(result), tempFilePath) : null,
         mimeType: mimeType ?? null,
-        looksLikeVideo,
+        isVideo,
+        isImage,
       });
 
       return true;
@@ -395,7 +427,7 @@ function toSafeBigInt(raw: string | undefined) {
   }
 }
 
-export async function processCloneVideoDownload(job: CloneVideoDownloadJob) {
+export async function processCloneMediaDownload(job: CloneMediaDownloadJob, workerJobId?: string) {
   const itemId = BigInt(job.itemId);
   const runId = BigInt(job.runId);
   const taskId = BigInt(job.taskId);
@@ -404,6 +436,16 @@ export async function processCloneVideoDownload(job: CloneVideoDownloadJob) {
   const channelSlot = channelUsernameForSlot
     ? await tryAcquireCloneChannelSlot(channelUsernameForSlot)
     : null;
+
+  if (channelSlot?.staleReplaced) {
+    logger.warn('[clone][下载/Download] 发现并替换 stale channel slot / stale channel slot replaced', {
+      taskId: job.taskId,
+      runId: job.runId,
+      itemId: job.itemId,
+      channelUsername: channelUsernameForSlot,
+      slotKey: channelSlot.key,
+    });
+  }
 
   if (channelSlot && !channelSlot.acquired) {
     await cloneGuardWaitQueue.add(
@@ -494,9 +536,16 @@ export async function processCloneVideoDownload(job: CloneVideoDownloadJob) {
       where: { id: itemId },
       data: {
         downloadStatus: 'downloading',
+        downloadLeaseUntil: new Date(Date.now() + CLONE_DOWNLOAD_LEASE_MS),
+        downloadHeartbeatAt: new Date(),
+        downloadWorkerJobId: workerJobId ?? null,
+        downloadAttempt: { increment: 1 },
+        downloadProgressPct: 0,
+        downloadedBytes: BigInt(0),
+        downloadSpeedMbps: null,
         downloadErrorCode: null,
         downloadError: null,
-      },
+      } as any,
     });
 
     const expectedSize = toSafeBigInt(job.expectedFileSize) ?? item.fileSize ?? undefined;
@@ -540,7 +589,31 @@ export async function processCloneVideoDownload(job: CloneVideoDownloadJob) {
       channelUsername: mediaRef.kind === 'tg_message' ? mediaRef.channelUsername : item.channelUsername,
       messageId: mediaRef.kind === 'tg_message' ? Number(mediaRef.messageId) : Number(item.messageId),
       expectedSize,
+      onProgress: async ({ downloadedBytes, progressPct, speedMbps }) => {
+        await prisma.cloneCrawlItem.updateMany({
+          where: { id: itemId, downloadStatus: 'downloading' },
+          data: {
+            downloadedBytes: BigInt(Math.max(0, downloadedBytes)),
+            downloadProgressPct: progressPct === null ? 0 : Math.max(0, Math.min(100, Math.floor(progressPct))),
+            downloadSpeedMbps: speedMbps,
+            downloadHeartbeatAt: new Date(),
+            downloadLeaseUntil: new Date(Date.now() + CLONE_DOWNLOAD_LEASE_MS),
+            downloadWorkerJobId: workerJobId ?? null,
+          } as any,
+        });
+      },
     });
+
+    const heartbeatTimer = setInterval(() => {
+      void prisma.cloneCrawlItem.updateMany({
+        where: { id: itemId, downloadStatus: 'downloading' },
+        data: {
+          downloadLeaseUntil: new Date(Date.now() + CLONE_DOWNLOAD_LEASE_MS),
+          downloadHeartbeatAt: new Date(),
+          downloadWorkerJobId: workerJobId ?? null,
+        } as any,
+      });
+    }, CLONE_DOWNLOAD_HEARTBEAT_INTERVAL_MS);
 
     let tempFilePath = '';
     let downloadedBytes = BigInt(0);
@@ -557,6 +630,7 @@ export async function processCloneVideoDownload(job: CloneVideoDownloadJob) {
       downloadedBytes = downloadResult.downloadedBytes;
       mimeType = downloadResult.mimeType;
     } finally {
+      clearInterval(heartbeatTimer);
       stopProgressLog();
     }
 
@@ -588,6 +662,7 @@ export async function processCloneVideoDownload(job: CloneVideoDownloadJob) {
     const validateResult = await validateDownloadedFile({
       filePath: tempFilePath,
       expectedSize,
+      expectedMimeType: job.expectedMimeType ?? item.mimeType ?? mimeType,
     });
 
     if (!validateResult.ok) {
@@ -624,11 +699,17 @@ export async function processCloneVideoDownload(job: CloneVideoDownloadJob) {
       where: { id: itemId },
       data: {
         downloadStatus: 'downloaded',
+        downloadLeaseUntil: null,
+        downloadHeartbeatAt: null,
+        downloadWorkerJobId: null,
+        downloadProgressPct: 100,
+        downloadedBytes,
+        downloadSpeedMbps: null,
         downloadErrorCode: null,
         downloadError: null,
         localPath: finalPath,
         mimeType: mimeType ?? item.mimeType,
-      },
+      } as any,
     });
 
     await prisma.cloneCrawlRun.updateMany({
@@ -667,9 +748,12 @@ export async function processCloneVideoDownload(job: CloneVideoDownloadJob) {
         where: { id: itemId },
         data: {
           downloadStatus: 'failed_final',
+          downloadLeaseUntil: null,
+          downloadHeartbeatAt: null,
+          downloadWorkerJobId: null,
           downloadErrorCode: 'retry_exhausted',
           downloadError: err instanceof Error ? err.message : String(err),
-        },
+        } as any,
       });
 
       logger.warn('[clone][下载/Download] 下载失败已达重试上限 / download failed and reached retry max', {
@@ -704,10 +788,13 @@ export async function processCloneVideoDownload(job: CloneVideoDownloadJob) {
       where: { id: itemId },
       data: {
         downloadStatus: 'failed_retryable',
+        downloadLeaseUntil: null,
+        downloadHeartbeatAt: null,
+        downloadWorkerJobId: null,
         downloadErrorCode: reason,
         downloadError: err instanceof Error ? err.message : String(err),
         retryCount: { increment: 1 },
-      },
+      } as any,
     });
 
     logger.warn('[clone][下载/Download] 下载失败，已进入重试队列 / download failed, retry queued', {

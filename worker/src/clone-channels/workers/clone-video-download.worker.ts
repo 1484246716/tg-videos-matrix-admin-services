@@ -1,15 +1,30 @@
 import { Worker } from 'bullmq';
-import { cloneVideoDownloadQueue, connection } from '../../infra/redis';
+import { cloneMediaDownloadQueue, connection } from '../../infra/redis';
 import { logger, logError } from '../../logger';
 import { CLONE_DOWNLOAD_GLOBAL_CONCURRENCY } from '../constants/clone-queue.constants';
-import { processCloneVideoDownload } from '../services/clone-download.service';
+import { processCloneMediaDownload } from '../services/clone-download.service';
 
-export const cloneVideoDownloadWorker = new Worker(
-  cloneVideoDownloadQueue.name,
+function hasRequiredDownloadPayload(data: any) {
+  const hasTaskId = typeof data?.taskId === 'string' || typeof data?.taskId === 'number' || typeof data?.taskId === 'bigint';
+  const hasRunId = typeof data?.runId === 'string' || typeof data?.runId === 'number' || typeof data?.runId === 'bigint';
+  const hasItemId = typeof data?.itemId === 'string' || typeof data?.itemId === 'number' || typeof data?.itemId === 'bigint';
+  return hasTaskId && hasRunId && hasItemId;
+}
+
+export const cloneMediaDownloadWorker = new Worker(
+  cloneMediaDownloadQueue.name,
   async (job) => {
+    if (!hasRequiredDownloadPayload(job.data)) {
+      logger.warn('[clone-media-download.worker] invalid payload skipped', {
+        jobId: job.id,
+        data: job.data,
+      });
+      return;
+    }
+
     const startedAt = Date.now();
-    await processCloneVideoDownload(job.data);
-    logger.info('[clone-video-download.worker] job completed', {
+    await processCloneMediaDownload(job.data, String(job.id ?? ''));
+    logger.info('[clone-media-download.worker] job completed', {
       jobId: job.id,
       taskId: job.data?.taskId,
       runId: job.data?.runId,
@@ -22,9 +37,9 @@ export const cloneVideoDownloadWorker = new Worker(
   { connection: connection as any, concurrency: CLONE_DOWNLOAD_GLOBAL_CONCURRENCY },
 );
 
-cloneVideoDownloadWorker.on('failed', (job, err) => {
-  logError('[clone-video-download.worker] failed', err);
-  logger.warn('[clone-video-download.worker] job failed', {
+cloneMediaDownloadWorker.on('failed', (job, err) => {
+  logError('[clone-media-download.worker] failed', err);
+  logger.warn('[clone-media-download.worker] job failed', {
     jobId: job?.id,
     taskId: job?.data?.taskId,
     runId: job?.data?.runId,
@@ -35,6 +50,6 @@ cloneVideoDownloadWorker.on('failed', (job, err) => {
   });
 });
 
-cloneVideoDownloadWorker.on('ready', () => {
-  logger.info('[clone-video-download.worker] ready');
+cloneMediaDownloadWorker.on('ready', () => {
+  logger.info('[clone-media-download.worker] ready');
 });

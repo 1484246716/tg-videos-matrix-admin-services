@@ -42,6 +42,45 @@ export const CLONE_DAILY_JITTER_SEC = (() => {
 /** Clone daily 默认触发时刻（HH:mm） */
 export const CLONE_DAILY_DEFAULT_TIME = (process.env.CLONE_DAILY_DEFAULT_TIME || '00:00').trim() || '00:00';
 
+/** Clone 下载租约时长（毫秒） */
+export const CLONE_DOWNLOAD_LEASE_MS = (() => {
+  const n = Number(process.env.CLONE_DOWNLOAD_LEASE_MS ?? '120000');
+  if (!Number.isFinite(n) || n < 10000) return 120000;
+  return Math.min(900000, Math.floor(n));
+})();
+
+/** Clone 下载 heartbeat 间隔（毫秒） */
+export const CLONE_DOWNLOAD_HEARTBEAT_INTERVAL_MS = (() => {
+  const n = Number(process.env.CLONE_DOWNLOAD_HEARTBEAT_INTERVAL_MS ?? '30000');
+  if (!Number.isFinite(n) || n < 5000) return 30000;
+  return Math.min(120000, Math.floor(n));
+})();
+
+/** Clone 下载卡住自愈总开关 */
+export const CLONE_DOWNLOAD_RECONCILE_ENABLED =
+  process.env.CLONE_DOWNLOAD_RECONCILE_ENABLED !== 'false';
+
+/** Clone 下载卡住阈值（毫秒） */
+export const CLONE_DOWNLOAD_STUCK_MS = (() => {
+  const n = Number(process.env.CLONE_DOWNLOAD_STUCK_MS ?? '180000');
+  if (!Number.isFinite(n) || n < 30000) return 180000;
+  return Math.min(3600000, Math.floor(n));
+})();
+
+/** Clone 下载卡住自愈每轮处理上限 */
+export const CLONE_DOWNLOAD_RECONCILE_BATCH = (() => {
+  const n = Number(process.env.CLONE_DOWNLOAD_RECONCILE_BATCH ?? '200');
+  if (!Number.isFinite(n) || n < 1) return 200;
+  return Math.min(2000, Math.floor(n));
+})();
+
+/** Clone 下载最大自动恢复次数 */
+export const CLONE_DOWNLOAD_RECOVER_MAX = (() => {
+  const n = Number(process.env.CLONE_DOWNLOAD_RECOVER_MAX ?? '5');
+  if (!Number.isFinite(n) || n < 1) return 5;
+  return Math.min(100, Math.floor(n));
+})();
+
 /** Clone 是否启用 nextRunAt 调度（灰度开关） */
 export const CLONE_SCHEDULE_USE_NEXT_RUN_AT =
   process.env.CLONE_SCHEDULE_USE_NEXT_RUN_AT !== 'false';
@@ -264,6 +303,31 @@ export const TYPEA_FAIL_ON_FILE_MISSING =
 export const TYPEA_MAX_UPLOAD_SIZE_MB = Number(
   process.env.TYPEA_MAX_UPLOAD_SIZE_MB || '2048',
 );
+
+/** TypeA grouped/single 扫描总开关 */
+export const TYPEA_GROUP_SCAN_ENABLED =
+  process.env.TYPEA_GROUP_SCAN_ENABLED !== 'false';
+
+/** TypeA grouped/single 每轮最多扫描目录数 */
+export const TYPEA_GROUP_SCAN_MAX_DIRS_PER_TICK = (() => {
+  const n = Number(process.env.TYPEA_GROUP_SCAN_MAX_DIRS_PER_TICK ?? '200');
+  if (!Number.isFinite(n) || n < 10) return 200;
+  return Math.min(5000, Math.floor(n));
+})();
+
+/** TypeA grouped/single 每轮最多扫描文件数 */
+export const TYPEA_GROUP_SCAN_MAX_FILES_PER_TICK = (() => {
+  const n = Number(process.env.TYPEA_GROUP_SCAN_MAX_FILES_PER_TICK ?? '5000');
+  if (!Number.isFinite(n) || n < 100) return 5000;
+  return Math.min(200000, Math.floor(n));
+})();
+
+/** TypeA grouped/single 扫描并发 */
+export const TYPEA_GROUP_SCAN_CONCURRENCY = (() => {
+  const n = Number(process.env.TYPEA_GROUP_SCAN_CONCURRENCY ?? '3');
+  if (!Number.isFinite(n) || n < 1) return 3;
+  return Math.min(32, Math.floor(n));
+})();
 
 /** TypeA 告警：任务陈旧阈值 */
 export const TYPEA_ALERT_STALE_THRESHOLD = Number(

@@ -149,6 +149,131 @@ export async function handleDispatchJob(
     throw new Error(`未找到分发任务: ${dispatchTaskIdRaw}`);
   }
 
+  if (task.groupKey) {
+    const blockers = await withPrismaRetry(
+      () =>
+        prisma.dispatchTask.findMany({
+          where: {
+            channelId: task.channelId,
+            groupKey: task.groupKey,
+            id: { not: task.id },
+            scheduleSlot: { lt: task.scheduleSlot },
+            status: { in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.running, TaskStatus.failed] },
+          },
+          select: {
+            id: true,
+            scheduleSlot: true,
+            status: true,
+            retryCount: true,
+            maxRetries: true,
+          },
+          orderBy: { scheduleSlot: 'asc' },
+          take: 1,
+        }),
+      { label: 'dispatch.handleDispatchJob.findGroupBlockers' },
+    );
+
+    const blocker = blockers[0];
+    if (blocker) {
+      const delayTo = new Date(Date.now() + 30 * 1000);
+      await withPrismaRetry(
+        () =>
+          prisma.dispatchTask.update({
+            where: { id: dispatchTaskId },
+            data: {
+              status: TaskStatus.scheduled,
+              nextRunAt: delayTo,
+            },
+          }),
+        { label: 'dispatch.handleDispatchJob.groupOrderDelay' },
+      );
+
+      await withPrismaRetry(
+        () =>
+          prisma.dispatchTaskLog.create({
+            data: {
+              dispatchTaskId,
+              action: 'task_group_order_delayed',
+              detail: {
+                groupKey: task.groupKey,
+                blockedByTaskId: blocker.id.toString(),
+                blockedByStatus: blocker.status,
+                nextRunAt: delayTo.toISOString(),
+              },
+            },
+          }),
+        { label: 'dispatch.handleDispatchJob.groupOrderDelayLog' },
+      );
+
+      return {
+        ok: false,
+        delayed: true,
+        reason: 'group_order_blocked',
+        blockedByTaskId: blocker.id.toString(),
+      };
+    }
+
+    const deadOrCancelledBlockers = await withPrismaRetry(
+      () =>
+        prisma.dispatchTask.findMany({
+          where: {
+            channelId: task.channelId,
+            groupKey: task.groupKey,
+            id: { not: task.id },
+            scheduleSlot: { lt: task.scheduleSlot },
+            status: { in: [TaskStatus.dead, TaskStatus.cancelled] },
+          },
+          select: {
+            id: true,
+            status: true,
+          },
+          orderBy: { scheduleSlot: 'asc' },
+          take: 1,
+        }),
+      { label: 'dispatch.handleDispatchJob.findDeadOrCancelledGroupBlockers' },
+    );
+
+    const deadBlocker = deadOrCancelledBlockers[0];
+    if (deadBlocker) {
+      await withPrismaRetry(
+        () =>
+          prisma.dispatchTask.update({
+            where: { id: dispatchTaskId },
+            data: {
+              status: TaskStatus.dead,
+              finishedAt: new Date(),
+              telegramErrorCode: 'group_blocked_dead_prev',
+              telegramErrorMessage: `blocked by previous ${deadBlocker.status} task in same group`,
+            },
+          }),
+        { label: 'dispatch.handleDispatchJob.deadByGroupBlocker' },
+      );
+
+      await withPrismaRetry(
+        () =>
+          prisma.dispatchTaskLog.create({
+            data: {
+              dispatchTaskId,
+              action: 'task_dead_group_blocked',
+              detail: {
+                groupKey: task.groupKey,
+                blockedByTaskId: deadBlocker.id.toString(),
+                blockedByStatus: deadBlocker.status,
+              },
+            },
+          }),
+        { label: 'dispatch.handleDispatchJob.deadByGroupBlockerLog' },
+      );
+
+      return {
+        ok: false,
+        dead: true,
+        reason: 'group_blocked_by_dead_prev',
+        blockedByTaskId: deadBlocker.id.toString(),
+      };
+    }
+  }
+
   await withPrismaRetry(
     () =>
       prisma.dispatchTask.update({

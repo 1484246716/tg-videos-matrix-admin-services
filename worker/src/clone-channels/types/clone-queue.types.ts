@@ -17,24 +17,26 @@ export type CloneChannelIndexJob = {
   retryCount?: number;
 };
 
-export type CloneVideoDownloadPriority = 'small' | 'medium' | 'large';
+export type CloneMediaDownloadPriority = 'small' | 'medium' | 'large';
 
 export type CloneMediaRef =
   | { kind: 'tg_message'; channelUsername: string; messageId: string }
   | { kind: 'local_file'; filePath: string }
   | { kind: 'opaque'; value: string };
 
-export type CloneVideoDownloadJob = {
+export type CloneMediaDownloadJob = {
   taskId: string;
   runId: string;
   itemId: string;
   channelUsername?: string;
+  groupedId?: string;
+  groupKey?: string;
   mediaRef?: CloneMediaRef;
   expectedFileSize?: string;
   expectedMimeType?: string;
   expectedFileName?: string;
   targetPath?: string;
-  priority?: CloneVideoDownloadPriority;
+  priority?: CloneMediaDownloadPriority;
   enqueuedAt?: string;
   retryCount?: number;
 };
@@ -54,7 +56,7 @@ export type CloneRetryReason =
 
 export type CloneRetryJob = {
   queue: CloneRetryQueue;
-  payload: CloneChannelIndexJob | CloneVideoDownloadJob | Record<string, unknown>;
+  payload: CloneChannelIndexJob | CloneMediaDownloadJob | Record<string, unknown>;
   reason: CloneRetryReason | string;
   retryCount?: number;
   retryAfterSec?: number;
@@ -65,6 +67,8 @@ export type CloneRetryJob = {
 
 export type IndexedMessageDTO = {
   messageId: bigint;
+  groupedId?: string;
+  groupKey?: string;
   messageDate?: Date;
   messageText?: string;
   hasVideo: boolean;
