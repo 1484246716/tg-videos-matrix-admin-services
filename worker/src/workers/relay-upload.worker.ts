@@ -1,12 +1,12 @@
 import { Worker } from 'bullmq';
 import { createReadStream } from 'node:fs';
-import { unlink } from 'node:fs/promises';
-import { basename } from 'node:path';
+import { readFile, unlink } from 'node:fs/promises';
+import { basename, dirname, extname, join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import FormData from 'form-data';
 import { connection, relayUploadQueue } from '../infra/redis';
 import { prisma } from '../infra/prisma';
-import { logger, logError } from '../logger';
+import { logger, logError, toReadableErrorSummary } from '../logger';
 import {
   createVideoThumbnail,
   ensureMp4Faststart,
@@ -15,7 +15,7 @@ import {
 } from '../shared/file-utils';
 import { sendViaGramjs } from '../shared/gramjs/upload';
 import { getTelegramUpdates, sendTelegramRequest } from '../shared/telegram';
-import { MediaStatus } from '@prisma/client';
+import { DispatchMediaType, MediaStatus } from '@prisma/client';
 import {
   GRAMJS_FORWARD_TARGET_CHAT_ID,
   GRAMJS_UPLOAD_WORKERS,
@@ -30,6 +30,17 @@ import { TYPEA_INGEST_ERROR_CODE, TYPEA_INGEST_FINAL_REASON } from '../shared/me
 
 const PROGRESS_TTL_SECONDS = 24 * 60 * 60;
 const PROGRESS_WRITE_INTERVAL_MS = 5000;
+
+async function readGroupMessageTxt(localPath: string) {
+  try {
+    const messageTxtPath = join(dirname(localPath), 'message.txt');
+    const content = await readFile(messageTxtPath, 'utf8');
+    const trimmed = content.replace(/^\uFEFF/, '').trim();
+    return trimmed || null;
+  } catch {
+    return null;
+  }
+}
 
 function createProgressMilestoneLogger(params: {
   traceId: string;
@@ -96,7 +107,7 @@ async function removeUploadedSourceFile(filePath: string, context: {
   traceId: string;
   mediaAssetId: string;
   relayChannelId: string;
-  uploadMethod: 'gramjs_sendVideo' | 'sendVideo' | 'recover_after_hang_up';
+  uploadMethod: 'gramjs_sendVideo' | 'sendVideo' | 'sendPhoto' | 'recover_after_hang_up';
 }) {
   try {
     await unlink(filePath);
@@ -262,6 +273,89 @@ export const relayUploadWorker = new Worker(
       };
     }
 
+    const sourceMetaForIdempotent =
+      mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
+        ? (mediaAsset.sourceMeta as Record<string, unknown>)
+        : {};
+    const sourceMessageIdForIdempotent =
+      typeof sourceMetaForIdempotent.sourceMessageId === 'string'
+        ? sourceMetaForIdempotent.sourceMessageId
+        : null;
+    const isCloneCrawlAssetForIdempotent = sourceMetaForIdempotent.isCloneCrawlAsset === true;
+
+    if (isCloneCrawlAssetForIdempotent && sourceMessageIdForIdempotent) {
+      const uploadedSameSource = await prisma.mediaAsset.findFirst({
+        where: {
+          channelId: mediaAsset.channelId,
+          id: { not: mediaAsset.id },
+          OR: [
+            { status: MediaStatus.relay_uploaded },
+            { telegramFileId: { not: null } },
+            { relayMessageId: { not: null } },
+          ],
+          sourceMeta: {
+            path: ['sourceMessageId'],
+            equals: sourceMessageIdForIdempotent,
+          },
+        },
+        select: {
+          id: true,
+          relayMessageId: true,
+          telegramFileId: true,
+          telegramFileUniqueId: true,
+          dispatchMediaType: true,
+        },
+      });
+
+      if (uploadedSameSource) {
+        const ingestFinishedAt = new Date();
+        await prisma.mediaAsset.update({
+          where: { id: mediaAsset.id },
+          data: {
+            status: MediaStatus.relay_uploaded,
+            relayMessageId: uploadedSameSource.relayMessageId,
+            telegramFileId: uploadedSameSource.telegramFileId,
+            telegramFileUniqueId: uploadedSameSource.telegramFileUniqueId,
+            dispatchMediaType: uploadedSameSource.dispatchMediaType,
+            ingestError: null,
+            ingestFinishedAt,
+            ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
+            sourceMeta: {
+              ...sourceMetaForIdempotent,
+              ingestLeaseUntil: null,
+              ingestLastHeartbeatAt: new Date().toISOString(),
+              ingestWorkerJobId: null,
+              ingestStage: 'done',
+              uploadIdempotentSkip: true,
+              uploadIdempotentReason: 'same_source_message_already_uploaded',
+              uploadIdempotentFromMediaAssetId: uploadedSameSource.id.toString(),
+            },
+          } as any,
+        });
+
+        await removeUploadedSourceFile(mediaAsset.localPath, {
+          traceId,
+          mediaAssetId: mediaAssetIdRaw,
+          relayChannelId: relayChannelIdRaw,
+          uploadMethod: 'recover_after_hang_up',
+        });
+
+        logger.info('[q_relay_upload] 发送幂等命中，复用已上传 sourceMessageId', {
+          traceId,
+          mediaAssetId: mediaAssetIdRaw,
+          sourceMessageId: sourceMessageIdForIdempotent,
+          uploadedFromMediaAssetId: uploadedSameSource.id.toString(),
+        });
+
+        return {
+          ok: true,
+          skipped: true,
+          reason: 'idempotent_same_source_message_uploaded',
+          mediaAssetId: mediaAssetIdRaw,
+        };
+      }
+    }
+
     if (!mediaAsset.channelId) {
       throw new Error(`媒体资源缺少关联频道: ${mediaAssetIdRaw}`);
     }
@@ -377,7 +471,28 @@ export const relayUploadWorker = new Worker(
     }
 
     const fileName = basename(mediaAsset.localPath);
+    const fileExt = extname(mediaAsset.localPath).toLowerCase();
     const fileSize = mediaAsset.fileSize ? Number(mediaAsset.fileSize) : undefined;
+    const sourceMeta =
+      mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
+        ? (mediaAsset.sourceMeta as Record<string, unknown>)
+        : {};
+    const groupedMessageTxt = await readGroupMessageTxt(mediaAsset.localPath);
+    const sourceMetaWithGroupTxt = groupedMessageTxt
+      ? {
+          ...sourceMeta,
+          messageTxt: groupedMessageTxt,
+          txtContent: groupedMessageTxt,
+        }
+      : sourceMeta;
+    const mimeType = typeof sourceMeta.mimeType === 'string' ? sourceMeta.mimeType.toLowerCase() : '';
+
+    const isImage = mimeType.startsWith('image/') || ['.jpg', '.jpeg', '.png', '.webp'].includes(fileExt);
+    const isVideo = mimeType.startsWith('video/') || ['.mp4', '.mov', '.mkv', '.webm'].includes(fileExt);
+
+    if (!isImage && !isVideo) {
+      throw new Error(`中转上传不支持的媒体类型: ext=${fileExt}, mime=${mimeType || 'unknown'}`);
+    }
     const gramjsThresholdBytes = RELAY_UPLOAD_GRAMJS_THRESHOLD_MB * 1024 * 1024;
     const useGramjs = fileSize !== undefined && fileSize >= gramjsThresholdBytes;
 
@@ -465,23 +580,34 @@ export const relayUploadWorker = new Worker(
         throw forwardErr instanceof Error ? forwardErr : new Error('forwardMessage 失败');
       }
 
-      const forwardFileId = forwardResult.videoFileId;
-      const forwardFileUniqueId = forwardResult.videoFileUniqueId ?? null;
+      const forwardVideoFileId = forwardResult.videoFileId;
+      const forwardVideoFileUniqueId = forwardResult.videoFileUniqueId ?? null;
+      const forwardPhotoFileId = forwardResult.photoFileId;
+      const forwardPhotoFileUniqueId = forwardResult.photoFileUniqueId ?? null;
 
-      if (!forwardFileId) {
+      const resolvedTelegramFileId = isImage ? forwardPhotoFileId : forwardVideoFileId;
+      const resolvedTelegramFileUniqueId = isImage ? forwardPhotoFileUniqueId : forwardVideoFileUniqueId;
+
+      if (!resolvedTelegramFileId) {
         const ingestFinishedAt = new Date();
         await prisma.mediaAsset.update({
           where: { id: mediaAssetId },
           data: {
             status: MediaStatus.failed,
             relayMessageId: BigInt(gramjsMessageId),
-            ingestError: 'GramJS 上传成功但 forwardMessage 未返回 video_file_id（疑似被识别为 document）',
+            ingestError: isImage
+              ? 'GramJS 上传成功但 forwardMessage 未返回 photo_file_id'
+              : 'GramJS 上传成功但 forwardMessage 未返回 video_file_id（疑似被识别为 document）',
             ingestFinishedAt,
             ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
           } as any,
         });
 
-        throw new Error('GramJS 上传成功但 forwardMessage 未返回 video_file_id');
+        throw new Error(
+          isImage
+            ? 'GramJS 上传成功但 forwardMessage 未返回 photo_file_id'
+            : 'GramJS 上传成功但 forwardMessage 未返回 video_file_id',
+        );
       }
 
       const ingestFinishedAt = new Date();
@@ -490,18 +616,18 @@ export const relayUploadWorker = new Worker(
         data: {
           status: MediaStatus.relay_uploaded,
           relayMessageId: BigInt(gramjsMessageId),
-          telegramFileId: forwardFileId,
-          telegramFileUniqueId: forwardFileUniqueId,
+          telegramFileId: resolvedTelegramFileId,
+          telegramFileUniqueId: resolvedTelegramFileUniqueId,
+          dispatchMediaType: isImage ? DispatchMediaType.photo : DispatchMediaType.video,
           ingestError: null,
           durationSec: normalizedDurationSec,
           ingestFinishedAt,
           ingestDurationSec: calcIngestDurationSec(ingestStartedAt, ingestFinishedAt),
           archivePath: null,
           sourceMeta: {
-            ...(mediaAsset.sourceMeta && typeof mediaAsset.sourceMeta === 'object'
-              ? (mediaAsset.sourceMeta as Record<string, unknown>)
-              : {}),
+            ...sourceMetaWithGroupTxt,
             relayBotId: relayChannel.bot.id.toString(),
+            relayResolvedMediaType: isImage ? 'photo' : 'video',
             ingestLeaseUntil: null,
             ingestLastHeartbeatAt: new Date().toISOString(),
             ingestWorkerJobId: null,
@@ -549,13 +675,16 @@ export const relayUploadWorker = new Worker(
     const streamWithProgress = new PassThrough();
     let streamedBytes = 0;
     let lastProgressWriteAt = 0;
+    const uploadMethod = isImage ? 'sendPhoto' : 'sendVideo';
+    const uploadField = isImage ? 'photo' : 'video';
+
     const logUploadProgressMilestone = createProgressMilestoneLogger({
       traceId,
       mediaAssetId: mediaAssetIdRaw,
       relayChannelId: relayChannelIdRaw,
       stage: 'upload_progress_percent',
       extra: {
-        uploadMethod: 'sendVideo',
+        uploadMethod,
       },
     });
 
@@ -582,16 +711,18 @@ export const relayUploadWorker = new Worker(
 
     fileStream.pipe(streamWithProgress);
 
-    formData.append('video', streamWithProgress, {
+    formData.append(uploadField, streamWithProgress, {
       filename: fileName,
       knownLength: fileSize,
     });
-    if (thumbnailPath) {
+    if (!isImage && thumbnailPath) {
       formData.append('thumbnail', createReadStream(thumbnailPath), {
         filename: 'thumb.jpg',
       });
     }
-    formData.append('supports_streaming', 'true');
+    if (!isImage) {
+      formData.append('supports_streaming', 'true');
+    }
     const streamDurationMs = Date.now() - streamStart;
     if (streamDurationMs > 500) {
       logger.info('[q_relay_upload] 文件读取/封装耗时', {
@@ -607,7 +738,7 @@ export const relayUploadWorker = new Worker(
       stage: 'start',
       mediaAssetId: mediaAssetIdRaw,
       relayChannelId: relayChannelIdRaw,
-      uploadMethod: 'sendVideo',
+      uploadMethod,
     });
 
     const uploadStart = Date.now();
@@ -631,7 +762,7 @@ export const relayUploadWorker = new Worker(
     try {
       sendResult = await sendTelegramRequest({
         botToken: relayChannel.bot.tokenEncrypted,
-        method: 'sendVideo',
+        method: isImage ? 'sendPhoto' : 'sendVideo',
         payload: formData,
       });
     } catch (err: any) {
@@ -673,6 +804,7 @@ export const relayUploadWorker = new Worker(
               relayMessageId: BigInt(fallbackResult.messageId),
               telegramFileId: fallbackResult.telegramFileId,
               telegramFileUniqueId: fallbackResult.telegramFileUniqueId,
+              dispatchMediaType: isImage ? DispatchMediaType.photo : DispatchMediaType.video,
               ingestError: null,
               durationSec: normalizedDurationSec,
               ingestFinishedAt,
@@ -745,8 +877,10 @@ export const relayUploadWorker = new Worker(
       durationMs: Date.now() - uploadStart,
     });
 
-    const directFileId = sendResult.videoFileId;
-    const directFileUniqueId = sendResult.videoFileUniqueId ?? null;
+    const directFileId = isImage ? sendResult.photoFileId : sendResult.videoFileId;
+    const directFileUniqueId = isImage
+      ? (sendResult.photoFileUniqueId ?? null)
+      : (sendResult.videoFileUniqueId ?? null);
 
     if (directFileId) {
       const ingestFinishedAt = new Date();
@@ -757,6 +891,7 @@ export const relayUploadWorker = new Worker(
           relayMessageId: BigInt(sendResult.messageId),
           telegramFileId: directFileId,
           telegramFileUniqueId: directFileUniqueId,
+          dispatchMediaType: isImage ? DispatchMediaType.photo : DispatchMediaType.video,
           ingestError: null,
           durationSec: normalizedDurationSec,
           ingestFinishedAt,
@@ -767,6 +902,7 @@ export const relayUploadWorker = new Worker(
               ? (mediaAsset.sourceMeta as Record<string, unknown>)
               : {}),
             relayBotId: relayChannel.bot.id.toString(),
+            relayResolvedMediaType: isImage ? 'photo' : 'video',
             ingestLeaseUntil: null,
             ingestLastHeartbeatAt: new Date().toISOString(),
             ingestWorkerJobId: null,
@@ -779,7 +915,7 @@ export const relayUploadWorker = new Worker(
         traceId,
         mediaAssetId: mediaAssetIdRaw,
         relayChannelId: relayChannelIdRaw,
-        uploadMethod: 'sendVideo',
+        uploadMethod,
       });
 
       await writeProgress({
@@ -938,11 +1074,12 @@ relayUploadWorker.on('failed', async (job, err) => {
 
   const errorInfo = err instanceof Error
     ? { name: err.name, message: err.message, stack: err.stack }
-    : { raw: err, string: String(err), json: errorJson };
+    : { raw: err, string: toReadableErrorSummary(err), json: errorJson };
 
   logError('[q_relay_upload] 任务失败', {
     jobId: job?.id ? String(job.id) : null,
     mediaAssetId: mediaAssetIdRaw ?? null,
+    errorSummary: toReadableErrorSummary(err),
     error: errorInfo,
   });
 });

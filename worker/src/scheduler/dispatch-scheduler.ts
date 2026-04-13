@@ -6,6 +6,11 @@ import {
   COLLECTION_AUTO_BYPASS_ON_MAX_RETRIES,
   DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED,
   MAX_SCHEDULE_BATCH,
+  TYPEB_GROUP_READY_TIMEOUT_MS,
+  TYPEB_GROUP_RETRY_CHECK_MS,
+  TYPEB_GROUP_SEND_ENABLED,
+  TYPEB_GROUP_SEND_MIN_MEDIA_COUNT,
+  TYPEB_GROUP_SEND_WHITELIST_CHANNEL_IDS,
 } from '../config/env';
 import { prisma, getTaskDefinitionModel, withPrismaRetry } from '../infra/prisma';
 import { dispatchQueue } from '../infra/redis';
@@ -17,6 +22,8 @@ const DISPATCH_HEAD_BYPASS_RETRY_THRESHOLD = 2;
 const DISPATCH_HEAD_BYPASS_DELAY_SEC = 10 * 60;
 const COLLECTION_SKIP_GRACE_MS = 5 * 60 * 1000;
 const COLLECTION_SKIP_REASON = 'auto_skip_missing_after_grace';
+const TYPEB_GROUP_READY_TIMEOUT_MS = 90 * 1000;
+const TYPEB_GROUP_RETRY_CHECK_MS = 10 * 1000;
 
 type CollectionGateEvalStats = {
   autoBypassCount: number;
@@ -69,6 +76,18 @@ function parseCollectionMeta(sourceMeta: unknown) {
     episodeNo,
     episodeParseFailed,
   };
+}
+
+function extractSecondaryGroupKeyFromPath(pathLike: string | null | undefined) {
+  if (!pathLike) return null;
+  const normalized = pathLike.replace(/\\/g, '/');
+  const matched = normalized.match(/\/(grouped-\d+|single-\d+)\//i);
+  return matched?.[1] ?? null;
+}
+
+function isGroupedPath(pathLike: string | null | undefined) {
+  if (!pathLike) return false;
+  return /\/(grouped-\d+)\//i.test(pathLike.replace(/\\/g, '/'));
 }
 
 function parseCollectionSchedulerConfig(navReplyMarkup: unknown) {
@@ -372,6 +391,7 @@ export async function scheduleDueDispatchTasks() {
           status: true,
           channelId: true,
           mediaAssetId: true,
+          groupKey: true,
           retryCount: true,
           maxRetries: true,
           nextRunAt: true,
@@ -386,6 +406,8 @@ export async function scheduleDueDispatchTasks() {
             select: {
               sourceMeta: true,
               originalName: true,
+              localPath: true,
+              pathNormalized: true,
             },
           },
         },
@@ -395,6 +417,8 @@ export async function scheduleDueDispatchTasks() {
 
   const queuedChannelIds = new Set<string>();
   let queuedCount = 0;
+  let groupedQueuedCount = 0;
+  let groupedFallbackCount = 0;
 
   for (const task of dueTasks) {
     const channelIdStr = task.channelId.toString();
@@ -637,16 +661,241 @@ export async function scheduleDueDispatchTasks() {
 
       if (updated.count === 0) continue;
 
+      let groupSize = 1;
+      let queueJobName: 'dispatch-send' | 'dispatch-send-group' = 'dispatch-send';
+      let queueJobId = `dispatch-${task.id.toString()}`;
+
+      if (task.groupKey) {
+        const groupedTasks = await withPrismaRetry(
+          () =>
+            prisma.dispatchTask.findMany({
+              where: {
+                channelId: task.channelId,
+                groupKey: task.groupKey,
+                status: { in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed, TaskStatus.running] },
+              },
+              select: {
+                id: true,
+                mediaAssetId: true,
+                scheduleSlot: true,
+              },
+            }),
+          { label: 'dispatch.scheduleDueDispatchTasks.findGroupedTasks' },
+        );
+
+        groupSize = groupedTasks.length;
+
+        const expectedMediaCount = await withPrismaRetry(
+          () =>
+            prisma.mediaAsset.count({
+              where: {
+                channelId: task.channelId,
+                OR: [
+                  {
+                    sourceMeta: {
+                      path: ['groupKey'],
+                      equals: task.groupKey,
+                    },
+                  },
+                  {
+                    pathNormalized: {
+                      contains: `/${task.groupKey}/`,
+                    },
+                  },
+                  {
+                    localPath: {
+                      contains: `\\${task.groupKey}\\`,
+                    },
+                  },
+                ],
+                status: {
+                  in: [
+                    MediaStatus.ready,
+                    MediaStatus.ingesting,
+                    MediaStatus.relay_uploaded,
+                  ],
+                },
+              },
+            }),
+          { label: 'dispatch.scheduleDueDispatchTasks.countGroupExpectedAssets' },
+        );
+
+        const readyCount =
+          groupedTasks.length > 0
+            ? await withPrismaRetry(
+                () =>
+                  prisma.mediaAsset.count({
+                    where: {
+                      id: { in: groupedTasks.map((t) => t.mediaAssetId) },
+                      status: MediaStatus.relay_uploaded,
+                      telegramFileId: { not: null },
+                      dispatchMediaType: { not: null },
+                    },
+                  }),
+                { label: 'dispatch.scheduleDueDispatchTasks.countGroupReadyAssets' },
+              )
+            : 0;
+
+        const channelInWhitelist =
+          TYPEB_GROUP_SEND_WHITELIST_CHANNEL_IDS.length === 0 ||
+          TYPEB_GROUP_SEND_WHITELIST_CHANNEL_IDS.includes(task.channelId.toString());
+
+        if (!TYPEB_GROUP_SEND_ENABLED || !channelInWhitelist) {
+          await withPrismaRetry(
+            () =>
+              prisma.dispatchTask.update({
+                where: { id: task.id },
+                data: {
+                  status: TaskStatus.scheduled,
+                  nextRunAt: new Date(Date.now() + TYPEB_GROUP_RETRY_CHECK_MS),
+                },
+              }),
+            { label: 'dispatch.scheduleDueDispatchTasks.groupDisabledDelay' },
+          );
+
+          logger.warn('[typeb_group] grouped 任务不允许降级单发，等待组发送配置生效', {
+            taskId: task.id.toString(),
+            channelId: task.channelId.toString(),
+            groupKey: task.groupKey,
+            typebGroupSendEnabled: TYPEB_GROUP_SEND_ENABLED,
+            channelInWhitelist,
+          });
+          continue;
+        }
+
+        const groupScheduleSlot = groupedTasks
+          .map((t) => t.scheduleSlot)
+          .sort((a, b) => a.getTime() - b.getTime())[0] ?? task.scheduleSlot;
+
+        const groupTask = await withPrismaRetry(
+          () =>
+            (prisma as any).dispatchGroupTask.upsert({
+              where: {
+                channelId_scheduleSlot_groupKey: {
+                  channelId: task.channelId,
+                  scheduleSlot: groupScheduleSlot,
+                  groupKey: task.groupKey,
+                },
+              },
+              create: {
+                channelId: task.channelId,
+                groupKey: task.groupKey,
+                scheduleSlot: groupScheduleSlot,
+                status: TaskStatus.pending,
+                retryCount: 0,
+                maxRetries: task.maxRetries,
+                nextRunAt: now,
+                readyDeadlineAt: new Date(groupScheduleSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
+                expectedMediaCount: Math.max(expectedMediaCount, groupSize),
+                actualReadyCount: readyCount,
+              },
+              update: {
+                nextRunAt: now,
+                expectedMediaCount: Math.max(expectedMediaCount, groupSize),
+                actualReadyCount: readyCount,
+                readyDeadlineAt: {
+                  set: new Date(groupScheduleSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
+                },
+              },
+              select: {
+                id: true,
+                scheduleSlot: true,
+                readyDeadlineAt: true,
+              },
+            }),
+          { label: 'dispatch.scheduleDueDispatchTasks.upsertGroupTask' },
+        );
+
+        const readyDeadlineAt = groupTask.readyDeadlineAt
+          ? new Date(groupTask.readyDeadlineAt)
+          : new Date(new Date(groupTask.scheduleSlot).getTime() + TYPEB_GROUP_READY_TIMEOUT_MS);
+        const expectedTotal = Math.max(Number(groupTask.expectedMediaCount ?? 0), expectedMediaCount, groupSize);
+        const readyEnough = expectedTotal > 0 && readyCount === expectedTotal;
+
+        if (!readyEnough) {
+          if (Date.now() >= readyDeadlineAt.getTime()) {
+            await withPrismaRetry(
+              () =>
+                prisma.$transaction([
+                  (prisma as any).dispatchGroupTask.update({
+                    where: { id: groupTask.id },
+                    data: {
+                      status: TaskStatus.dead,
+                      telegramErrorCode: 'group_not_ready_timeout',
+                      telegramErrorMessage: `group not ready within ${TYPEB_GROUP_READY_TIMEOUT_MS}ms`,
+                    },
+                  }),
+                  prisma.dispatchTask.updateMany({
+                    where: {
+                      channelId: task.channelId,
+                      groupKey: task.groupKey,
+                      status: { in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed, TaskStatus.running] },
+                    },
+                    data: {
+                      status: TaskStatus.dead,
+                      telegramErrorCode: 'group_not_ready_timeout',
+                      telegramErrorMessage: `group not ready within ${TYPEB_GROUP_READY_TIMEOUT_MS}ms`,
+                      finishedAt: new Date(),
+                    },
+                  }),
+                ]),
+              { label: 'dispatch.scheduleDueDispatchTasks.groupTimeoutDead' },
+            );
+
+            logger.warn('[typeb_group] grouped 任务组装超时，标记 dead（禁止单发降级）', {
+              channelId: task.channelId.toString(),
+              groupKey: task.groupKey,
+              groupSize,
+              readyCount,
+              timeoutMs: TYPEB_GROUP_READY_TIMEOUT_MS,
+              readyDeadlineAt: readyDeadlineAt.toISOString(),
+              typeb_group_ready_timeout_total: 1,
+            });
+            continue;
+          }
+
+          await withPrismaRetry(
+            () =>
+              prisma.dispatchTask.update({
+                where: { id: task.id },
+                data: {
+                  status: TaskStatus.scheduled,
+                  nextRunAt: new Date(Date.now() + TYPEB_GROUP_RETRY_CHECK_MS),
+                },
+              }),
+            { label: 'dispatch.scheduleDueDispatchTasks.groupNotReadyDelay' },
+          );
+
+          logger.info('[typeb_group] grouped 任务未全量就绪，延后等待（禁止提前派发）', {
+            taskId: task.id.toString(),
+            channelId: task.channelId.toString(),
+            groupKey: task.groupKey,
+            groupSize,
+            expectedMediaCount: expectedTotal,
+            readyCount,
+            readyAssert: 'blocked_until_ready_eq_expected',
+            readyDeadlineAt: readyDeadlineAt.toISOString(),
+            typeb_group_not_ready_block_total: 1,
+          });
+          continue;
+        }
+
+        queueJobName = 'dispatch-send-group';
+        queueJobId = `dispatch-group-${groupTask.id.toString()}`;
+      }
+
       await dispatchQueue.add(
-        'dispatch-send',
+        queueJobName,
         {
           dispatchTaskId: task.id.toString(),
           channelId: task.channelId.toString(),
           mediaAssetId: task.mediaAssetId.toString(),
+          groupKey: task.groupKey,
+          groupSize,
           retryCount: task.retryCount,
         },
         {
-          jobId: `dispatch-${task.id.toString()}`,
+          jobId: queueJobId,
           removeOnComplete: true,
           removeOnFail: 200,
         },
@@ -654,6 +903,19 @@ export async function scheduleDueDispatchTasks() {
 
       queuedChannelIds.add(channelIdStr);
       queuedCount += 1;
+      if (queueJobName === 'dispatch-send-group') groupedQueuedCount += 1;
+      else if (task.groupKey) groupedFallbackCount += 1;
+
+      if (task.groupKey) {
+        logger.info('[typeb_group] grouped 入队决策', {
+          channelId: task.channelId.toString(),
+          groupKey: task.groupKey,
+          groupSize,
+          queueJobName,
+          typeb_group_dispatch_path_total: 1,
+          dispatchPath: queueJobName === 'dispatch-send-group' ? 'group' : 'single_fallback',
+        });
+      }
     } finally {
       await releaseChannelLock({ lockKey: lock.lockKey, lockToken: lock.lockToken });
     }
@@ -661,6 +923,8 @@ export async function scheduleDueDispatchTasks() {
 
   logger.info('[typeb_metrics] dispatch scheduler tick', {
     typeb_enqueue_total: queuedCount,
+    typeb_group_send_queue_total: groupedQueuedCount,
+    typeb_group_send_fallback_queue_total: groupedFallbackCount,
     collection_gate_auto_bypass_total: gateStats.autoBypassCount,
     collection_gate_block_total: gateStats.blockedCount,
     collectionAutoBypassEnabled: COLLECTION_AUTO_BYPASS_ENABLED,
@@ -705,6 +969,8 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
             channelId: true,
             originalName: true,
             sourceMeta: true,
+            localPath: true,
+            pathNormalized: true,
           },
           take: 200,
         }),
@@ -718,11 +984,54 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
     const grouped = new Map<string, typeof unscheduledAssets>();
     for (const asset of unscheduledAssets) {
       const sourceMeta = (asset.sourceMeta ?? {}) as Record<string, unknown>;
-      const groupKeyRaw = sourceMeta.groupKey;
-      const groupKey =
-        typeof groupKeyRaw === 'string' && groupKeyRaw.trim()
-          ? groupKeyRaw.trim()
-          : `asset-${asset.id.toString()}`;
+      const primaryGroupKeyRaw = sourceMeta.groupKey;
+      const primaryGroupKey =
+        typeof primaryGroupKeyRaw === 'string' && primaryGroupKeyRaw.trim()
+          ? primaryGroupKeyRaw.trim()
+          : null;
+      const secondaryGroupKey =
+        extractSecondaryGroupKeyFromPath(asset.pathNormalized) ??
+        extractSecondaryGroupKeyFromPath(asset.localPath);
+      const groupedPathLike = asset.pathNormalized ?? asset.localPath;
+      const fromGroupedPath = isGroupedPath(groupedPathLike);
+
+      let groupKey = primaryGroupKey;
+      if (!groupKey && secondaryGroupKey) {
+        groupKey = secondaryGroupKey;
+        logger.info('[typeb_group] 使用 secondaryGroupKey 修复分组', {
+          mediaAssetId: asset.id.toString(),
+          channelId: asset.channelId.toString(),
+          secondaryGroupKey,
+          typeb_group_key_secondary_resolved_total: 1,
+        });
+      }
+
+      if (primaryGroupKey && secondaryGroupKey && primaryGroupKey !== secondaryGroupKey) {
+        logger.warn('[typeb_group] 检测到主次分组键不一致，按主键优先', {
+          mediaAssetId: asset.id.toString(),
+          channelId: asset.channelId.toString(),
+          groupKeyPrimary: primaryGroupKey,
+          groupKeySecondary: secondaryGroupKey,
+          typeb_group_key_conflict_total: 1,
+        });
+      }
+
+      if (!groupKey && fromGroupedPath) {
+        logger.warn('[typeb_group] grouped 路径缺失可用 groupKey，阻止错误分组', {
+          mediaAssetId: asset.id.toString(),
+          channelId: asset.channelId.toString(),
+          originalName: asset.originalName,
+          pathLike: groupedPathLike,
+          reason: 'group_key_missing_for_grouped_path',
+          typeb_group_key_missing_total: 1,
+        });
+        continue;
+      }
+
+      if (!groupKey) {
+        groupKey = `asset-${asset.id.toString()}`;
+      }
+
       const key = `${asset.channelId.toString()}::${groupKey}`;
       const bucket = grouped.get(key);
       if (bucket) bucket.push(asset);
@@ -734,13 +1043,59 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
       const sorted = [...assets].sort((a, b) =>
         String(a.originalName || '').localeCompare(String(b.originalName || ''), 'zh-CN'),
       );
-      if (sorted.length > 1) {
+      const groupSlot = new Date(now.getTime());
+      const isRealGroup = sorted.length > 1;
+
+      if (groupKey.toLowerCase().startsWith('grouped-') && sorted.length === 1) {
+        logger.warn('[typeb_group] grouped 单元素组已识别，保持等待组装不降级单发', {
+          channelId: sorted[0].channelId.toString(),
+          groupKey,
+          mediaAssetId: sorted[0].id.toString(),
+          typeb_group_singleton_detected_total: 1,
+        });
+      }
+
+      if (isRealGroup) {
         groupScheduledCount += 1;
+      }
+
+      if (isRealGroup && groupKey) {
+        await withPrismaRetry(
+          () =>
+            (prisma as any).dispatchGroupTask.upsert({
+              where: {
+                channelId_scheduleSlot_groupKey: {
+                  channelId: sorted[0].channelId,
+                  scheduleSlot: groupSlot,
+                  groupKey,
+                },
+              },
+              create: {
+                channelId: sorted[0].channelId,
+                groupKey,
+                scheduleSlot: groupSlot,
+                status: TaskStatus.pending,
+                retryCount: 0,
+                maxRetries: definition.priority ? 6 : 6,
+                nextRunAt: groupSlot,
+                readyDeadlineAt: new Date(groupSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
+                expectedMediaCount: sorted.length,
+                actualReadyCount: 0,
+              },
+              update: {
+                nextRunAt: groupSlot,
+                expectedMediaCount: sorted.length,
+                readyDeadlineAt: new Date(groupSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
+                updatedAt: new Date(),
+              },
+            }),
+          { label: 'dispatch.scheduleDispatchForDefinition.upsertDispatchGroupTask' },
+        );
       }
 
       for (let i = 0; i < sorted.length; i += 1) {
         const asset = sorted[i];
-        const slot = new Date(now.getTime() + i * 1000);
+        const slot = new Date(groupSlot.getTime() + i * 1000);
 
         await withPrismaRetry(
           () =>

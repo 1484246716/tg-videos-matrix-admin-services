@@ -117,14 +117,23 @@ async function finalizeDownloadedFile(params: {
 }
 
 async function persistMessageTextFile(params: {
-  finalStemPath: string;
+  finalDir: string;
   messageText?: string | null;
 }) {
   const text = (params.messageText ?? '').trim();
   if (!text) return;
 
-  const txtPath = `${params.finalStemPath}.txt`;
+  const txtPath = path.join(params.finalDir, 'message.txt');
   await writeFile(txtPath, text, 'utf8');
+}
+
+async function cleanupLegacyStemTextFile(finalPath: string) {
+  const parsed = path.parse(finalPath);
+  const legacyTxtPath = path.join(parsed.dir, `${parsed.name}.txt`);
+  const messageTxtPath = path.join(parsed.dir, 'message.txt');
+
+  if (legacyTxtPath === messageTxtPath) return;
+  await rm(legacyTxtPath, { force: true });
 }
 
 async function validateDownloadedFile(params: {
@@ -684,16 +693,17 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
       tempFilePath,
     });
 
-    const { finalPath, finalStemPath } = await finalizeDownloadedFile({
+    const { finalPath } = await finalizeDownloadedFile({
       tempFilePath,
       finalDir: targetPath,
       finalFileName: fileName,
     });
 
     await persistMessageTextFile({
-      finalStemPath,
+      finalDir: targetPath,
       messageText: item.messageText,
     });
+    await cleanupLegacyStemTextFile(finalPath);
 
     await prisma.cloneCrawlItem.update({
       where: { id: itemId },

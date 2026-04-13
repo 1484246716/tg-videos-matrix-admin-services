@@ -164,4 +164,10 @@ export class CloneChannelsController {
   verifyAccount(@Param('id') id: string) {
     return this.cloneChannelsService.verifyAccount(id);
   }
+
+  @Permissions('channels:update')
+  @Post('accounts/:id/logout')
+  logoutAccount(@Param('id') id: string) {
+    return this.cloneChannelsService.logoutAccount(id);
+  }
 }

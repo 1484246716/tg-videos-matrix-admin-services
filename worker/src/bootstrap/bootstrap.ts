@@ -23,6 +23,7 @@ import { auditTypeAHealth } from '../services/typea-audit.service';
 import { enqueueChangedCollectionEpisodes } from '../services/search-index-trigger.service';
 import { TYPEA_RECONCILE_ENABLED, CLONE_DOWNLOAD_RECONCILE_ENABLED } from '../config/env';
 import { auditCloneHealth } from '../clone-channels/services/clone-audit.service';
+import { auditTypeBGroupSendHealth } from '../services/typeb-audit.service';
 import { reconcileCloneDownloadStuck } from '../clone-channels/services/clone-download-reconcile.service';
 import '../workers/dispatch.worker';
 import '../workers/relay-upload.worker';
@@ -169,6 +170,10 @@ export async function bootstrapWorker() {
 
     void auditCloneHealth().catch((err) => {
       logError('[scheduler:clone-audit] 巡检快照异常', err);
+    });
+
+    void auditTypeBGroupSendHealth().catch((err) => {
+      logError('[scheduler:typeb-group-audit] 巡检快照异常', err);
     });
 
     if (CLONE_DOWNLOAD_RECONCILE_ENABLED) {

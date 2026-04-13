@@ -53,6 +53,56 @@ export const logger = winston.createLogger({
   transports: [fileTransport, cloneFileTransport, consoleTransport],
 });
 
+export function toReadableErrorSummary(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message || error.name || 'Unknown error';
+  }
+
+  if (typeof error === 'string') {
+    return error;
+  }
+
+  if (typeof error === 'number' || typeof error === 'boolean' || error === null || error === undefined) {
+    return String(error);
+  }
+
+  if (typeof error === 'object') {
+    const errObj = error as {
+      message?: unknown;
+      code?: unknown;
+      name?: unknown;
+      error?: unknown;
+    };
+
+    if (typeof errObj.message === 'string' && errObj.message.trim()) {
+      return errObj.message;
+    }
+
+    if (typeof errObj.error === 'string' && errObj.error.trim()) {
+      return errObj.error;
+    }
+
+    try {
+      const json = JSON.stringify(error);
+      if (json && json !== '{}') {
+        return json;
+      }
+    } catch {
+      // ignore
+    }
+
+    if (typeof errObj.code === 'string' && errObj.code.trim()) {
+      return `Error code: ${errObj.code}`;
+    }
+
+    if (typeof errObj.name === 'string' && errObj.name.trim()) {
+      return errObj.name;
+    }
+  }
+
+  return 'Unknown error';
+}
+
 export function logError(message: string, error?: unknown) {
   if (!error) {
     logger.error(message);
@@ -64,5 +114,5 @@ export function logError(message: string, error?: unknown) {
     return;
   }
 
-  logger.error(message, { error });
+  logger.error(message, { error, errorSummary: toReadableErrorSummary(error) });
 }

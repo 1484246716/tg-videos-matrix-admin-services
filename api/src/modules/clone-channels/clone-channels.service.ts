@@ -811,4 +811,38 @@ export class CloneChannelsService {
 
     return this.serializeBigInt(updated);
   }
+
+  async logoutAccount(id: string) {
+    const accountId = this.assertTaskId(id);
+
+    const account = await this.prisma.cloneCrawlAccount.findUnique({
+      where: { id: accountId },
+      select: { id: true, accountPhone: true },
+    });
+
+    if (!account) {
+      throw new NotFoundException('clone crawl account not found');
+    }
+
+    const updated = await this.prisma.cloneCrawlAccount.update({
+      where: { id: accountId },
+      data: {
+        status: 'expired',
+        sessionString: '',
+        lastCheckAt: new Date(),
+        lastErrorCode: 'manual_logout',
+        lastErrorMessage: 'Logged out by operator',
+      },
+      select: {
+        id: true,
+        accountPhone: true,
+        accountType: true,
+        status: true,
+        lastLoginAt: true,
+        lastCheckAt: true,
+      },
+    });
+
+    return this.serializeBigInt(updated);
+  }
 }

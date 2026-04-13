@@ -78,6 +78,7 @@ export type TelegramRequestMethod =
     | 'sendVideo'
     | 'sendPhoto'
     | 'sendDocument'
+    | 'sendMediaGroup'
     | 'sendMessage'
     | 'pinChatMessage'
     | 'unpinChatMessage'
@@ -96,8 +97,12 @@ export type TelegramRequestArgs = {
 
 export type TelegramResponse = {
   messageId?: number;
+  messageIds?: number[];
+  mediaGroupId?: string;
   videoFileId?: string;
   videoFileUniqueId?: string;
+  photoFileId?: string;
+  photoFileUniqueId?: string;
   documentFileId?: string;
   documentFileUniqueId?: string;
   animationFileId?: string;
@@ -143,6 +148,17 @@ function computeRetryDelayMs(attempt: number, retryAfterSec?: number) {
   return expSec * 1000 + jitter;
 }
 
+function stringifyForLog(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') return value;
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<TelegramResponse> {
   const endpoint = `${normalizeTelegramApiBase(telegramApiBase)}/bot${args.botToken}/${args.method}`;
 
@@ -177,7 +193,7 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
         : undefined;
       const response = await axios.post(endpoint, args.payload, {
         headers: isFormData
-          ? { ...formHeaders, 'content-length': (args.payload as FormData).getLengthSync() }
+          ? { ...formHeaders }
           : { 'content-type': 'application/json' },
         timeout: timeoutMs,
         maxBodyLength: Infinity,
@@ -279,6 +295,7 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
         retryAfterSec,
       };
 
+      const responseRaw = stringifyForLog(json);
       const logPayload = {
         method: args.method,
         status: responseStatus,
@@ -287,6 +304,8 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
         description,
         parameters: json?.parameters ?? null,
         response: json,
+        responseRaw,
+        responseType: typeof json,
         attempt,
       };
 
@@ -312,6 +331,13 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
         continue;
       }
 
+      if (Number(errorCode) === 400) {
+        logger.error('[telegram] 请求失败(400详细响应)', {
+          ...logPayload,
+          hint: '请优先查看 responseRaw / description / parameters 定位非法参数',
+        });
+      }
+
       logError('[telegram] 请求失败', logPayload);
       throw err;
     }
@@ -335,20 +361,43 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
     ? updates.reduce((max, update) => (update.update_id > max ? update.update_id : max), updates[0].update_id)
     : undefined;
 
+  const resultArray =
+    Array.isArray(json.result)
+      ? (json.result as Array<{
+          message_id?: number;
+          media_group_id?: string;
+          video?: { file_id?: string; file_unique_id?: string };
+          photo?: Array<{ file_id?: string; file_unique_id?: string }>;
+          document?: { file_id?: string; file_unique_id?: string };
+          animation?: { file_id?: string; file_unique_id?: string };
+        }>)
+      : undefined;
+
   const resultObject =
     !Array.isArray(json.result) && json.result && typeof json.result === 'object'
       ? (json.result as {
           message_id?: number;
+          media_group_id?: string;
           video?: { file_id?: string; file_unique_id?: string };
+          photo?: Array<{ file_id?: string; file_unique_id?: string }>;
           document?: { file_id?: string; file_unique_id?: string };
           animation?: { file_id?: string; file_unique_id?: string };
         })
       : undefined;
 
+  const photoVariants = resultObject?.photo;
+  const photoLargest = Array.isArray(photoVariants) && photoVariants.length > 0
+    ? photoVariants[photoVariants.length - 1]
+    : undefined;
+
   return {
     messageId: resultObject?.message_id,
+    messageIds: resultArray?.map((x) => Number(x.message_id)).filter((n) => Number.isFinite(n)),
+    mediaGroupId: resultObject?.media_group_id ?? resultArray?.[0]?.media_group_id,
     videoFileId: resultObject?.video?.file_id,
     videoFileUniqueId: resultObject?.video?.file_unique_id,
+    photoFileId: photoLargest?.file_id,
+    photoFileUniqueId: photoLargest?.file_unique_id,
     documentFileId: resultObject?.document?.file_id,
     documentFileUniqueId: resultObject?.document?.file_unique_id,
     animationFileId: resultObject?.animation?.file_id,

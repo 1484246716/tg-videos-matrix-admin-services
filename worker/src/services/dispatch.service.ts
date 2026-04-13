@@ -1,11 +1,13 @@
-import { TaskStatus } from '@prisma/client';
+import { rm } from 'node:fs/promises';
+import path from 'node:path';
+import { DispatchMediaType, TaskStatus } from '@prisma/client';
 import { generateTextWithAiProfile } from '../ai-provider';
 import { DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED } from '../config/env';
 import { prisma, withPrismaRetry } from '../infra/prisma';
 import { searchIndexQueue } from '../infra/redis';
 import { logger, logError } from '../logger';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
-import { sendVideoByTelegram, TelegramError } from '../shared/telegram';
+import { sendPhotoByTelegram, sendTelegramRequest, sendVideoByTelegram, TelegramError } from '../shared/telegram';
 import { classifyAndAssignForTypeB } from './typeb-category.service';
 
 function isParseEntitiesError(error: { code?: string; message?: string } | null | undefined) {
@@ -31,6 +33,30 @@ function isDeterministicDispatchError(error: { code?: string; message?: string }
     message.includes('分发任务或频道未配置机器人') ||
     message.includes('未找到可用机器人')
   );
+}
+
+function isPhotoAsVideoError(error: { code?: string; message?: string } | null | undefined) {
+  const message = (error?.message ?? '').toLowerCase();
+  return error?.code === 'TG_400' && message.includes("can't use file of type photo as video");
+}
+
+function isVideoAsPhotoError(error: { code?: string; message?: string } | null | undefined) {
+  const message = (error?.message ?? '').toLowerCase();
+  return error?.code === 'TG_400' && message.includes("can't use file of type video as photo");
+}
+
+function resolveDispatchMethod(meta: Record<string, unknown> | null | undefined, originalName: string) {
+  const mediaTypeRaw = typeof meta?.relayResolvedMediaType === 'string' ? meta.relayResolvedMediaType.toLowerCase() : '';
+  if (mediaTypeRaw === 'photo') return 'sendPhoto' as const;
+  if (mediaTypeRaw === 'video') return 'sendVideo' as const;
+
+  const mimeType = typeof meta?.mimeType === 'string' ? meta.mimeType.toLowerCase() : '';
+  if (mimeType.startsWith('image/')) return 'sendPhoto' as const;
+  if (mimeType.startsWith('video/')) return 'sendVideo' as const;
+
+  const lowerName = originalName.toLowerCase();
+  if (/\.(jpg|jpeg|png|webp)$/i.test(lowerName)) return 'sendPhoto' as const;
+  return 'sendVideo' as const;
 }
 
 function getFileStem(fileName: string) {
@@ -104,6 +130,618 @@ function sanitizeTypeBCaptionUnknown(caption: string, fallbackTitle: string) {
   return next;
 }
 
+function normalizeCaptionText(raw?: string | null) {
+  if (!raw) return '';
+  return raw.replace(/^\uFEFF/, '').trim();
+}
+
+function resolveCaptionFromSourceMeta(meta: Record<string, unknown> | null | undefined) {
+  if (!meta) return '';
+  const direct = typeof meta.caption === 'string' ? meta.caption : '';
+  if (direct.trim()) return normalizeCaptionText(direct);
+  const msg = typeof meta.messageText === 'string' ? meta.messageText : '';
+  return normalizeCaptionText(msg);
+}
+
+function toFiniteNumber(v: unknown) {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string' && v.trim()) {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function readMediaDimensions(meta: Record<string, unknown> | null | undefined) {
+  const width = toFiniteNumber(meta?.width) ?? toFiniteNumber(meta?.videoWidth) ?? toFiniteNumber(meta?.imageWidth);
+  const height = toFiniteNumber(meta?.height) ?? toFiniteNumber(meta?.videoHeight) ?? toFiniteNumber(meta?.imageHeight);
+  if (!width || !height || width <= 0 || height <= 0) {
+    return { width: null, height: null, aspectRatio: null, area: null };
+  }
+  const aspectRatio = width / height;
+  return { width, height, aspectRatio, area: width * height };
+}
+
+function classifyImageOrientation(aspectRatio: number | null) {
+  if (!aspectRatio) return 'square' as const;
+  if (aspectRatio >= 1.2) return 'landscape' as const;
+  if (aspectRatio <= 0.85) return 'portrait' as const;
+  return 'square' as const;
+}
+
+function resolveMediaTypeByMeta(meta: Record<string, unknown> | null | undefined, originalNameHint?: string | null) {
+  const relayResolvedMediaType =
+    typeof meta?.relayResolvedMediaType === 'string' ? meta.relayResolvedMediaType.toLowerCase() : '';
+  if (relayResolvedMediaType === 'photo' || relayResolvedMediaType === 'image') return 'photo' as const;
+  if (relayResolvedMediaType === 'video') return 'video' as const;
+
+  const mime = typeof meta?.mimeType === 'string' ? meta.mimeType.toLowerCase() : '';
+  if (mime.startsWith('image/')) return 'photo' as const;
+  if (mime.startsWith('video/')) return 'video' as const;
+
+  const originalNameFromMeta = typeof meta?.originalName === 'string' ? meta.originalName : '';
+  const originalName = (originalNameFromMeta || originalNameHint || '').toLowerCase();
+  if (/\.(jpg|jpeg|png|webp|gif|bmp|heic|heif)$/i.test(originalName)) return 'photo' as const;
+  if (/\.(mp4|mov|mkv|avi|webm|m4v)$/i.test(originalName)) return 'video' as const;
+
+  const localPath = typeof meta?.localPath === 'string' ? meta.localPath.toLowerCase() : '';
+  if (/\.(jpg|jpeg|png|webp|gif|bmp|heic|heif)$/i.test(localPath)) return 'photo' as const;
+  if (/\.(mp4|mov|mkv|avi|webm|m4v)$/i.test(localPath)) return 'video' as const;
+
+  return null;
+}
+
+function isDispatchScopedTempDirName(dirName: string) {
+  return /^(single|grouped)-[a-z0-9][a-z0-9_-]*$/i.test(dirName);
+}
+
+function resolveDispatchScopedDirFromMeta(meta: Record<string, unknown> | null | undefined) {
+  const localPath = typeof meta?.localPath === 'string' ? meta.localPath : '';
+  if (!localPath) return null;
+
+  const normalized = localPath.replace(/\\/g, '/');
+  const match = normalized.match(/(.+\/((?:single|grouped)-[^/]+))\//i);
+  if (!match || !match[1] || !match[2]) return null;
+
+  if (!isDispatchScopedTempDirName(match[2])) {
+    return null;
+  }
+
+  return match[1].replace(/\//g, path.sep);
+}
+
+async function cleanupDispatchScopedDirectoriesAfterSuccess(tasks: Array<{ mediaAsset: { sourceMeta: unknown } }>) {
+  const dirs = new Set<string>();
+  for (const t of tasks) {
+    const meta = t.mediaAsset.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
+      ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
+      : null;
+    const dir = resolveDispatchScopedDirFromMeta(meta);
+    if (dir) dirs.add(dir);
+  }
+
+  for (const dir of dirs) {
+    const dirName = path.basename(dir);
+    if (!isDispatchScopedTempDirName(dirName)) {
+      logger.warn('[typeb_cleanup] 跳过目录清理（目录名不安全）', {
+        scopedDir: dir,
+        scopedDirName: dirName,
+      });
+      continue;
+    }
+
+    try {
+      await rm(dir, { recursive: true, force: true });
+      logger.info('[typeb_cleanup] 发送成功后目录清理完成', {
+        scopedDir: dir,
+        scopedDirName: dirName,
+      });
+    } catch (error) {
+      logger.warn('[typeb_cleanup] 目录清理失败（忽略）', {
+        scopedDir: dir,
+        scopedDirName: dirName,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+}
+
+function buildGroupCaptionFromTasks(tasks: Array<{ mediaAsset: { sourceMeta: unknown } }>) {
+  let firstTxt = '';
+  for (const t of tasks) {
+    const meta = t.mediaAsset.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
+      ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
+      : null;
+
+    const explicitMessageTxt = typeof meta?.messageTxt === 'string' ? meta.messageTxt : '';
+    if (explicitMessageTxt.trim()) {
+      return { caption: normalizeCaptionText(explicitMessageTxt), captionSource: 'message_txt' as const };
+    }
+
+    const txt = typeof meta?.txtContent === 'string' ? meta.txtContent : '';
+    if (!firstTxt && txt.trim()) {
+      firstTxt = normalizeCaptionText(txt);
+    }
+  }
+
+  if (firstTxt) {
+    return { caption: firstTxt, captionSource: 'first_txt' as const };
+  }
+
+  let longestMessageText = '';
+  for (const t of tasks) {
+    const meta = t.mediaAsset.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
+      ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
+      : null;
+    const text = typeof meta?.messageText === 'string' ? normalizeCaptionText(meta.messageText) : '';
+    if (text.length > longestMessageText.length) longestMessageText = text;
+  }
+
+  if (longestMessageText) {
+    return { caption: longestMessageText, captionSource: 'message_text' as const };
+  }
+
+  for (const t of tasks) {
+    const meta = t.mediaAsset.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
+      ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
+      : null;
+    const fromMeta = resolveCaptionFromSourceMeta(meta);
+    if (fromMeta) return { caption: fromMeta, captionSource: 'source_meta' as const };
+  }
+
+  return { caption: '', captionSource: 'none' as const };
+}
+
+export async function handleDispatchGroupJob(
+  dispatchTaskIdRaw: string,
+  jobId: string,
+  attemptsMade: number,
+) {
+  const dispatchTaskId = BigInt(dispatchTaskIdRaw);
+
+  const seedTask = await withPrismaRetry(
+    () =>
+      prisma.dispatchTask.findUnique({
+        where: { id: dispatchTaskId },
+        include: {
+          channel: {
+            select: {
+              id: true,
+              tgChatId: true,
+              defaultBotId: true,
+            },
+          },
+          mediaAsset: {
+            select: {
+              id: true,
+              telegramFileId: true,
+              dispatchMediaType: true,
+              sourceMeta: true,
+            },
+          },
+        },
+      }),
+    { label: 'dispatch.handleDispatchGroupJob.findSeedTask' },
+  );
+
+  if (!seedTask || !seedTask.groupKey) {
+    throw new Error('group worker 仅处理 grouped 任务');
+  }
+
+  const groupTasks = await withPrismaRetry(
+    () =>
+      prisma.dispatchTask.findMany({
+        where: {
+          channelId: seedTask.channelId,
+          groupKey: seedTask.groupKey,
+          status: { in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed, TaskStatus.success] },
+        },
+        orderBy: [{ scheduleSlot: 'asc' }, { id: 'asc' }],
+        include: {
+          mediaAsset: {
+            select: {
+              id: true,
+              telegramFileId: true,
+              sourceMeta: true,
+            },
+          },
+        },
+      }),
+    { label: 'dispatch.handleDispatchGroupJob.findGroupTasks' },
+  );
+
+  const alreadySuccess = groupTasks.filter((t) => t.status === TaskStatus.success);
+  const pendingGroupTasks = groupTasks.filter(
+    (t) => t.status === TaskStatus.pending || t.status === TaskStatus.scheduled || t.status === TaskStatus.failed,
+  );
+
+  if (pendingGroupTasks.length === 0 && alreadySuccess.length > 0) {
+    logger.info('[typeb_metrics] group send skipped already success', {
+      typeb_group_send_fallback_single_total: 0,
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: seedTask.groupKey,
+      groupedTaskCount: groupTasks.length,
+    });
+    return {
+      ok: true,
+      grouped: true,
+      skipped: true,
+      reason: 'group_already_success',
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: seedTask.groupKey,
+    };
+  }
+
+  if (pendingGroupTasks.length <= 1) {
+    throw new Error(`group_not_ready: pendingGroupTasks=${pendingGroupTasks.length}`);
+  }
+
+  const sourceRelayBotIdRaw =
+    (seedTask.mediaAsset.sourceMeta as Record<string, unknown> | null | undefined)?.relayBotId;
+  const sourceRelayBotId =
+    typeof sourceRelayBotIdRaw === 'string' && /^\d+$/.test(sourceRelayBotIdRaw)
+      ? BigInt(sourceRelayBotIdRaw)
+      : null;
+  const resolvedBotId = sourceRelayBotId ?? seedTask.botId ?? seedTask.channel.defaultBotId;
+
+  if (!resolvedBotId) {
+    throw new Error('分发任务或频道未配置机器人');
+  }
+
+  const bot = await withPrismaRetry(
+    () =>
+      prisma.bot.findFirst({
+        where: {
+          id: resolvedBotId,
+          status: 'active',
+        },
+        select: { id: true, tokenEncrypted: true },
+      }),
+    { label: 'dispatch.handleDispatchGroupJob.findActiveBot' },
+  );
+
+  if (!bot) {
+    throw new Error(`未找到可用机器人: dispatchTaskId=${dispatchTaskIdRaw}`);
+  }
+
+  const pendingWithMeta = pendingGroupTasks.map((t) => {
+    const meta = t.mediaAsset.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
+      ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
+      : null;
+
+    const persistedDispatchType =
+      t.mediaAsset.dispatchMediaType === DispatchMediaType.photo
+        ? ('photo' as const)
+        : t.mediaAsset.dispatchMediaType === DispatchMediaType.video
+          ? ('video' as const)
+          : null;
+
+    const resolvedByMeta = resolveMediaTypeByMeta(meta, null);
+    const resolvedType = persistedDispatchType ?? resolvedByMeta;
+
+    return {
+      task: t,
+      meta,
+      persistedDispatchType,
+      resolvedByMeta,
+      resolvedType,
+    };
+  });
+
+  const unresolvedTypeCount = pendingWithMeta.filter(({ resolvedType }) => !resolvedType).length;
+
+  if (unresolvedTypeCount > 0) {
+    const unresolvedItems = pendingWithMeta
+      .filter(({ resolvedType }) => !resolvedType)
+      .map(({ task, meta }) => ({
+        taskId: task.id.toString(),
+        mediaAssetId: task.mediaAsset.id.toString(),
+        telegramFileIdPresent: Boolean(task.mediaAsset.telegramFileId),
+        relayResolvedMediaType: typeof meta?.relayResolvedMediaType === 'string' ? meta.relayResolvedMediaType : null,
+        mimeType: typeof meta?.mimeType === 'string' ? meta.mimeType : null,
+        localPath: typeof meta?.localPath === 'string' ? meta.localPath : null,
+      }));
+
+    logger.warn('[typeb_metrics] group preflight rejected: unresolved_media_type', {
+      typeb_group_preflight_reject_total: 1,
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: seedTask.groupKey,
+      unresolvedTypeCount,
+      unresolvedItems,
+      reason: 'dispatch_media_type_missing_and_meta_unresolvable',
+    });
+
+    throw new Error(`group_preflight_failed_unresolved_type: count=${unresolvedTypeCount}`);
+  }
+
+  const enriched = pendingWithMeta.map(({ task, meta, resolvedType }) => {
+    const mediaType = resolvedType as 'photo' | 'video';
+    const dims = readMediaDimensions(meta);
+    return {
+      task,
+      mediaType,
+      meta,
+      ...dims,
+      orientation: mediaType === 'photo' ? classifyImageOrientation(dims.aspectRatio) : null,
+    };
+  });
+
+  const photos = enriched.filter((x) => x.mediaType === 'photo');
+  const videos = enriched.filter((x) => x.mediaType === 'video');
+
+  let sortedMedia = enriched;
+
+  if (photos.length === 1 && videos.length === 1) {
+    // 1图1视频：依据图片比例决定“横向优先/纵向优先”，实现上仍是图在前，再视频
+    const photo = photos[0];
+    const video = videos[0];
+    sortedMedia = [photo, video];
+
+    const layoutHint =
+      photo.aspectRatio && photo.aspectRatio >= 1.2
+        ? 'left_photo_right_video'
+        : photo.aspectRatio && photo.aspectRatio <= 0.85
+          ? 'top_photo_bottom_video'
+          : 'side_by_side_preferred';
+
+    logger.info('[typeb_metrics] grouped media layout hint', {
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: seedTask.groupKey,
+      layoutHint,
+      photoAspectRatio: photo.aspectRatio,
+    });
+  } else {
+    // 多图多视频：视频在图片之后；图片按尺寸自由排列（横->方->竖，组内面积降序）
+    const photoSorted = [...photos].sort((a, b) => {
+      const rank = (o: string | null) => (o === 'landscape' ? 0 : o === 'square' ? 1 : 2);
+      const r = rank(a.orientation) - rank(b.orientation);
+      if (r !== 0) return r;
+      const areaA = a.area ?? 0;
+      const areaB = b.area ?? 0;
+      if (areaA !== areaB) return areaB - areaA;
+      return String(a.task.mediaAsset.id).localeCompare(String(b.task.mediaAsset.id));
+    });
+
+    const videoSorted = [...videos].sort((a, b) =>
+      String(a.task.mediaAsset.id).localeCompare(String(b.task.mediaAsset.id)),
+    );
+
+    sortedMedia = [...photoSorted, ...videoSorted];
+  }
+
+  const sortedGroupTasks = sortedMedia.map((x) => x.task);
+
+  const media = sortedMedia
+    .map((x, idx) => ({
+      idx,
+      taskId: x.task.id,
+      telegramFileId: x.task.mediaAsset.telegramFileId,
+      type: x.mediaType,
+      meta: x.meta,
+    }))
+    .filter((x) => Boolean(x.telegramFileId));
+
+  if (media.length < 2) {
+    throw new Error(`group_not_ready_media: mediaCount=${media.length}`);
+  }
+
+  const { caption, captionSource } = buildGroupCaptionFromTasks(sortedGroupTasks as any);
+
+  const buildInputMedia = (overrideTypeByTaskId?: Map<string, 'photo' | 'video'>) =>
+    media.map((item, index) => ({
+      type: overrideTypeByTaskId?.get(item.taskId.toString()) ?? item.type,
+      media: item.telegramFileId,
+      ...(index === 0 && caption ? { caption } : {}),
+    }));
+
+  logger.info('[typeb_metrics] group send attempt', {
+    typeb_group_send_attempt_total: 1,
+    dispatchTaskId: dispatchTaskIdRaw,
+    groupKey: seedTask.groupKey,
+    mediaCount: media.length,
+    captionSource,
+    unresolvedTypeCount,
+    mediaTypeMappingAssert: 'meta_or_mime_or_ext_single_resolver',
+    mediaTypeMapping: sortedMedia.map((m) => ({
+      taskId: m.task.id.toString(),
+      assetId: m.task.mediaAsset.id.toString(),
+      persistedDispatchMediaType: m.task.mediaAsset.dispatchMediaType ?? null,
+      relayResolvedMediaType: typeof m.meta?.relayResolvedMediaType === 'string' ? m.meta.relayResolvedMediaType : null,
+      mimeType: typeof m.meta?.mimeType === 'string' ? m.meta.mimeType : null,
+      localPath: typeof m.meta?.localPath === 'string' ? m.meta.localPath : null,
+      telegramType: m.mediaType,
+    })),
+  });
+
+  try {
+    let sendResult;
+    let correctedByRetry = false;
+
+    try {
+      sendResult = await sendTelegramRequest({
+        botToken: bot.tokenEncrypted,
+        method: 'sendMediaGroup',
+        payload: {
+          chat_id: seedTask.channel.tgChatId,
+          media: JSON.stringify(buildInputMedia()),
+        },
+      });
+    } catch (sendError) {
+      const errorObj = sendError as TelegramError;
+      if (isVideoAsPhotoError({ code: errorObj.code, message: errorObj.message })) {
+        const retryTypes = new Map<string, 'photo' | 'video'>();
+        const correctedTaskIds: string[] = [];
+
+        for (const item of sortedMedia) {
+          const taskId = item.task.id.toString();
+          const persisted = item.task.mediaAsset.dispatchMediaType;
+          if (persisted === DispatchMediaType.video && item.mediaType !== 'video') {
+            retryTypes.set(taskId, 'video');
+            correctedTaskIds.push(taskId);
+          }
+        }
+
+        if (correctedTaskIds.length === 0) {
+          logger.warn('[typeb_metrics] group type mismatch detected but no targeted correction candidate', {
+            typeb_group_type_mismatch_total: 1,
+            dispatchTaskId: dispatchTaskIdRaw,
+            groupKey: seedTask.groupKey,
+            errorCode: errorObj.code,
+            errorMessage: errorObj.message,
+          });
+          throw sendError;
+        }
+
+        logger.warn('[typeb_group] sendMediaGroup 检测到 Video 被当作 Photo，执行定向纠错重试', {
+          typeb_group_retry_corrected_total: 1,
+          dispatchTaskId: dispatchTaskIdRaw,
+          groupKey: seedTask.groupKey,
+          mediaCount: media.length,
+          correctedTaskIds,
+          retryMode: 'targeted_by_persisted_dispatch_media_type',
+          errorCode: errorObj.code,
+          errorMessage: errorObj.message,
+        });
+
+        correctedByRetry = true;
+        sendResult = await sendTelegramRequest({
+          botToken: bot.tokenEncrypted,
+          method: 'sendMediaGroup',
+          payload: {
+            chat_id: seedTask.channel.tgChatId,
+            media: JSON.stringify(buildInputMedia(retryTypes)),
+          },
+        });
+      } else {
+        throw sendError;
+      }
+    }
+
+    const firstMessageId = sendResult.messageIds?.[0] ?? sendResult.messageId;
+
+    await withPrismaRetry(
+      () =>
+        prisma.$transaction([
+          ...sortedGroupTasks.map((t) =>
+            prisma.dispatchTask.update({
+              where: { id: t.id },
+              data: {
+                status: TaskStatus.success,
+                finishedAt: new Date(),
+                botId: bot.id,
+                telegramMessageId: firstMessageId ? BigInt(firstMessageId) : undefined,
+                telegramMessageLink: firstMessageId
+                  ? `https://t.me/c/${seedTask.channel.tgChatId.replace('-100', '')}/${firstMessageId}`
+                  : null,
+                telegramErrorCode: null,
+                telegramErrorMessage: null,
+              },
+            }),
+          ),
+          prisma.channel.update({
+            where: { id: seedTask.channelId },
+            data: { lastPostAt: new Date() },
+          }),
+        ]),
+      { label: 'dispatch.handleDispatchGroupJob.markGroupSuccess' },
+    );
+
+    logger.info('[typeb_metrics] group send success', {
+      typeb_group_send_success_total: 1,
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: seedTask.groupKey,
+      sentCount: media.length,
+      mediaGroupId: sendResult.mediaGroupId ?? null,
+      captionSource,
+      correctedByRetry,
+    });
+
+    await cleanupDispatchScopedDirectoriesAfterSuccess(
+      sortedGroupTasks as Array<{ mediaAsset: { sourceMeta: unknown } }>,
+    );
+
+    return {
+      ok: true,
+      grouped: true,
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: seedTask.groupKey,
+      sentCount: media.length,
+      firstMessageId,
+      mediaGroupId: sendResult.mediaGroupId ?? null,
+    };
+  } catch (error) {
+    const now = new Date();
+    const errorObj = error as TelegramError;
+    const message = errorObj.message || '未知组级分发错误';
+    const code = errorObj.code || 'GROUP_DISPATCH_ERROR';
+
+    let deadCount = 0;
+    let failedCount = 0;
+
+    for (const t of sortedGroupTasks) {
+      const nextRetryCount = t.retryCount + 1;
+      const retryAfterSec = errorObj.retryAfterSec;
+      const fallbackBackoffSec = getBackoffSeconds(nextRetryCount);
+      const finalBackoffSec = retryAfterSec ?? fallbackBackoffSec;
+      const nextRunAt = new Date(Date.now() + finalBackoffSec * 1000);
+      const deterministic = isDeterministicDispatchError({ code, message });
+      const exceeded = nextRetryCount > t.maxRetries;
+      const nextStatus = exceeded || deterministic ? TaskStatus.dead : TaskStatus.failed;
+
+      if (nextStatus === TaskStatus.dead) deadCount += 1;
+      else failedCount += 1;
+
+      await withPrismaRetry(
+        () =>
+          prisma.dispatchTask.update({
+            where: { id: t.id },
+            data: {
+              status: nextStatus,
+              retryCount: nextRetryCount,
+              nextRunAt: nextStatus === TaskStatus.dead ? t.nextRunAt : nextRunAt,
+              telegramErrorCode: code,
+              telegramErrorMessage: message,
+              finishedAt: now,
+            },
+          }),
+        { label: 'dispatch.handleDispatchGroupJob.markFailedOrDead' },
+      );
+
+      await withPrismaRetry(
+        () =>
+          prisma.dispatchTaskLog.create({
+            data: {
+              dispatchTaskId: t.id,
+              action: nextStatus === TaskStatus.dead ? 'task_dead_group_send' : 'task_failed_group_send',
+              detail: {
+                groupKey: seedTask.groupKey,
+                errorCode: code,
+                errorMessage: message,
+                retryCount: nextRetryCount,
+                deterministic,
+              },
+            },
+          }),
+        { label: 'dispatch.handleDispatchGroupJob.logFailedOrDead' },
+      );
+    }
+
+    logger.warn('[typeb_metrics] group send failed', {
+      typeb_group_send_failed_total: failedCount > 0 ? 1 : 0,
+      typeb_group_send_dead_total: deadCount > 0 ? 1 : 0,
+      typeb_group_send_retry_total: failedCount,
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: seedTask.groupKey,
+      errorCode: code,
+      errorMessage: message,
+      failedCount,
+      deadCount,
+    });
+
+    throw error;
+  }
+}
+
 export async function handleDispatchJob(
   dispatchTaskIdRaw: string,
   jobId: string,
@@ -150,129 +788,53 @@ export async function handleDispatchJob(
   }
 
   if (task.groupKey) {
-    const blockers = await withPrismaRetry(
+    const delayTo = new Date(Date.now() + 10 * 1000);
+    await withPrismaRetry(
       () =>
-        prisma.dispatchTask.findMany({
-          where: {
-            channelId: task.channelId,
-            groupKey: task.groupKey,
-            id: { not: task.id },
-            scheduleSlot: { lt: task.scheduleSlot },
-            status: { in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.running, TaskStatus.failed] },
+        prisma.dispatchTask.update({
+          where: { id: dispatchTaskId },
+          data: {
+            status: TaskStatus.scheduled,
+            nextRunAt: delayTo,
           },
-          select: {
-            id: true,
-            scheduleSlot: true,
-            status: true,
-            retryCount: true,
-            maxRetries: true,
-          },
-          orderBy: { scheduleSlot: 'asc' },
-          take: 1,
         }),
-      { label: 'dispatch.handleDispatchJob.findGroupBlockers' },
+      { label: 'dispatch.handleDispatchJob.groupMasterRedirect' },
     );
 
-    const blocker = blockers[0];
-    if (blocker) {
-      const delayTo = new Date(Date.now() + 30 * 1000);
-      await withPrismaRetry(
-        () =>
-          prisma.dispatchTask.update({
-            where: { id: dispatchTaskId },
-            data: {
-              status: TaskStatus.scheduled,
-              nextRunAt: delayTo,
-            },
-          }),
-        { label: 'dispatch.handleDispatchJob.groupOrderDelay' },
-      );
-
-      await withPrismaRetry(
-        () =>
-          prisma.dispatchTaskLog.create({
-            data: {
-              dispatchTaskId,
-              action: 'task_group_order_delayed',
-              detail: {
-                groupKey: task.groupKey,
-                blockedByTaskId: blocker.id.toString(),
-                blockedByStatus: blocker.status,
-                nextRunAt: delayTo.toISOString(),
-              },
-            },
-          }),
-        { label: 'dispatch.handleDispatchJob.groupOrderDelayLog' },
-      );
-
-      return {
-        ok: false,
-        delayed: true,
-        reason: 'group_order_blocked',
-        blockedByTaskId: blocker.id.toString(),
-      };
-    }
-
-    const deadOrCancelledBlockers = await withPrismaRetry(
+    await withPrismaRetry(
       () =>
-        prisma.dispatchTask.findMany({
-          where: {
-            channelId: task.channelId,
-            groupKey: task.groupKey,
-            id: { not: task.id },
-            scheduleSlot: { lt: task.scheduleSlot },
-            status: { in: [TaskStatus.dead, TaskStatus.cancelled] },
+        prisma.dispatchTaskLog.create({
+          data: {
+            dispatchTaskId,
+            action: 'task_group_master_redirected',
+            detail: {
+              groupKey: task.groupKey,
+              reason: 'grouped_assets_must_use_dispatch_send_group',
+              nextRunAt: delayTo.toISOString(),
+            },
           },
-          select: {
-            id: true,
-            status: true,
-          },
-          orderBy: { scheduleSlot: 'asc' },
-          take: 1,
         }),
-      { label: 'dispatch.handleDispatchJob.findDeadOrCancelledGroupBlockers' },
+      { label: 'dispatch.handleDispatchJob.groupMasterRedirectLog' },
     );
 
-    const deadBlocker = deadOrCancelledBlockers[0];
-    if (deadBlocker) {
-      await withPrismaRetry(
-        () =>
-          prisma.dispatchTask.update({
-            where: { id: dispatchTaskId },
-            data: {
-              status: TaskStatus.dead,
-              finishedAt: new Date(),
-              telegramErrorCode: 'group_blocked_dead_prev',
-              telegramErrorMessage: `blocked by previous ${deadBlocker.status} task in same group`,
-            },
-          }),
-        { label: 'dispatch.handleDispatchJob.deadByGroupBlocker' },
-      );
+    logger.info('[typeb_group] 单条任务重定向到组任务主路径', {
+      dispatchTaskId: dispatchTaskIdRaw,
+      channelId: task.channelId.toString(),
+      groupKey: task.groupKey,
+      nextRunAt: delayTo.toISOString(),
+      typeb_group_master_redirect_total: 1,
+    });
 
-      await withPrismaRetry(
-        () =>
-          prisma.dispatchTaskLog.create({
-            data: {
-              dispatchTaskId,
-              action: 'task_dead_group_blocked',
-              detail: {
-                groupKey: task.groupKey,
-                blockedByTaskId: deadBlocker.id.toString(),
-                blockedByStatus: deadBlocker.status,
-              },
-            },
-          }),
-        { label: 'dispatch.handleDispatchJob.deadByGroupBlockerLog' },
-      );
-
-      return {
-        ok: false,
-        dead: true,
-        reason: 'group_blocked_by_dead_prev',
-        blockedByTaskId: deadBlocker.id.toString(),
-      };
-    }
+    return {
+      ok: true,
+      redirected: true,
+      reason: 'group_master_redirected',
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: task.groupKey,
+    };
   }
+
+
 
   await withPrismaRetry(
     () =>
@@ -520,37 +1082,73 @@ export async function handleDispatchJob(
       }
     }
 
-    let sendResult;
-    try {
-      sendResult = await sendVideoByTelegram({
+    const dispatchMethod = resolveDispatchMethod(mediaSourceMeta, task.mediaAsset.originalName);
+
+    logger.info('[q_dispatch] 最终选用发送方法', {
+      dispatchTaskId: dispatchTaskIdRaw,
+      channelId: task.channelId.toString(),
+      mediaAssetId: task.mediaAsset.id.toString(),
+      dispatchMethod,
+      relayResolvedMediaType:
+        typeof mediaSourceMeta?.relayResolvedMediaType === 'string'
+          ? mediaSourceMeta.relayResolvedMediaType
+          : null,
+      mimeType: typeof mediaSourceMeta?.mimeType === 'string' ? mediaSourceMeta.mimeType : null,
+      originalName: task.mediaAsset.originalName,
+    });
+
+    const sendWithMethod = async (method: 'sendVideo' | 'sendPhoto', parseMode: string | null | undefined) => {
+      if (method === 'sendPhoto') {
+        return sendPhotoByTelegram({
+          botToken: bot.tokenEncrypted,
+          chatId: task.channel.tgChatId,
+          fileId: task.mediaAsset.telegramFileId,
+          caption: finalCaption,
+          parseMode,
+          replyMarkup: task.replyMarkup ?? task.channel.aiReplyMarkup ?? undefined,
+        });
+      }
+
+      return sendVideoByTelegram({
         botToken: bot.tokenEncrypted,
         chatId: task.channel.tgChatId,
         fileId: task.mediaAsset.telegramFileId,
         caption: finalCaption,
-        parseMode: task.parseMode,
+        parseMode,
         replyMarkup: task.replyMarkup ?? task.channel.aiReplyMarkup ?? undefined,
       });
+    };
+
+    let sendResult;
+    try {
+      sendResult = await sendWithMethod(dispatchMethod, task.parseMode);
     } catch (sendError) {
       const errorObj = sendError as TelegramError;
-      if (
+
+      if (isPhotoAsVideoError({ code: errorObj.code, message: errorObj.message })) {
+        logger.warn('[q_dispatch] 识别到 Photo 被当作 Video，自动降级为 sendPhoto 重试', {
+          dispatchTaskId: dispatchTaskIdRaw,
+          channelId: task.channelId.toString(),
+          originalMethod: dispatchMethod,
+          retryMethod: 'sendPhoto',
+          errorCode: errorObj.code,
+          errorMessage: errorObj.message,
+        });
+
+        sendResult = await sendWithMethod('sendPhoto', task.parseMode);
+      } else if (
         task.parseMode?.toUpperCase() === 'HTML' &&
         isParseEntitiesError({ code: errorObj.code, message: errorObj.message })
       ) {
         logger.warn('[q_dispatch] HTML 解析失败，回退纯文本重发', {
           dispatchTaskId: dispatchTaskIdRaw,
           channelId: task.channelId.toString(),
+          method: dispatchMethod,
           errorCode: errorObj.code,
           errorMessage: errorObj.message,
         });
 
-        sendResult = await sendVideoByTelegram({
-          botToken: bot.tokenEncrypted,
-          chatId: task.channel.tgChatId,
-          fileId: task.mediaAsset.telegramFileId,
-          caption: finalCaption,
-          parseMode: null,
-          replyMarkup: task.replyMarkup ?? task.channel.aiReplyMarkup ?? undefined,
-        });
+        sendResult = await sendWithMethod(dispatchMethod, null);
       } else {
         throw sendError;
       }
@@ -590,6 +1188,10 @@ export async function handleDispatchJob(
         },
       },
     });
+
+    await cleanupDispatchScopedDirectoriesAfterSuccess([
+      { mediaAsset: { sourceMeta: task.mediaAsset.sourceMeta } },
+    ]);
 
     // ── 触发搜索索引更新（延迟2秒等AI caption等后续处理完成）──
     try {

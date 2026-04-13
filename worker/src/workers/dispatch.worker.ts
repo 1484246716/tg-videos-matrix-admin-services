@@ -1,13 +1,21 @@
 import { Worker } from 'bullmq';
 import { connection } from '../infra/redis';
 import { logger, logError } from '../logger';
-import { handleDispatchJob } from '../services/dispatch.service';
+import { handleDispatchJob, handleDispatchGroupJob } from '../services/dispatch.service';
 
 export const dispatchWorker = new Worker(
   'q_dispatch',
   async (job) => {
     if (job.name === 'bootstrap-check') {
       return { ok: true, skipped: true, reason: 'bootstrap-check' };
+    }
+
+    if (job.name === 'dispatch-send-group') {
+      const dispatchTaskIdRaw = job.data.dispatchTaskId as string | undefined;
+      if (!dispatchTaskIdRaw) {
+        throw new Error('组任务负载缺少 dispatchTaskId');
+      }
+      return handleDispatchGroupJob(dispatchTaskIdRaw, String(job.id), job.attemptsMade);
     }
 
     const dispatchTaskIdRaw = job.data.dispatchTaskId as string | undefined;

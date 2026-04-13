@@ -42,6 +42,47 @@ function parseGroupedMeta(filePath: string) {
   return { groupKey, groupedId };
 }
 
+function parseCloneSourceMeta(filePath: string, groupedMeta: { groupKey: string; groupedId: string | null } | null) {
+  if (!groupedMeta) return null;
+
+  const fileName = basename(filePath);
+  const ext = fileName.includes('.') ? fileName.slice(fileName.lastIndexOf('.')) : '';
+  const stem = ext ? fileName.slice(0, -ext.length) : fileName;
+  const match = stem.match(/^(.*)-(\d+)$/);
+  if (!match || !match[1] || !match[2]) return null;
+
+  const sourceChannelUsername = match[1].trim();
+  const sourceMessageId = match[2].trim();
+  if (!sourceChannelUsername || !/^\d+$/.test(sourceMessageId)) return null;
+
+  return {
+    isCloneCrawlAsset: true,
+    sourceChannelUsername,
+    sourceMessageId,
+  };
+}
+
+function buildStoredFileHash(fileHash: string, cloneSourceMeta: { sourceMessageId: string } | null) {
+  if (!cloneSourceMeta?.sourceMessageId) return fileHash;
+  return `${fileHash}:srcmsg:${cloneSourceMeta.sourceMessageId}`;
+}
+
+function shouldSkipRelayScanFile(filePath: string): { skip: boolean; reason?: string } {
+  const name = basename(filePath).toLowerCase();
+
+  // 业务派生临时缩略图，上传完成后可能被清理，不能入队
+  if (/\.tg-thumb\.(jpg|jpeg|png|webp)$/i.test(name)) {
+    return { skip: true, reason: 'derived_tg_thumb' };
+  }
+
+  // 常见临时/未完成下载文件，避免误入队导致 missing
+  if (/\.(tmp|temp|part|crdownload)$/i.test(name)) {
+    return { skip: true, reason: 'temporary_or_partial_file' };
+  }
+
+  return { skip: false };
+}
+
 function parseCollectionMeta(filePath: string) {
   const normalizedFile = filePath.replace(/\\/g, '/');
   const marker = '/collection/';
@@ -142,6 +183,15 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
 
     for (const filePath of files) {
       scannedFiles += 1;
+
+      const skipDecision = shouldSkipRelayScanFile(filePath);
+      if (skipDecision.skip) {
+        logger.info('[relay] 扫描过滤派生/临时文件，跳过入队', {
+          filePath,
+          reason: skipDecision.reason ?? 'scan_filter',
+        });
+        continue;
+      }
 
       const pathLock = await tryAcquireRelayPathLock(filePath);
       if (!pathLock.acquired) {
@@ -274,8 +324,10 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
       const hashStart = Date.now();
       const fileHash = await hashFile(filePath);
       const hashDurationMs = Date.now() - hashStart;
-      const collectionMeta = parseCollectionMeta(filePath);
       const groupedMeta = parseGroupedMeta(filePath);
+      const cloneSourceMeta = parseCloneSourceMeta(filePath, groupedMeta);
+      const storedFileHash = buildStoredFileHash(fileHash, cloneSourceMeta);
+      const collectionMeta = parseCollectionMeta(filePath);
       if (groupedMeta?.groupKey) {
         groupedDiscovered += 1;
         groupedKeys.add(groupedMeta.groupKey);
@@ -444,7 +496,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
         asset = await prisma.mediaAsset.findUnique({
           where: {
             fileHash_fileSize: {
-              fileHash,
+              fileHash: storedFileHash,
               fileSize: s.size,
             },
           },
@@ -468,7 +520,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
               pathNormalized,
               pathFingerprint,
               fileSize: BigInt(s.size),
-              fileHash,
+              fileHash: storedFileHash,
               status: MediaStatus.ready,
               sourceMeta: {
                 relayChannelId: definition.relayChannelId.toString(),
@@ -478,6 +530,8 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
                 relayMaxRetries: definition.maxRetries,
                 ingestRetryCount: 0,
                 ...(collectionMeta ?? {}),
+                ...(groupedMeta ?? {}),
+                ...(cloneSourceMeta ?? {}),
               },
             },
             select: {
@@ -546,14 +600,34 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
         asset.status === MediaStatus.failed &&
         ingestFinalReason === TYPEA_INGEST_FINAL_REASON.retryable;
 
-      const isAlreadyUploadedDuplicate =
-        asset.status === MediaStatus.relay_uploaded ||
-        Boolean(asset.telegramFileId) ||
-        Boolean(asset.relayMessageId);
+      const cloneUploadedBySource = cloneSourceMeta
+        ? await prisma.mediaAsset.findFirst({
+            where: {
+              channelId: channel.id,
+              OR: [
+                { status: MediaStatus.relay_uploaded },
+                { telegramFileId: { not: null } },
+                { relayMessageId: { not: null } },
+              ],
+              sourceMeta: {
+                path: ['sourceMessageId'],
+                equals: cloneSourceMeta.sourceMessageId,
+              },
+            },
+            select: { id: true },
+          })
+        : null;
+
+      const isAlreadyUploadedDuplicate = cloneSourceMeta
+        ? Boolean(cloneUploadedBySource)
+        : asset.status === MediaStatus.relay_uploaded ||
+          Boolean(asset.telegramFileId) ||
+          Boolean(asset.relayMessageId);
 
       if (isAlreadyUploadedDuplicate) {
         const duplicateName = basename(filePath);
         const duplicateError = `DUPLICATE_ALREADY_UPLOADED: 本地重复文件已跳过 ${duplicateName}`;
+        const duplicateOfMediaAssetId = cloneUploadedBySource?.id?.toString?.() ?? asset.id.toString();
 
         const existingDuplicateFailed = await prisma.mediaAsset.findFirst({
           where: {
@@ -584,7 +658,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
                 ingestFinalReason: 'duplicate_already_uploaded',
                 duplicateDetectedAt: new Date().toISOString(),
                 duplicateLocalPath: filePath,
-                duplicateOfMediaAssetId: asset.id.toString(),
+                duplicateOfMediaAssetId,
               },
             },
           });
@@ -606,13 +680,13 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
                 ingestFinalReason: 'duplicate_already_uploaded',
                 duplicateDetectedAt: new Date().toISOString(),
                 duplicateLocalPath: filePath,
-                duplicateOfMediaAssetId: asset.id.toString(),
+                duplicateOfMediaAssetId,
               },
             },
           });
         }
 
-        await removeLocalDuplicateFile(filePath, asset.id.toString());
+        await removeLocalDuplicateFile(filePath, duplicateOfMediaAssetId);
         continue;
       }
 
@@ -646,6 +720,8 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
             relayPriority: definition.priority,
             relayMaxRetries: definition.maxRetries,
             ...(collectionMeta ?? {}),
+            ...(groupedMeta ?? {}),
+            ...(cloneSourceMeta ?? {}),
           },
         },
       });

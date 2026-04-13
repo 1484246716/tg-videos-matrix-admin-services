@@ -364,3 +364,50 @@ export const TG_SEND_MIN_INTERVAL_MS = (() => {
   if (!Number.isFinite(n) || n < 0) return 120;
   return Math.min(5000, Math.floor(n));
 })();
+
+/** TypeB 是否启用 grouped sendMediaGroup */
+export const TYPEB_GROUP_SEND_ENABLED =
+  process.env.TYPEB_GROUP_SEND_ENABLED !== 'false';
+
+/** TypeB 触发 grouped sendMediaGroup 的最小媒体数 */
+export const TYPEB_GROUP_SEND_MIN_MEDIA_COUNT = (() => {
+  const n = Number(process.env.TYPEB_GROUP_SEND_MIN_MEDIA_COUNT ?? '2');
+  if (!Number.isFinite(n) || n < 2) return 2;
+  return Math.min(10, Math.floor(n));
+})();
+
+/** TypeB grouped send 白名单频道（逗号分隔 channelId） */
+export const TYPEB_GROUP_SEND_WHITELIST_CHANNEL_IDS = (() => {
+  const raw = process.env.TYPEB_GROUP_SEND_WHITELIST_CHANNEL_IDS ?? '';
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => /^\d+$/.test(s));
+})();
+
+/** TypeB grouped 组装超时阈值（毫秒） */
+export const TYPEB_GROUP_READY_TIMEOUT_MS = (() => {
+  const n = Number(process.env.TYPEB_GROUP_READY_TIMEOUT_MS ?? '90000');
+  if (!Number.isFinite(n) || n < 5000) return 90000;
+  return Math.min(10 * 60 * 1000, Math.floor(n));
+})();
+
+/** TypeB grouped 未凑齐时重试检查间隔（毫秒） */
+export const TYPEB_GROUP_RETRY_CHECK_MS = (() => {
+  const n = Number(process.env.TYPEB_GROUP_RETRY_CHECK_MS ?? '10000');
+  if (!Number.isFinite(n) || n < 1000) return 10000;
+  return Math.min(60 * 1000, Math.floor(n));
+})();
+
+/** TypeB grouped send 告警阈值（5分钟窗口） */
+export const TYPEB_GROUP_SEND_ALERT_FAILED_SPIKE_THRESHOLD = (() => {
+  const n = Number(process.env.TYPEB_GROUP_SEND_ALERT_FAILED_SPIKE_THRESHOLD ?? '10');
+  if (!Number.isFinite(n) || n < 1) return 10;
+  return Math.min(10000, Math.floor(n));
+})();
+
+export const TYPEB_GROUP_SEND_ALERT_DEAD_SPIKE_THRESHOLD = (() => {
+  const n = Number(process.env.TYPEB_GROUP_SEND_ALERT_DEAD_SPIKE_THRESHOLD ?? '3');
+  if (!Number.isFinite(n) || n < 1) return 3;
+  return Math.min(10000, Math.floor(n));
+})();
