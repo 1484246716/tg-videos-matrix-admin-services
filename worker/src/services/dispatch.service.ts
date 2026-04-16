@@ -210,7 +210,10 @@ function resolveDispatchScopedDirFromMeta(meta: Record<string, unknown> | null |
   return match[1].replace(/\//g, path.sep);
 }
 
-async function cleanupDispatchScopedDirectoriesAfterSuccess(tasks: Array<{ mediaAsset: { sourceMeta: unknown } }>) {
+async function cleanupDispatchScopedDirectoriesAfterSuccess(
+  tasks: Array<{ mediaAsset: { sourceMeta: unknown } }>,
+  allowedDirNames?: Set<string>,
+) {
   const dirs = new Set<string>();
   for (const t of tasks) {
     const meta = t.mediaAsset.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
@@ -226,6 +229,15 @@ async function cleanupDispatchScopedDirectoriesAfterSuccess(tasks: Array<{ media
       logger.warn('[typeb_cleanup] 跳过目录清理（目录名不安全）', {
         scopedDir: dir,
         scopedDirName: dirName,
+      });
+      continue;
+    }
+
+    if (allowedDirNames && !allowedDirNames.has(dirName)) {
+      logger.warn('[typeb_cleanup] 跳过目录清理（不在本次允许列表）', {
+        scopedDir: dir,
+        scopedDirName: dirName,
+        allowedDirNames: Array.from(allowedDirNames),
       });
       continue;
     }
@@ -328,13 +340,22 @@ export async function handleDispatchGroupJob(
     throw new Error('group worker 仅处理 grouped 任务');
   }
 
+  logger.info('[typeb_group] dispatch-send-group started', {
+    dispatchTaskId: dispatchTaskIdRaw,
+    seedTaskId: seedTask.id.toString(),
+    channelId: seedTask.channelId.toString(),
+    groupKey: seedTask.groupKey,
+    seedTaskStatus: seedTask.status,
+    attemptsMade,
+    jobId,
+  });
+
   const groupTasks = await withPrismaRetry(
     () =>
       prisma.dispatchTask.findMany({
         where: {
           channelId: seedTask.channelId,
           groupKey: seedTask.groupKey,
-          status: { in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed, TaskStatus.success] },
         },
         orderBy: [{ scheduleSlot: 'asc' }, { id: 'asc' }],
         include: {
@@ -350,10 +371,102 @@ export async function handleDispatchGroupJob(
     { label: 'dispatch.handleDispatchGroupJob.findGroupTasks' },
   );
 
-  const alreadySuccess = groupTasks.filter((t) => t.status === TaskStatus.success);
-  const pendingGroupTasks = groupTasks.filter(
-    (t) => t.status === TaskStatus.pending || t.status === TaskStatus.scheduled || t.status === TaskStatus.failed,
+  const now = new Date();
+  const readyStatuses = new Set<TaskStatus>([
+    TaskStatus.pending,
+    TaskStatus.scheduled,
+    TaskStatus.failed,
+    TaskStatus.running,
+  ]);
+
+  const recoverableDeadTasks = groupTasks.filter((t) => {
+    if (t.status !== TaskStatus.dead) return false;
+    if (!t.readyDeadlineAt) return false;
+    return t.readyDeadlineAt.getTime() > now.getTime();
+  });
+
+  if (recoverableDeadTasks.length > 0) {
+    await withPrismaRetry(
+      () =>
+        prisma.dispatchTask.updateMany({
+          where: {
+            id: { in: recoverableDeadTasks.map((t) => t.id) },
+          },
+          data: {
+            status: TaskStatus.scheduled,
+            nextRunAt: now,
+            telegramErrorCode: null,
+            telegramErrorMessage: null,
+            finishedAt: null,
+          },
+        }),
+      { label: 'dispatch.handleDispatchGroupJob.recoverDeadTasksWithinDeadline' },
+    );
+  }
+
+  const normalizedGroupTasks = groupTasks.map((t) =>
+    recoverableDeadTasks.some((r) => r.id === t.id)
+      ? {
+          ...t,
+          status: TaskStatus.scheduled,
+          nextRunAt: now,
+          telegramErrorCode: null,
+          telegramErrorMessage: null,
+          finishedAt: null,
+        }
+      : t,
   );
+
+  const alreadySuccess = normalizedGroupTasks.filter((t) => t.status === TaskStatus.success);
+  const pendingGroupTasks = normalizedGroupTasks.filter((t) => readyStatuses.has(t.status));
+  const excludedGroupTasks = normalizedGroupTasks.filter(
+    (t) => !readyStatuses.has(t.status) && t.status !== TaskStatus.success,
+  );
+  const expectedCount = Math.max(Number(seedTask.expectedMediaCount ?? 0), normalizedGroupTasks.length);
+
+  logger.info('[typeb_group] dispatch-send-group preflight snapshot', {
+    dispatchTaskId: dispatchTaskIdRaw,
+    groupKey: seedTask.groupKey,
+    channelId: seedTask.channelId.toString(),
+    expectedCount,
+    readyCount: pendingGroupTasks.length,
+    successCount: alreadySuccess.length,
+    recoveredDeadTaskIds: recoverableDeadTasks.map((t) => t.id.toString()),
+    taskIds: normalizedGroupTasks.map((t) => t.id.toString()),
+    assetIds: normalizedGroupTasks.map((t) => t.mediaAsset.id.toString()),
+    statuses: normalizedGroupTasks.map((t) => ({
+      taskId: t.id.toString(),
+      status: t.status,
+      retryCount: t.retryCount,
+      maxRetries: t.maxRetries,
+      nextRunAt: t.nextRunAt?.toISOString?.() ?? null,
+      readyDeadlineAt: t.readyDeadlineAt?.toISOString?.() ?? null,
+      telegramErrorCode: t.telegramErrorCode ?? null,
+      telegramErrorMessage: t.telegramErrorMessage ?? null,
+    })),
+    excludedTasks: excludedGroupTasks.map((t) => ({
+      taskId: t.id.toString(),
+      status: t.status,
+      readyDeadlineAt: t.readyDeadlineAt?.toISOString?.() ?? null,
+      telegramErrorCode: t.telegramErrorCode ?? null,
+      telegramErrorMessage: t.telegramErrorMessage ?? null,
+    })),
+    mediaSources: normalizedGroupTasks.map((t) => {
+      const meta = t.mediaAsset.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
+        ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
+        : null;
+      return {
+        taskId: t.id.toString(),
+        assetId: t.mediaAsset.id.toString(),
+        telegramFileIdPresent: Boolean(t.mediaAsset.telegramFileId),
+        dispatchMediaType: t.mediaAsset.dispatchMediaType ?? null,
+        relayResolvedMediaType: typeof meta?.relayResolvedMediaType === 'string' ? meta.relayResolvedMediaType : null,
+        mimeType: typeof meta?.mimeType === 'string' ? meta.mimeType : null,
+        localPath: typeof meta?.localPath === 'string' ? meta.localPath : null,
+      };
+    }),
+    readyAssert: 'ready_count_eq_expected_or_wait',
+  });
 
   if (pendingGroupTasks.length === 0 && alreadySuccess.length > 0) {
     logger.info('[typeb_metrics] group send skipped already success', {
@@ -372,8 +485,10 @@ export async function handleDispatchGroupJob(
     };
   }
 
-  if (pendingGroupTasks.length <= 1) {
-    throw new Error(`group_not_ready: pendingGroupTasks=${pendingGroupTasks.length}`);
+  if (pendingGroupTasks.length < expectedCount) {
+    throw new Error(
+      `group_not_ready: ready=${pendingGroupTasks.length}, expected=${expectedCount}, excluded=${excludedGroupTasks.length}`,
+    );
   }
 
   const sourceRelayBotIdRaw =
@@ -658,6 +773,7 @@ export async function handleDispatchGroupJob(
 
     await cleanupDispatchScopedDirectoriesAfterSuccess(
       sortedGroupTasks as Array<{ mediaAsset: { sourceMeta: unknown } }>,
+      seedTask.groupKey ? new Set([seedTask.groupKey]) : undefined,
     );
 
     return {

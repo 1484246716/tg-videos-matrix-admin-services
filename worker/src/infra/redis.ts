@@ -43,6 +43,14 @@ export const cloneMediaDownloadQueue = new Queue('q_clone_media_download', {
   connection: connection as any,
 });
 
+export const cloneGroupL1DispatchQueue = new Queue('q_clone_group_l1_dispatch', {
+  connection: connection as any,
+});
+
+export const cloneGroupL2DownloadQueue = new Queue('q_clone_group_l2_download', {
+  connection: connection as any,
+});
+
 export const cloneGuardWaitQueue = new Queue('q_clone_download_guard_wait', {
   connection: connection as any,
 });

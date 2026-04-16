@@ -9,6 +9,7 @@ import * as crypto from 'node:crypto';
 import { StringSession } from 'telegram/sessions';
 import { TelegramClient } from 'telegram';
 import { Api } from 'telegram';
+import { computeCheck } from 'telegram/Password';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateCloneTaskDto } from './dto/create-clone-task.dto';
 import { UpdateCloneTaskDto } from './dto/update-clone-task.dto';
@@ -697,7 +698,7 @@ export class CloneChannelsService {
           const pwd = await client.invoke(new Api.account.GetPassword());
           const inputCheck = await client.invoke(
             new Api.auth.CheckPassword({
-              password: await (client as any).computeCheck(pwd, password),
+              password: await computeCheck(pwd, password),
             }),
           );
 

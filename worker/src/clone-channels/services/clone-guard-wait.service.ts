@@ -47,13 +47,40 @@ export async function processCloneGuardWait(job: CloneMediaDownloadJob) {
     return;
   }
 
+  const itemId = String((next.payload as { itemId?: string | number | bigint }).itemId ?? '').trim();
+  if (!itemId) {
+    logger.warn('[clone][guard-wait] skip requeue due to missing itemId', {
+      sourceItemId: job.itemId,
+      pickedChannelUsername: next.channelUsername,
+    });
+    return;
+  }
+
+  const jobId = `clone-download-item-${itemId}`;
+  const existing = await cloneMediaDownloadQueue.getJob(jobId);
+  if (existing) {
+    const state = await existing.getState();
+    if (state === 'waiting' || state === 'active' || state === 'delayed') {
+      logger.info('[clone][guard-wait] skip duplicate requeue due to existing active job', {
+        itemId,
+        jobId,
+        state,
+        pickedChannelUsername: next.channelUsername,
+      });
+      return;
+    }
+    if (state === 'failed') {
+      await existing.remove();
+    }
+  }
+
   await cloneMediaDownloadQueue.add(
     'clone-media-download-from-guard-wait-rr',
     {
       ...next.payload,
       retryCount: Number((next.payload as { retryCount?: number }).retryCount ?? 0),
     },
-    { removeOnComplete: true, removeOnFail: 100 },
+    { jobId, removeOnComplete: true, removeOnFail: 100 },
   );
 
   processedCount += 1;

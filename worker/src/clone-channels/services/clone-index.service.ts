@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { prisma } from '../../infra/prisma';
-import { cloneRetryQueue, cloneMediaDownloadQueue } from '../../infra/redis';
+import { cloneRetryQueue, cloneMediaDownloadQueue, cloneGroupL1DispatchQueue } from '../../infra/redis';
 import { logger } from '../../logger';
 import { withClient } from './clone-session.service';
 import {
@@ -12,6 +12,7 @@ import {
 } from '../types/clone-queue.types';
 import { CLONE_RETRY_MAX } from '../constants/clone-queue.constants';
 import { markCloneTaskRunFinished } from './clone-task.service';
+import { enqueueCloneGroupItem, shouldUseCloneL1L2 } from './clone-group-scheduler.service';
 
 function classifyRetryReason(err: unknown): CloneRetryReason {
   const message = err instanceof Error ? err.message.toLowerCase() : '';
@@ -38,6 +39,193 @@ function parseContentTypes(raw: string[] | CloneContentType[] | undefined): Clon
     .map((t) => String(t).toLowerCase())
     .filter((t): t is CloneContentType => allowed.includes(t as CloneContentType));
   return normalized.length ? Array.from(new Set(normalized)) : allowed;
+}
+
+const AD_KEYWORDS = [
+  '广告',
+  '互推',
+  '商务合作',
+  '商务联系',
+  '合作联系',
+  '招商',
+  '博彩',
+  '娱乐城',
+  '下注',
+  '注册送彩金',
+  '返水',
+  '代理',
+  '上分',
+  '下分',
+  '平台客服',
+  '推广',
+  '点击注册',
+  '官网地址',
+  '最新网址',
+  'tgads',
+  'bet',
+  'casino',
+  'bonus',
+  'affiliate',
+  'promo code',
+  'usdt',
+  // 保持关键词为“强广告语义”，避免误伤正常图文媒体
+];
+
+const AD_HASHTAGS = ['#广告', '#ad', '#推广', '#博彩'];
+
+const AD_BUTTON_KEYWORDS = [
+  '注册',
+  '开户',
+  '官网',
+  '客服',
+  '联系',
+  '下载',
+  '立即体验',
+  '点击进入',
+  '充值',
+  '返利',
+  '礼包',
+  // 保持按钮关键词为强广告语义，避免误伤正常图文
+];
+
+const SUSPICIOUS_LINK_KEYWORDS = [
+  'casino',
+  'bet',
+  'bonus',
+  'promo',
+  'affiliate',
+  '开户链接',
+  '注册',
+  'tgads',
+  '博彩',
+];
+
+type AdFilterReason =
+  | 'keyword'
+  | 'hashtag'
+  | 'link'
+  | 'button'
+  | 'pinned_service'
+  | 'image_with_blue_link'
+  | 'video_with_blue_link'
+  | 'text_with_blue_link_and_button';
+
+function normalizeText(value: unknown) {
+  return String(value ?? '').trim().toLowerCase();
+}
+
+function extractMessageLinks(msg: any): string[] {
+  const text = String(msg?.message ?? '');
+  const textLinks = text.match(/https?:\/\/[^\s]+/gi) ?? [];
+
+  const entities = Array.isArray(msg?.entities) ? msg.entities : [];
+  const entityLinks = entities
+    .map((e: any) => {
+      if (typeof e?.url === 'string' && e.url.trim()) return e.url.trim();
+      if (typeof e?.text === 'string' && /^https?:\/\//i.test(e.text.trim())) return e.text.trim();
+      return '';
+    })
+    .filter(Boolean);
+
+  return Array.from(new Set([...textLinks, ...entityLinks].map((v) => String(v).trim())));
+}
+
+function extractButtonTextsAndLinks(msg: any): { texts: string[]; links: string[] } {
+  const rows = Array.isArray(msg?.replyMarkup?.rows) ? msg.replyMarkup.rows : [];
+  const texts: string[] = [];
+  const links: string[] = [];
+
+  for (const row of rows) {
+    const buttons = Array.isArray(row?.buttons) ? row.buttons : [];
+    for (const btn of buttons) {
+      if (typeof btn?.text === 'string' && btn.text.trim()) texts.push(btn.text.trim());
+      if (typeof btn?.url === 'string' && btn.url.trim()) links.push(btn.url.trim());
+    }
+  }
+
+  return { texts, links };
+}
+
+function hasBlueLinkByEntity(msg: any) {
+  const entities = Array.isArray(msg?.entities) ? msg.entities : [];
+  return entities.some((e: any) => {
+    const className = String(e?.className ?? '').toLowerCase();
+    return className.includes('messageentityurl') || className.includes('messageentitytexturl');
+  });
+}
+
+function hasReplyButtons(msg: any) {
+  const rows = Array.isArray(msg?.replyMarkup?.rows) ? msg.replyMarkup.rows : [];
+  return rows.some((row: any) => Array.isArray(row?.buttons) && row.buttons.length > 0);
+}
+
+function detectAdReasons(msg: any): AdFilterReason[] {
+  const reasons = new Set<AdFilterReason>();
+  const messageText = normalizeText(msg?.message);
+
+  const media = (msg as any)?.media;
+  const document = (media as any)?.document;
+  const photo = (media as any)?.photo;
+  const docMimeType = typeof document?.mimeType === 'string' ? document.mimeType.toLowerCase() : '';
+  const hasVideoAttr = ((document?.attributes ?? []) as any[]).some((attr) =>
+    String(attr?.className ?? '').toLowerCase().includes('video'),
+  );
+  const hasVideo = Boolean(docMimeType.startsWith('video/') || hasVideoAttr);
+  const hasImage = Boolean(docMimeType.startsWith('image/') || photo);
+  const hasText = messageText.length > 0;
+
+  // Telegram 服务消息（例如 pinned a message）直接过滤
+  const actionClassName = String((msg as any)?.action?.className ?? '').toLowerCase();
+  if (actionClassName.includes('messageactionpinmessage')) {
+    reasons.add('pinned_service');
+  }
+
+  const messageLinks = extractMessageLinks(msg).map((v) => v.toLowerCase());
+  const { texts: buttonTexts, links: buttonLinks } = extractButtonTextsAndLinks(msg);
+  const allLinks = [...messageLinks, ...buttonLinks.map((v) => v.toLowerCase())];
+  const hasBlueLink = hasBlueLinkByEntity(msg) || allLinks.length > 0;
+  const hasButtons = hasReplyButtons(msg);
+
+  // 规则1：图片 + 蓝色链接
+  if (hasImage && hasBlueLink) {
+    reasons.add('image_with_blue_link');
+  }
+
+  // 规则3/4：视频 + 蓝色链接（是否有按钮都过滤）
+  if (hasVideo && hasBlueLink) {
+    reasons.add('video_with_blue_link');
+  }
+
+  // 规则2：文字 + 蓝色链接 + 按钮
+  if (hasText && !hasImage && !hasVideo && hasBlueLink && hasButtons) {
+    reasons.add('text_with_blue_link_and_button');
+  }
+
+  if (AD_KEYWORDS.some((kw) => messageText.includes(kw.toLowerCase()))) {
+    reasons.add('keyword');
+  }
+
+  if (AD_HASHTAGS.some((tag) => messageText.includes(tag.toLowerCase()))) {
+    reasons.add('hashtag');
+  }
+
+  if (
+    allLinks.some((link) =>
+      SUSPICIOUS_LINK_KEYWORDS.some((kw) => link.includes(kw.toLowerCase())),
+    )
+  ) {
+    reasons.add('link');
+  }
+
+  if (
+    buttonTexts
+      .map((v) => v.toLowerCase())
+      .some((text) => AD_BUTTON_KEYWORDS.some((kw) => text.includes(kw.toLowerCase())))
+  ) {
+    reasons.add('button');
+  }
+
+  return Array.from(reasons);
 }
 
 function sanitizeFileName(name: string) {
@@ -132,6 +320,14 @@ async function fetchIncrementalMessages(params: {
 
   let skippedByNoId = 0;
   let skippedByType = 0;
+  let skippedByAd = 0;
+  const skippedByAdReasons: Record<AdFilterReason, number> = {
+    keyword: 0,
+    hashtag: 0,
+    link: 0,
+    button: 0,
+    pinned_service: 0,
+  };
   let pickedVideo = 0;
   let pickedImage = 0;
   let pickedText = 0;
@@ -178,6 +374,34 @@ async function fetchIncrementalMessages(params: {
       continue;
     }
 
+    const adReasons = detectAdReasons(msg as any);
+
+    if (adReasons.length > 0) {
+      const hasButtons = hasReplyButtons(msg as any);
+      const hasBlueLink = hasBlueLinkByEntity(msg as any) || extractMessageLinks(msg as any).length > 0;
+
+      const messageTextPreview = messageText
+        ? `${messageText.replace(/\s+/g, ' ').trim().slice(0, 10)}***`
+        : '';
+
+      logger.info('[clone][索引/Index] 消息被过滤（广告/引流判定）', {
+        channelUsername,
+        messageId: String(messageIdRaw),
+        reasons: adReasons,
+        hasImage,
+        hasVideo,
+        hasButtons,
+        hasBlueLink,
+        messageTextPreview,
+      });
+
+      skippedByAd += 1;
+      for (const reason of adReasons) {
+        skippedByAdReasons[reason] += 1;
+      }
+      continue;
+    }
+
     if (hasVideo) pickedVideo += 1;
     else if (hasImage) pickedImage += 1;
     else if (hasText) pickedText += 1;
@@ -208,6 +432,8 @@ async function fetchIncrementalMessages(params: {
     pickedText,
     skippedByNoId,
     skippedByType,
+    skippedByAd,
+    skippedByAdReasons,
   });
 
   return picked;
@@ -279,36 +505,68 @@ async function upsertIndexedItems(params: {
     }
 
     if (params.crawlMode === 'index_and_download' && isDownloadableMedia) {
-      await cloneMediaDownloadQueue.add(
-        'clone-media-download',
-        {
+      const downloadJob = {
+        taskId: params.taskId.toString(),
+        runId: params.runId.toString(),
+        itemId: item.id.toString(),
+        channelUsername: params.channelUsername,
+        mediaRef: row.mediaRef
+          ? {
+              kind: 'tg_message' as const,
+              channelUsername: params.channelUsername,
+              messageId: row.messageId.toString(),
+            }
+          : undefined,
+        expectedFileSize: row.fileSize ? row.fileSize.toString() : undefined,
+        expectedMimeType: row.mimeType,
+        groupedId: row.groupedId,
+        groupKey: row.groupKey,
+        expectedFileName: resolveMediaBaseName(params.channelUsername, row.messageId, row.mimeType),
+        targetPath: groupedTargetPath,
+        priority:
+          row.fileSize && row.fileSize > BigInt(1024 * 1024 * 1024)
+            ? 'large'
+            : row.fileSize && row.fileSize < BigInt(200 * 1024 * 1024)
+              ? 'small'
+              : 'medium',
+        enqueuedAt: new Date().toISOString(),
+      };
+
+      if (shouldUseCloneL1L2(downloadJob)) {
+        logger.info('[clone][l1l2] route grouped job to l1l2', {
           taskId: params.taskId.toString(),
           runId: params.runId.toString(),
           itemId: item.id.toString(),
-          channelUsername: params.channelUsername,
-          mediaRef: row.mediaRef
-            ? {
-                kind: 'tg_message',
-                channelUsername: params.channelUsername,
-                messageId: row.messageId.toString(),
-              }
-            : undefined,
-          expectedFileSize: row.fileSize ? row.fileSize.toString() : undefined,
-          expectedMimeType: row.mimeType,
-          groupedId: row.groupedId,
           groupKey: row.groupKey,
-          expectedFileName: resolveMediaBaseName(params.channelUsername, row.messageId, row.mimeType),
-          targetPath: groupedTargetPath,
-          priority:
-            row.fileSize && row.fileSize > BigInt(1024 * 1024 * 1024)
-              ? 'large'
-              : row.fileSize && row.fileSize < BigInt(200 * 1024 * 1024)
-                ? 'small'
-                : 'medium',
-          enqueuedAt: new Date().toISOString(),
-        },
-        { removeOnComplete: true, removeOnFail: 100 },
-      );
+          groupedId: row.groupedId,
+        });
+        await enqueueCloneGroupItem(downloadJob);
+        await cloneGroupL1DispatchQueue.add(
+          'clone-group-l1-dispatch-tick',
+          {
+            source: 'clone-index',
+            runId: params.runId.toString(),
+            taskId: params.taskId.toString(),
+            groupKey: row.groupKey,
+            at: new Date().toISOString(),
+          },
+          { removeOnComplete: true, removeOnFail: 100 },
+        );
+      } else {
+        logger.info('[clone][l1l2] route job to legacy download queue', {
+          taskId: params.taskId.toString(),
+          runId: params.runId.toString(),
+          itemId: item.id.toString(),
+          groupKey: row.groupKey,
+          groupedId: row.groupedId,
+          reason: 'l1l2_disabled_or_not_grouped',
+        });
+        await cloneMediaDownloadQueue.add(
+          'clone-media-download',
+          downloadJob,
+          { removeOnComplete: true, removeOnFail: 100 },
+        );
+      }
 
       queuedDownloads += 1;
       logger.info('[clone][索引/Index] 媒体下载任务已入队 / media download job enqueued', {
@@ -317,7 +575,9 @@ async function upsertIndexedItems(params: {
         channelUsername: params.channelUsername,
         itemId: item.id.toString(),
         mimeType: row.mimeType ?? null,
-        queue: cloneMediaDownloadQueue.name,
+        queue: shouldUseCloneL1L2(downloadJob)
+          ? cloneGroupL1DispatchQueue.name
+          : cloneMediaDownloadQueue.name,
       });
     }
   }

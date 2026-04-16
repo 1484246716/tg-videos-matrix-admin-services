@@ -9,12 +9,14 @@ import {
   cloneCrawlScheduleQueue,
   cloneChannelIndexQueue,
   cloneMediaDownloadQueue,
+  cloneGroupL1DispatchQueue,
+  cloneGroupL2DownloadQueue,
   cloneGuardWaitQueue,
   cloneRetryQueue,
 } from '../infra/redis';
 import { ensureWorkerPrismaModels, logWorkerDatabaseFingerprint } from '../infra/prisma';
 import { logger, logError } from '../logger';
-import { SCHEDULER_POLL_MS, telegramApiBase } from '../config/env';
+import { COLLECTION_SNAPSHOT_REFRESH_MS, SCHEDULER_POLL_MS, telegramApiBase } from '../config/env';
 import { scheduleEnabledTaskDefinitions } from '../scheduler/task-definition-scheduler';
 import { scheduleDueMassMessageItems } from '../scheduler/mass-message-scheduler';
 import { scheduleCollectionSnapshotRefresh } from '../scheduler/collection-snapshot-scheduler';
@@ -34,6 +36,8 @@ import '../workers/collection-snapshot.worker';
 import '../clone-channels/workers/clone-crawl-schedule.worker';
 import '../clone-channels/workers/clone-channel-index.worker';
 import '../clone-channels/workers/clone-video-download.worker';
+import '../clone-channels/workers/clone-group-l1-dispatch.worker';
+import '../clone-channels/workers/clone-group-l2-download.worker';
 import '../clone-channels/workers/clone-guard-wait.worker';
 import '../clone-channels/workers/clone-retry.worker';
 
@@ -124,6 +128,18 @@ export async function bootstrapWorker() {
     { removeOnComplete: true, removeOnFail: 100 },
   );
 
+  await cloneGroupL1DispatchQueue.add(
+    'bootstrap-check',
+    { source: 'worker_startup', timestamp: new Date().toISOString() },
+    { removeOnComplete: true, removeOnFail: 100 },
+  );
+
+  await cloneGroupL2DownloadQueue.add(
+    'bootstrap-check',
+    { source: 'worker_startup', timestamp: new Date().toISOString() },
+    { removeOnComplete: true, removeOnFail: 100 },
+  );
+
   await cloneGuardWaitQueue.add(
     'bootstrap-check',
     { source: 'worker_startup', timestamp: new Date().toISOString() },
@@ -140,6 +156,10 @@ export async function bootstrapWorker() {
 
   logger.info('[bootstrap] Telegram API 地址', { telegramApiBase });
   logger.info('[bootstrap] 调度轮询间隔', { schedulerPollMs: SCHEDULER_POLL_MS });
+
+  logger.info('[bootstrap] collection snapshot refresh interval', {
+    collectionSnapshotRefreshMs: COLLECTION_SNAPSHOT_REFRESH_MS,
+  });
 
   setInterval(() => {
     void scheduleEnabledTaskDefinitions().catch((err) => {

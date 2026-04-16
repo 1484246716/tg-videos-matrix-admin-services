@@ -13,6 +13,7 @@ import { logger } from '../../logger';
 
 let cachedBotClient: TelegramClient | null = null;
 let cachedUserClient: TelegramClient | null = null;
+let cachedUserClientPhone: string | null = null;
 
 function decryptSession(encrypted: string) {
   const keyRaw = process.env.CLONE_ACCOUNT_ENCRYPT_KEY || 'dev-only-insecure-key-change-me';
@@ -34,22 +35,35 @@ function decryptSession(encrypted: string) {
   return plain.toString('utf8');
 }
 
-async function resolveUserSessionFromDb() {
-  const account = await prisma.cloneCrawlAccount.findFirst({
+async function resolveUserSessionsFromDb() {
+  const accounts = await prisma.cloneCrawlAccount.findMany({
     where: { status: 'active', accountType: 'user' },
-    orderBy: { updatedAt: 'desc' },
-    select: { sessionString: true, accountPhone: true },
+    orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+    select: { id: true, sessionString: true, accountPhone: true },
   });
 
-  if (!account?.sessionString) return null;
+  const result: Array<{ id: string; accountPhone: string; session: string }> = [];
 
-  const session = decryptSession(account.sessionString);
-  if (!session.trim()) return null;
+  for (const account of accounts) {
+    if (!account?.sessionString) continue;
+    try {
+      const session = decryptSession(account.sessionString);
+      if (!session.trim()) continue;
+      result.push({
+        id: account.id.toString(),
+        accountPhone: account.accountPhone,
+        session,
+      });
+    } catch (error) {
+      logger.warn('[gramjs] skip invalid encrypted session in db', {
+        accountId: account.id.toString(),
+        accountPhone: account.accountPhone,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
 
-  return {
-    session,
-    accountPhone: account.accountPhone,
-  };
+  return result;
 }
 
 export async function getGramjsBotClient() {
@@ -73,58 +87,135 @@ export async function getGramjsBotClient() {
 }
 
 export async function getGramjsUserClient() {
-  if (cachedUserClient) return cachedUserClient;
+  if (cachedUserClient) {
+    try {
+      if (await cachedUserClient.isUserAuthorized()) {
+        return cachedUserClient;
+      }
+      logger.warn('[gramjs] cached user client unauthorized, dropping cache', {
+        accountPhone: cachedUserClientPhone,
+      });
+    } catch (error) {
+      logger.warn('[gramjs] cached user client check failed, dropping cache', {
+        accountPhone: cachedUserClientPhone,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    try {
+      await cachedUserClient.disconnect();
+    } catch {
+      // ignore
+    }
+    cachedUserClient = null;
+    cachedUserClientPhone = null;
+  }
 
   if (!GRAMJS_API_ID || !GRAMJS_API_HASH) {
     throw new Error('GramJS User 配置缺失：GRAMJS_API_ID / GRAMJS_API_HASH');
   }
 
-  let userSession = '';
-  let sessionSource: 'db' | 'env' = 'env';
-
   try {
-    const fromDb = await resolveUserSessionFromDb();
-    if (fromDb?.session) {
-      userSession = fromDb.session;
-      sessionSource = 'db';
-      logger.info('[gramjs] user session loaded from db', {
-        sessionSource,
-        accountPhone: fromDb.accountPhone,
+    const candidates = await resolveUserSessionsFromDb();
+
+    for (const candidate of candidates) {
+      const session = new StringSession(candidate.session);
+      const client = new TelegramClient(session, GRAMJS_API_ID, GRAMJS_API_HASH, {
+        connectionRetries: 5,
       });
+
+      try {
+        await client.connect();
+        const authorized = await client.isUserAuthorized();
+        if (!authorized) {
+          await prisma.cloneCrawlAccount.update({
+            where: { id: BigInt(candidate.id) },
+            data: {
+              status: 'invalid',
+              lastErrorCode: 'AUTH_INVALID',
+              lastErrorMessage: 'GramJS session unauthorized',
+              lastCheckAt: new Date(),
+            },
+          });
+          await client.disconnect();
+          logger.warn('[gramjs] user session unauthorized, auto mark invalid', {
+            accountId: candidate.id,
+            accountPhone: candidate.accountPhone,
+          });
+          continue;
+        }
+
+        await prisma.cloneCrawlAccount.update({
+          where: { id: BigInt(candidate.id) },
+          data: {
+            status: 'active',
+            lastCheckAt: new Date(),
+            lastErrorCode: null,
+            lastErrorMessage: null,
+          },
+        });
+
+        cachedUserClient = client;
+        cachedUserClientPhone = candidate.accountPhone;
+
+        logger.info('[gramjs] user client authorized', {
+          sessionSource: 'db',
+          accountId: candidate.id,
+          accountPhone: candidate.accountPhone,
+        });
+
+        return client;
+      } catch (error) {
+        await prisma.cloneCrawlAccount.update({
+          where: { id: BigInt(candidate.id) },
+          data: {
+            status: 'invalid',
+            lastErrorCode: 'AUTH_INVALID',
+            lastErrorMessage: error instanceof Error ? error.message : String(error),
+            lastCheckAt: new Date(),
+          },
+        });
+
+        try {
+          await client.disconnect();
+        } catch {
+          // ignore
+        }
+
+        logger.warn('[gramjs] user session failed, auto mark invalid and try next', {
+          accountId: candidate.id,
+          accountPhone: candidate.accountPhone,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
   } catch (error) {
-    logger.warn('[gramjs] failed to load user session from db, fallback to env', {
-      sessionSource: 'env',
+    logger.warn('[gramjs] failed to load user sessions from db, fallback to env', {
       reason: error instanceof Error ? error.message : String(error),
     });
   }
 
-  if (!userSession) {
-    userSession = GRAMJS_USER_SESSION || GRAMJS_SESSION;
-    if (userSession) {
-      logger.info('[gramjs] user session loaded from env', { sessionSource: 'env' });
+  const envSession = GRAMJS_USER_SESSION || GRAMJS_SESSION;
+  if (envSession) {
+    const session = new StringSession(envSession);
+    const client = new TelegramClient(session, GRAMJS_API_ID, GRAMJS_API_HASH, {
+      connectionRetries: 5,
+    });
+
+    await client.connect();
+
+    if (!await client.isUserAuthorized()) {
+      throw new Error('auth_invalid: GramJS User 会话未授权（sessionSource=env）');
     }
+
+    cachedUserClient = client;
+    cachedUserClientPhone = null;
+
+    logger.info('[gramjs] user client authorized', { sessionSource: 'env' });
+    return client;
   }
 
-  if (!userSession) {
-    throw new Error('GramJS User 会话缺失：请先手机号登录或配置 GRAMJS_USER_SESSION');
-  }
-
-  const session = new StringSession(userSession);
-  const client = new TelegramClient(session, GRAMJS_API_ID, GRAMJS_API_HASH, {
-    connectionRetries: 5,
-  });
-
-  await client.connect();
-
-  if (!await client.isUserAuthorized()) {
-    throw new Error(`auth_invalid: GramJS User 会话未授权（sessionSource=${sessionSource}）`);
-  }
-
-  logger.info('[gramjs] user client authorized', { sessionSource });
-
-  cachedUserClient = client;
-  return client;
+  throw new Error('GramJS User 会话缺失：请先手机号登录或配置 GRAMJS_USER_SESSION');
 }
 
 // 向后兼容：默认返回 user client（clone 抓取场景）

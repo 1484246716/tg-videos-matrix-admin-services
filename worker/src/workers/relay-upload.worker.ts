@@ -16,6 +16,7 @@ import {
 import { sendViaGramjs } from '../shared/gramjs/upload';
 import { getTelegramUpdates, sendTelegramRequest } from '../shared/telegram';
 import { DispatchMediaType, MediaStatus } from '@prisma/client';
+import { scheduleDueDispatchTasks } from '../scheduler/dispatch-scheduler';
 import {
   GRAMJS_FORWARD_TARGET_CHAT_ID,
   GRAMJS_UPLOAD_WORKERS,
@@ -127,6 +128,178 @@ async function removeUploadedSourceFile(filePath: string, context: {
       relayChannelId: context.relayChannelId,
       uploadMethod: context.uploadMethod,
       filePath,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function logCloneRelayDispatchLinkSnapshot(context: {
+  traceId: string;
+  mediaAssetId: string;
+  relayChannelId: string;
+  uploadMethod: 'gramjs_sendVideo' | 'sendVideo' | 'sendPhoto' | 'recover_after_hang_up';
+  stage: 'before_dispatch_schedule' | 'after_dispatch_schedule';
+  scheduleResult?: {
+    queuedCount: number;
+    autoBypassCount: number;
+    blockedCount: number;
+  };
+}) {
+  try {
+    const mediaAssetId = BigInt(context.mediaAssetId);
+    const asset = await prisma.mediaAsset.findUnique({
+      where: { id: mediaAssetId },
+      select: {
+        id: true,
+        channelId: true,
+        status: true,
+        telegramFileId: true,
+        relayMessageId: true,
+        sourceMeta: true,
+        dispatchTasks: {
+          select: {
+            id: true,
+            status: true,
+            mediaAssetId: true,
+            groupKey: true,
+            retryCount: true,
+            maxRetries: true,
+            telegramMessageId: true,
+            nextRunAt: true,
+            finishedAt: true,
+          },
+          orderBy: [{ id: 'desc' }],
+          take: 8,
+        },
+      },
+    });
+
+    if (!asset) {
+      logger.warn('[clone][trace] relay->dispatch snapshot skipped: mediaAsset missing', {
+        traceId: context.traceId,
+        stage: context.stage,
+        mediaAssetId: context.mediaAssetId,
+      });
+      return;
+    }
+
+    const sourceMeta = asset.sourceMeta && typeof asset.sourceMeta === 'object'
+      ? (asset.sourceMeta as Record<string, unknown>)
+      : {};
+
+    const isCloneCrawlAsset = sourceMeta.isCloneCrawlAsset === true;
+    const sourceMessageId = typeof sourceMeta.sourceMessageId === 'string' ? sourceMeta.sourceMessageId : null;
+    const sourceChannelUsernameRaw = typeof sourceMeta.sourceChannelUsername === 'string'
+      ? sourceMeta.sourceChannelUsername
+      : null;
+    const sourceChannelUsername = sourceChannelUsernameRaw?.trim().replace(/^@+/, '').toLowerCase() || null;
+
+    let cloneItemRef: { itemId: string; runId: string; taskId: string; downloadStatus: string } | null = null;
+
+    if (isCloneCrawlAsset && sourceMessageId && sourceChannelUsername) {
+      try {
+        const cloneItem = await prisma.cloneCrawlItem.findFirst({
+          where: {
+            channelUsername: sourceChannelUsername,
+            messageId: BigInt(sourceMessageId),
+          },
+          select: {
+            id: true,
+            runId: true,
+            taskId: true,
+            downloadStatus: true,
+          },
+          orderBy: { id: 'desc' },
+        });
+
+        if (cloneItem) {
+          cloneItemRef = {
+            itemId: cloneItem.id.toString(),
+            runId: cloneItem.runId.toString(),
+            taskId: cloneItem.taskId.toString(),
+            downloadStatus: cloneItem.downloadStatus,
+          };
+        }
+      } catch {
+        // best effort
+      }
+    }
+
+    logger.info('[clone][trace] item->relay_uploaded->dispatch snapshot', {
+      traceId: context.traceId,
+      stage: context.stage,
+      relayChannelId: context.relayChannelId,
+      uploadMethod: context.uploadMethod,
+      mediaAssetId: asset.id.toString(),
+      mediaAssetChannelId: asset.channelId.toString(),
+      relayUploaded: asset.status,
+      relayMessageId: asset.relayMessageId?.toString?.() ?? null,
+      telegramFileIdPresent: Boolean(asset.telegramFileId),
+      isCloneCrawlAsset,
+      sourceChannelUsername,
+      sourceMessageId,
+      cloneItemRef,
+      dispatchTaskCount: asset.dispatchTasks.length,
+      dispatchTasks: asset.dispatchTasks.map((t) => ({
+        dispatchTaskId: t.id.toString(),
+        mediaAssetId: t.mediaAssetId.toString(),
+        status: t.status,
+        groupKey: t.groupKey,
+        retryCount: t.retryCount,
+        maxRetries: t.maxRetries,
+        telegramMessageId: t.telegramMessageId?.toString?.() ?? null,
+        nextRunAt: t.nextRunAt?.toISOString?.() ?? null,
+        finishedAt: t.finishedAt?.toISOString?.() ?? null,
+      })),
+      scheduleResult: context.scheduleResult ?? null,
+    });
+  } catch (error) {
+    logger.warn('[clone][trace] relay->dispatch snapshot failed', {
+      traceId: context.traceId,
+      stage: context.stage,
+      mediaAssetId: context.mediaAssetId,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function triggerDispatchAfterRelayUpload(context: {
+  traceId: string;
+  mediaAssetId: string;
+  relayChannelId: string;
+  uploadMethod: 'gramjs_sendVideo' | 'sendVideo' | 'sendPhoto' | 'recover_after_hang_up';
+}) {
+  try {
+    await logCloneRelayDispatchLinkSnapshot({
+      ...context,
+      stage: 'before_dispatch_schedule',
+    });
+
+    const result = await scheduleDueDispatchTasks();
+
+    await logCloneRelayDispatchLinkSnapshot({
+      ...context,
+      stage: 'after_dispatch_schedule',
+      scheduleResult: result,
+    });
+
+    logger.info('[q_relay_upload] 上传成功后触发一次分发调度', {
+      traceId: context.traceId,
+      stage: 'trigger_dispatch_after_relay_upload',
+      mediaAssetId: context.mediaAssetId,
+      relayChannelId: context.relayChannelId,
+      uploadMethod: context.uploadMethod,
+      queuedCount: result.queuedCount,
+      autoBypassCount: result.autoBypassCount,
+      blockedCount: result.blockedCount,
+    });
+  } catch (error) {
+    logger.warn('[q_relay_upload] 上传成功后触发分发调度失败（不阻断当前任务）', {
+      traceId: context.traceId,
+      stage: 'trigger_dispatch_after_relay_upload_failed',
+      mediaAssetId: context.mediaAssetId,
+      relayChannelId: context.relayChannelId,
+      uploadMethod: context.uploadMethod,
       reason: error instanceof Error ? error.message : String(error),
     });
   }
@@ -650,6 +823,13 @@ export const relayUploadWorker = new Worker(
         progress: 100,
       });
 
+      await triggerDispatchAfterRelayUpload({
+        traceId,
+        mediaAssetId: mediaAssetIdRaw,
+        relayChannelId: relayChannelIdRaw,
+        uploadMethod: 'gramjs_sendVideo',
+      });
+
       return {
         ok: true,
         direct: true,
@@ -837,6 +1017,13 @@ export const relayUploadWorker = new Worker(
             messageId: fallbackResult.messageId,
           });
 
+          await triggerDispatchAfterRelayUpload({
+            traceId,
+            mediaAssetId: mediaAssetIdRaw,
+            relayChannelId: relayChannelIdRaw,
+            uploadMethod: 'recover_after_hang_up',
+          });
+
           return {
             ok: true,
             direct: false,
@@ -923,6 +1110,13 @@ export const relayUploadWorker = new Worker(
         streamedBytes: fileSize ?? streamedBytes,
         totalBytes: fileSize,
         progress: 100,
+      });
+
+      await triggerDispatchAfterRelayUpload({
+        traceId,
+        mediaAssetId: mediaAssetIdRaw,
+        relayChannelId: relayChannelIdRaw,
+        uploadMethod,
       });
 
       return {

@@ -18,6 +18,12 @@ export const SCHEDULER_POLL_MS = (() => {
   return Math.floor(n);
 })();
 
+export const COLLECTION_SNAPSHOT_REFRESH_MS = (() => {
+  const n = Number(process.env.COLLECTION_SNAPSHOT_REFRESH_MS ?? '60000');
+  if (!Number.isFinite(n) || n < 10000) return 60000;
+  return Math.floor(n);
+})();
+
 /** Clone 调度每次处理的到点任务上限 */
 export const CLONE_SCHEDULER_DUE_BATCH_SIZE = (() => {
   const n = Number(process.env.CLONE_SCHEDULER_DUE_BATCH_SIZE ?? '20');

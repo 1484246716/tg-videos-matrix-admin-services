@@ -103,16 +103,56 @@ export function toReadableErrorSummary(error: unknown): string {
   return 'Unknown error';
 }
 
+function serializeUnknownError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    const withCause = error as Error & { cause?: unknown };
+    return {
+      type: 'Error',
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+      cause:
+        withCause.cause === undefined
+          ? undefined
+          : withCause.cause instanceof Error
+            ? {
+                name: withCause.cause.name,
+                message: withCause.cause.message,
+                stack: withCause.cause.stack,
+              }
+            : withCause.cause,
+    };
+  }
+
+  if (typeof error === 'object' && error !== null) {
+    const obj = error as Record<string, unknown>;
+    return {
+      type: obj?.constructor?.name ?? 'Object',
+      ...obj,
+      json: (() => {
+        try {
+          return JSON.stringify(error);
+        } catch {
+          return '[unserializable-object]';
+        }
+      })(),
+    };
+  }
+
+  return {
+    type: typeof error,
+    value: error,
+  };
+}
+
 export function logError(message: string, error?: unknown) {
   if (!error) {
     logger.error(message);
     return;
   }
 
-  if (error instanceof Error) {
-    logger.error(message, { error: { name: error.name, message: error.message, stack: error.stack } });
-    return;
-  }
-
-  logger.error(message, { error, errorSummary: toReadableErrorSummary(error) });
+  logger.error(message, {
+    error: serializeUnknownError(error),
+    errorSummary: toReadableErrorSummary(error),
+  });
 }
