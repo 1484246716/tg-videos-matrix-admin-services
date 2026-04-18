@@ -345,6 +345,20 @@ async function reconcileGroupedDispatchAfterRelayUpload(context: {
     },
   });
 
+  const sourceExpectedCountCandidates = groupedAssets
+    .map((a) => {
+      const meta = a.sourceMeta && typeof a.sourceMeta === 'object' && !Array.isArray(a.sourceMeta)
+        ? (a.sourceMeta as Record<string, unknown>)
+        : null;
+      const raw = meta?.sourceExpectedCount;
+      if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return Math.floor(raw);
+      if (typeof raw === 'string' && /^\d+$/.test(raw) && Number(raw) > 0) return Math.floor(Number(raw));
+      return null;
+    })
+    .filter((n): n is number => typeof n === 'number' && n > 0);
+  const groupSourceExpectedCount =
+    sourceExpectedCountCandidates.length > 0 ? Math.max(...sourceExpectedCountCandidates) : null;
+
   const existingMediaAssetIdSet = new Set(existingTasks.map((t) => t.mediaAssetId.toString()));
   const missingAssets = groupedAssets.filter((a) => !existingMediaAssetIdSet.has(a.id.toString()));
 
@@ -370,29 +384,52 @@ async function reconcileGroupedDispatchAfterRelayUpload(context: {
     });
 
     const now = new Date();
-    const scheduleSlot = seedTask?.scheduleSlot ?? now;
+    const scheduleSlotBase = seedTask?.scheduleSlot ?? now;
     const plannedAt = seedTask?.plannedAt ?? now;
     const nextRunAt = now;
 
+    let slotCursor = scheduleSlotBase.getTime();
+
     for (const missing of missingAssets) {
-      await prisma.dispatchTask.create({
-        data: {
-          channelId: asset.channelId,
-          mediaAssetId: missing.id,
-          groupKey,
-          scheduleSlot,
-          plannedAt,
-          nextRunAt,
-          replyMarkup: seedTask?.replyMarkup ?? null,
-          caption: seedTask?.caption ?? null,
-          parseMode: seedTask?.parseMode ?? 'HTML',
-          status: TaskStatus.scheduled,
-          priority: seedTask?.priority ?? 100,
-          retryCount: 0,
-          maxRetries: seedTask?.maxRetries ?? 6,
-        },
-      });
-      createdDispatchTasks += 1;
+      let created = false;
+      let attempt = 0;
+
+      while (!created && attempt < 120) {
+        slotCursor += 1000;
+        const scheduleSlot = new Date(slotCursor);
+        attempt += 1;
+
+        try {
+          await prisma.dispatchTask.create({
+            data: {
+              channelId: asset.channelId,
+              mediaAssetId: missing.id,
+              groupKey,
+              scheduleSlot,
+              plannedAt,
+              nextRunAt,
+              replyMarkup: seedTask?.replyMarkup ?? undefined,
+              caption: seedTask?.caption ?? null,
+              parseMode: seedTask?.parseMode ?? 'HTML',
+              status: TaskStatus.scheduled,
+              priority: seedTask?.priority ?? 100,
+              retryCount: 0,
+              maxRetries: seedTask?.maxRetries ?? 6,
+            },
+          });
+          createdDispatchTasks += 1;
+          created = true;
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          if (!msg.toLowerCase().includes('unique constraint failed')) {
+            throw error;
+          }
+        }
+      }
+
+      if (!created) {
+        throw new Error(`dispatchTask slot allocation exhausted for groupKey=${groupKey}`);
+      }
     }
   }
 
@@ -415,6 +452,13 @@ async function reconcileGroupedDispatchAfterRelayUpload(context: {
       where: { id: groupTask.id },
       data: {
         expectedMediaCount: groupedAssets.length,
+        ...(groupSourceExpectedCount && groupSourceExpectedCount > 0
+          ? {
+              sourceExpectedCount: {
+                set: groupSourceExpectedCount,
+              },
+            }
+          : {}),
         actualUploadedCount: uploadedCount,
         lastArrivalAt: now,
       },
@@ -432,6 +476,21 @@ async function reconcileGroupedDispatchAfterRelayUpload(context: {
     missingDispatchTaskCount: missingAssets.length,
     createdDispatchTaskCount: createdDispatchTasks,
     dispatchGroupTaskId: groupTask?.id?.toString?.() ?? null,
+  });
+
+  logger.info('[typeb_group][verify] dispatchGroupTask expected source snapshot', {
+    traceId: context.traceId,
+    channelId: asset.channelId.toString(),
+    groupKey,
+    dispatchGroupTaskId: groupTask?.id?.toString?.() ?? null,
+    groupAssetCount: groupedAssets.length,
+    uploadedCount,
+    sourceExpectedCountCandidates,
+    groupSourceExpectedCount,
+    sourceExpectedCountWriteApplied: Boolean(groupTask?.id && groupSourceExpectedCount && groupSourceExpectedCount > 0),
+    sourceExpectedCountWriteSource: groupSourceExpectedCount && groupSourceExpectedCount > 0
+      ? 'reconcile_grouped_assets_terminal_meta'
+      : 'none',
   });
 
   return {

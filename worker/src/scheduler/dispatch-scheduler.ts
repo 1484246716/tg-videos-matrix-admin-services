@@ -90,6 +90,15 @@ function isGroupedPath(pathLike: string | null | undefined) {
   return /\/(grouped-\d+)\//i.test(pathLike.replace(/\\/g, '/'));
 }
 
+function parseSourceExpectedCount(sourceMeta: unknown) {
+  if (!sourceMeta || typeof sourceMeta !== 'object' || Array.isArray(sourceMeta)) return null;
+  const meta = sourceMeta as Record<string, unknown>;
+  const raw = meta.sourceExpectedCount;
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return Math.floor(raw);
+  if (typeof raw === 'string' && /^\d+$/.test(raw) && Number(raw) > 0) return Math.floor(Number(raw));
+  return null;
+}
+
 function parseCollectionSchedulerConfig(navReplyMarkup: unknown) {
   const fallback = {
     collectionDispatchGateEnabled: true,
@@ -837,6 +846,7 @@ export async function scheduleDueDispatchTasks() {
                 scheduleSlot: true,
                 readyDeadlineAt: true,
                 expectedMediaCount: true,
+                sourceExpectedCount: true,
                 actualUploadedCount: true,
                 lastArrivalAt: true,
                 sealedAt: true,
@@ -846,11 +856,9 @@ export async function scheduleDueDispatchTasks() {
           { label: 'dispatch.scheduleDueDispatchTasks.upsertGroupTask' },
         );
 
-        const expectedTotal = Math.max(
-          Number(groupTask.expectedMediaCount ?? 0),
-          expectedMediaCount,
-          groupSize,
-        );
+        const sourceExpectedCount = Number(groupTask.sourceExpectedCount ?? 0);
+        const expectedTotalSource = sourceExpectedCount > 0 ? 'source_expected_count' : 'fallback_missing_source_expected_count';
+        const expectedTotal = sourceExpectedCount;
         const persistedUploadedCount = Number(groupTask.actualUploadedCount ?? 0);
         const effectiveUploadedCount = Math.max(persistedUploadedCount, uploadedCount);
         const firstSeenAt = new Date(groupTask.scheduleSlot);
@@ -885,10 +893,37 @@ export async function scheduleDueDispatchTasks() {
         }
 
         const sealedEnough = Boolean(sealedAt);
-        const readyEnough = expectedTotal > 0 && readyCount === expectedTotal;
-        const uploadedEnough = expectedTotal > 0 && effectiveUploadedCount === expectedTotal;
+        const hasSourceExpectedCount = expectedTotal > 0;
+        const readyEnough = hasSourceExpectedCount && readyCount === expectedTotal;
+        const uploadedEnough = hasSourceExpectedCount && effectiveUploadedCount === expectedTotal;
 
-        if (!sealedEnough || !readyEnough || !uploadedEnough) {
+        if (!hasSourceExpectedCount) {
+          logger.error('[typeb_group][assert] source_expected_count missing, block dispatch enqueue', {
+            taskId: task.id.toString(),
+            channelId: task.channelId.toString(),
+            groupKey: task.groupKey,
+            dispatchGroupTaskId: groupTask.id.toString(),
+            expectedTotal,
+            expectedTotalSource,
+            sourceExpectedCount,
+            fallbackExpectedMediaCount: Number(groupTask.expectedMediaCount ?? 0),
+            readyCount,
+            uploadedCount: effectiveUploadedCount,
+            persistedUploadedCount,
+            computedUploadedCount: uploadedCount,
+            lastArrivalAt: lastArrivalAt?.toISOString() ?? null,
+            quietPeriodMs: TYPEB_GROUP_SEAL_QUIET_PERIOD_MS,
+            quietReached,
+            sealedAt: sealedAt?.toISOString() ?? null,
+            sealReason,
+            firstSeenAt: firstSeenAt.toISOString(),
+            hardDeadlineAt: hardDeadlineAt.toISOString(),
+            now: now.toISOString(),
+            blockedReason: 'source_expected_count_missing',
+          });
+        }
+
+        if (!sealedEnough || !readyEnough || !uploadedEnough || !hasSourceExpectedCount) {
           logger.info('[typeb_group][diag] send gate blocked snapshot', {
             taskId: task.id.toString(),
             channelId: task.channelId.toString(),
@@ -899,6 +934,7 @@ export async function scheduleDueDispatchTasks() {
             readyEnough,
             uploadedEnough,
             expectedTotal,
+            expectedTotalSource,
             readyCount,
             uploadedCount: effectiveUploadedCount,
             persistedUploadedCount,
@@ -947,6 +983,7 @@ export async function scheduleDueDispatchTasks() {
               groupKey: task.groupKey,
               groupSize,
               expectedMediaCount: expectedTotal,
+              expectedTotalSource,
               readyCount,
               uploadedCount: effectiveUploadedCount,
               lastArrivalAt: lastArrivalAt?.toISOString() ?? null,
@@ -982,6 +1019,7 @@ export async function scheduleDueDispatchTasks() {
             groupKey: task.groupKey,
             groupSize,
             expectedMediaCount: expectedTotal,
+            expectedTotalSource,
             readyCount,
             uploadedCount: effectiveUploadedCount,
             lastArrivalAt: lastArrivalAt?.toISOString() ?? null,
@@ -1032,6 +1070,7 @@ export async function scheduleDueDispatchTasks() {
             readyEnough,
             uploadedEnough,
             expectedTotal,
+            expectedTotalSource,
             readyCount,
             uploadedCount: effectiveUploadedCount,
             now: now.toISOString(),
@@ -1048,6 +1087,7 @@ export async function scheduleDueDispatchTasks() {
           groupKey: task.groupKey,
           dispatchGroupTaskId: groupTask.id.toString(),
           expectedTotal,
+          expectedTotalSource,
           readyCount,
           uploadedCount: effectiveUploadedCount,
           sealedAt: sealedAt?.toISOString() ?? null,
@@ -1056,6 +1096,19 @@ export async function scheduleDueDispatchTasks() {
           lastArrivalAt: lastArrivalAt?.toISOString() ?? null,
           queueJobName,
           queueJobId,
+        });
+
+        logger.info('[typeb_group][verify] expectedTotal source snapshot', {
+          taskId: task.id.toString(),
+          channelId: task.channelId.toString(),
+          groupKey: task.groupKey,
+          dispatchGroupTaskId: groupTask.id.toString(),
+          sourceExpectedCount: Number(groupTask.sourceExpectedCount ?? 0),
+          fallbackExpectedMediaCount: Number(groupTask.expectedMediaCount ?? 0),
+          expectedTotal,
+          expectedTotalSource,
+          readyCount,
+          uploadedCount: effectiveUploadedCount,
         });
       }
 
@@ -1220,6 +1273,13 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
       );
       const groupSlot = new Date(now.getTime());
       const isRealGroup = sorted.length > 1;
+      const sourceExpectedCountCandidates = sorted
+        .map((asset) => parseSourceExpectedCount(asset.sourceMeta))
+        .filter((n): n is number => typeof n === 'number' && n > 0);
+      const groupSourceExpectedCount =
+        sourceExpectedCountCandidates.length > 0
+          ? Math.max(...sourceExpectedCountCandidates)
+          : null;
 
       if (groupKey.toLowerCase().startsWith('grouped-') && sorted.length === 1) {
         logger.warn('[typeb_group] grouped 单元素组已识别，保持等待组装不降级单发', {
@@ -1255,6 +1315,7 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
                 nextRunAt: groupSlot,
                 readyDeadlineAt: new Date(groupSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
                 expectedMediaCount: sorted.length,
+                sourceExpectedCount: groupSourceExpectedCount,
                 actualReadyCount: 0,
                 actualUploadedCount: 0,
                 lastArrivalAt: now,
@@ -1262,6 +1323,13 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
               update: {
                 nextRunAt: groupSlot,
                 expectedMediaCount: sorted.length,
+                ...(groupSourceExpectedCount && groupSourceExpectedCount > 0
+                  ? {
+                      sourceExpectedCount: {
+                        set: groupSourceExpectedCount,
+                      },
+                    }
+                  : {}),
                 actualUploadedCount: {
                   set: 0,
                 },

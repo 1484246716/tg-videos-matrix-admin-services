@@ -2,7 +2,11 @@ import { rm } from 'node:fs/promises';
 import path from 'node:path';
 import { DispatchMediaType, MediaStatus, TaskStatus } from '@prisma/client';
 import { generateTextWithAiProfile } from '../ai-provider';
-import { DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED, TYPEB_GROUP_SEAL_QUIET_PERIOD_MS } from '../config/env';
+import {
+  DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED,
+  TYPEB_GROUP_RETRY_CHECK_MS,
+  TYPEB_GROUP_SEAL_QUIET_PERIOD_MS,
+} from '../config/env';
 import { prisma, withPrismaRetry } from '../infra/prisma';
 import { searchIndexQueue } from '../infra/redis';
 import { logger, logError } from '../logger';
@@ -195,8 +199,12 @@ function isDispatchScopedTempDirName(dirName: string) {
   return /^(single|grouped)-[a-z0-9][a-z0-9_-]*$/i.test(dirName);
 }
 
-function resolveDispatchScopedDirFromMeta(meta: Record<string, unknown> | null | undefined) {
-  const localPath = typeof meta?.localPath === 'string' ? meta.localPath : '';
+function resolveDispatchScopedDirFromMeta(
+  meta: Record<string, unknown> | null | undefined,
+  localPathFallback?: string | null,
+) {
+  const localPathFromMeta = typeof meta?.localPath === 'string' ? meta.localPath : '';
+  const localPath = localPathFromMeta || (typeof localPathFallback === 'string' ? localPathFallback : '');
   if (!localPath) return null;
 
   const normalized = localPath.replace(/\\/g, '/');
@@ -211,7 +219,7 @@ function resolveDispatchScopedDirFromMeta(meta: Record<string, unknown> | null |
 }
 
 async function cleanupDispatchScopedDirectoriesAfterSuccess(
-  tasks: Array<{ mediaAsset: { sourceMeta: unknown } }>,
+  tasks: Array<{ mediaAsset: { sourceMeta: unknown; localPath?: string | null } }>,
   allowedDirNames?: Set<string>,
 ) {
   const dirs = new Set<string>();
@@ -219,8 +227,16 @@ async function cleanupDispatchScopedDirectoriesAfterSuccess(
     const meta = t.mediaAsset.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
       ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
       : null;
-    const dir = resolveDispatchScopedDirFromMeta(meta);
+    const dir = resolveDispatchScopedDirFromMeta(meta, t.mediaAsset.localPath ?? null);
     if (dir) dirs.add(dir);
+  }
+
+  if (dirs.size === 0) {
+    logger.warn('[typeb_cleanup] 跳过目录清理（未解析到 dispatch scoped 目录）', {
+      taskCount: tasks.length,
+      allowedDirNames: allowedDirNames ? Array.from(allowedDirNames) : null,
+    });
+    return;
   }
 
   for (const dir of dirs) {
@@ -366,6 +382,7 @@ export async function handleDispatchGroupJob(
               telegramFileId: true,
               dispatchMediaType: true,
               sourceMeta: true,
+              localPath: true,
             },
           },
         },
@@ -385,6 +402,7 @@ export async function handleDispatchGroupJob(
           id: true,
           status: true,
           expectedMediaCount: true,
+          sourceExpectedCount: true,
           actualReadyCount: true,
           actualUploadedCount: true,
           lastArrivalAt: true,
@@ -452,11 +470,11 @@ export async function handleDispatchGroupJob(
       Boolean(t.mediaAsset.telegramFileId) &&
       Boolean(t.mediaAsset.dispatchMediaType),
   );
-  const expectedCount = Math.max(
-    Number(seedTask.expectedMediaCount ?? 0),
-    Number(groupTaskState?.expectedMediaCount ?? 0),
-    normalizedGroupTasks.length,
-  );
+  const sourceExpectedCount = Number(groupTaskState?.sourceExpectedCount ?? 0);
+  const expectedTotalSource = sourceExpectedCount > 0
+    ? 'source_expected_count'
+    : 'fallback_missing_source_expected_count';
+  const expectedCount = sourceExpectedCount;
   const lastArrivalAt = groupTaskState?.lastArrivalAt ? new Date(groupTaskState.lastArrivalAt) : null;
   const quietReached =
     Boolean(lastArrivalAt) &&
@@ -501,8 +519,9 @@ export async function handleDispatchGroupJob(
   }
 
   const sealedEnough = Boolean(sealedAt);
-  const readyEnough = pendingGroupTasks.length >= expectedCount;
-  const uploadedEnough = uploadedReadyTasks.length >= expectedCount;
+  const hasSourceExpectedCount = expectedCount > 0;
+  const readyEnough = hasSourceExpectedCount && pendingGroupTasks.length >= expectedCount;
+  const uploadedEnough = hasSourceExpectedCount && uploadedReadyTasks.length >= expectedCount;
 
   logger.info('[typeb_group] dispatch-send-group preflight snapshot', {
     dispatchTaskId: dispatchTaskIdRaw,
@@ -574,7 +593,30 @@ export async function handleDispatchGroupJob(
     };
   }
 
-  if (!sealedEnough || !readyEnough || !uploadedEnough) {
+  if (!hasSourceExpectedCount) {
+    logger.error('[typeb_group][assert] source_expected_count missing in dispatch worker preflight, block send', {
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: seedTask.groupKey,
+      channelId: seedTask.channelId.toString(),
+      dispatchGroupTaskId: groupTaskState?.id?.toString?.() ?? null,
+      expectedCount,
+      expectedTotalSource,
+      sourceExpectedCount,
+      fallbackExpectedMediaCount: Number(groupTaskState?.expectedMediaCount ?? 0),
+      readyCount: pendingGroupTasks.length,
+      uploadedCount: uploadedReadyTasks.length,
+      lastArrivalAt: lastArrivalAt?.toISOString() ?? null,
+      quietPeriodMs: TYPEB_GROUP_SEAL_QUIET_PERIOD_MS,
+      quietReached,
+      sealedAt: sealedAt?.toISOString() ?? null,
+      sealReason,
+      blockedReason: 'source_expected_count_missing',
+      action: 'reschedule_without_failure',
+      retryAfterMs: TYPEB_GROUP_RETRY_CHECK_MS,
+    });
+  }
+
+  if (!sealedEnough || !readyEnough || !uploadedEnough || !hasSourceExpectedCount) {
     logger.warn('[typeb_group][diag] preflight blocked snapshot', {
       dispatchTaskId: dispatchTaskIdRaw,
       groupKey: seedTask.groupKey,
@@ -584,6 +626,7 @@ export async function handleDispatchGroupJob(
       readyEnough,
       uploadedEnough,
       expectedCount,
+      expectedTotalSource,
       readyCount: pendingGroupTasks.length,
       uploadedCount: uploadedReadyTasks.length,
       excludedCount: excludedGroupTasks.length,
@@ -593,11 +636,51 @@ export async function handleDispatchGroupJob(
       sealedAt: sealedAt?.toISOString() ?? null,
       sealReason,
       blockedReason: 'blocked_until_all_uploaded',
+      action: 'reschedule_without_failure',
+      retryAfterMs: TYPEB_GROUP_RETRY_CHECK_MS,
     });
 
-    throw new Error(
-      `group_not_fully_uploaded: sealed=${sealedEnough ? 1 : 0}, ready=${pendingGroupTasks.length}, uploaded=${uploadedReadyTasks.length}, expected=${expectedCount}, excluded=${excludedGroupTasks.length}`,
+    await withPrismaRetry(
+      () =>
+        prisma.dispatchTask.updateMany({
+          where: {
+            id: { in: pendingGroupTasks.map((t) => t.id) },
+            status: { in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed, TaskStatus.running] },
+          },
+          data: {
+            status: TaskStatus.scheduled,
+            nextRunAt: new Date(Date.now() + TYPEB_GROUP_RETRY_CHECK_MS),
+          },
+        }),
+      { label: 'dispatch.handleDispatchGroupJob.preflightBlockedRescheduleTasks' },
     );
+
+    if (groupTaskState?.id) {
+      await withPrismaRetry(
+        () =>
+          (prisma as any).dispatchGroupTask.update({
+            where: { id: groupTaskState.id },
+            data: {
+              status: TaskStatus.scheduled,
+              nextRunAt: new Date(Date.now() + TYPEB_GROUP_RETRY_CHECK_MS),
+            },
+          }),
+        { label: 'dispatch.handleDispatchGroupJob.preflightBlockedRescheduleGroupTask' },
+      );
+    }
+
+    return {
+      ok: true,
+      grouped: true,
+      skipped: true,
+      reason: 'group_not_fully_uploaded_waiting',
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: seedTask.groupKey,
+      expectedCount,
+      expectedTotalSource,
+      readyCount: pendingGroupTasks.length,
+      uploadedCount: uploadedReadyTasks.length,
+    };
   }
 
   const sourceRelayBotIdRaw =
@@ -881,7 +964,7 @@ export async function handleDispatchGroupJob(
     });
 
     await cleanupDispatchScopedDirectoriesAfterSuccess(
-      sortedGroupTasks as Array<{ mediaAsset: { sourceMeta: unknown } }>,
+      sortedGroupTasks as Array<{ mediaAsset: { sourceMeta: unknown; localPath?: string | null } }>,
       seedTask.groupKey ? new Set([seedTask.groupKey]) : undefined,
     );
 
@@ -1001,6 +1084,7 @@ export async function handleDispatchJob(
               aiGeneratedCaption: true,
               durationSec: true,
               sourceMeta: true,
+              localPath: true,
             },
           },
         },
@@ -1415,7 +1499,12 @@ export async function handleDispatchJob(
     });
 
     await cleanupDispatchScopedDirectoriesAfterSuccess([
-      { mediaAsset: { sourceMeta: task.mediaAsset.sourceMeta } },
+      {
+        mediaAsset: {
+          sourceMeta: task.mediaAsset.sourceMeta,
+          localPath: task.mediaAsset.localPath,
+        },
+      },
     ]);
 
     // ── 触发搜索索引更新（延迟2秒等AI caption等后续处理完成）──

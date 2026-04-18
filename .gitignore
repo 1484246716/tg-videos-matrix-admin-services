@@ -11,3 +11,8 @@ apps/api/prisma/migrations
 # Ignore local data directory
 data/
 apps/data/
+
+# SQLite runtime temp files
+*.db-wal
+*.db-shm
+*.db-journal

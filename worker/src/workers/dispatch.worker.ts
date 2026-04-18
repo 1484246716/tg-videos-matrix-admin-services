@@ -1,6 +1,6 @@
 import { Worker } from 'bullmq';
 import { connection } from '../infra/redis';
-import { logger, logError } from '../logger';
+import { logger, logError, toReadableErrorSummary } from '../logger';
 import { handleDispatchJob, handleDispatchGroupJob } from '../services/dispatch.service';
 
 export const dispatchWorker = new Worker(
@@ -33,8 +33,26 @@ dispatchWorker.on('completed', (job) => {
 });
 
 dispatchWorker.on('failed', (job, err) => {
+  let errorJson: string | null = null;
+  if (!(err instanceof Error)) {
+    try {
+      errorJson = JSON.stringify(err);
+    } catch {
+      errorJson = null;
+    }
+  }
+
+  const errorInfo = err instanceof Error
+    ? { name: err.name, message: err.message, stack: err.stack }
+    : { raw: err, string: toReadableErrorSummary(err), json: errorJson };
+
   logError('[q_dispatch] 任务失败', {
     jobId: job?.id ? String(job.id) : null,
-    error: err,
+    jobName: job?.name ?? null,
+    attemptsMade: job?.attemptsMade ?? null,
+    dispatchTaskId: (job?.data?.dispatchTaskId as string | undefined) ?? null,
+    groupKey: (job?.data?.groupKey as string | undefined) ?? null,
+    errorSummary: toReadableErrorSummary(err),
+    error: errorInfo,
   });
 });

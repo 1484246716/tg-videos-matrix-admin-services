@@ -487,6 +487,7 @@ model DispatchGroupTask {
   nextRunAt             DateTime   @map("next_run_at") @db.Timestamptz(6)
   readyDeadlineAt       DateTime?  @map("ready_deadline_at") @db.Timestamptz(6)
   expectedMediaCount    Int        @default(0) @map("expected_media_count")
+  sourceExpectedCount   Int?       @map("source_expected_count")
   actualReadyCount      Int        @default(0) @map("actual_ready_count")
   actualUploadedCount   Int        @default(0) @map("actual_uploaded_count")
   lastArrivalAt         DateTime?  @map("last_arrival_at") @db.Timestamptz(6)

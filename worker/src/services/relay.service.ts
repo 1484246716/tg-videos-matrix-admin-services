@@ -42,6 +42,79 @@ function parseGroupedMeta(filePath: string) {
   return { groupKey, groupedId };
 }
 
+async function resolveSourceExpectedCount(args: {
+  channelId: bigint;
+  filePath: string;
+  groupedMeta: { groupKey: string; groupedId: string | null } | null;
+  cloneSourceMeta: { isCloneCrawlAsset: true; sourceChannelUsername: string; sourceMessageId: string } | null;
+}) {
+  if (!args.groupedMeta?.groupKey) return null;
+  if (!args.cloneSourceMeta?.sourceChannelUsername || !args.cloneSourceMeta?.sourceMessageId) return null;
+
+  const normalized = args.filePath.replace(/\\/g, '/');
+  const marker = `/${args.groupedMeta.groupKey}/`;
+  const idx = normalized.toLowerCase().lastIndexOf(marker.toLowerCase());
+  if (idx === -1) return null;
+
+
+  const groupedSourceChannel = args.cloneSourceMeta.sourceChannelUsername.trim().replace(/^@+/, '').toLowerCase();
+  if (!groupedSourceChannel) return null;
+
+  const groupedItemWhere = args.groupedMeta.groupedId
+    ? {
+        channelUsername: groupedSourceChannel,
+        groupedId: args.groupedMeta.groupedId,
+        OR: [
+          { hasVideo: true },
+          {
+            mimeType: {
+              startsWith: 'image/',
+            },
+          },
+        ],
+      }
+    : {
+        channelUsername: groupedSourceChannel,
+        groupKey: args.groupedMeta.groupKey,
+        OR: [
+          { hasVideo: true },
+          {
+            mimeType: {
+              startsWith: 'image/',
+            },
+          },
+        ],
+      };
+
+  const groupedItems = await prisma.cloneCrawlItem.findMany({
+    where: groupedItemWhere,
+    select: {
+      messageId: true,
+    },
+  });
+
+  const terminalCount = groupedItems.length;
+  if (terminalCount <= 0) return null;
+
+  const sourceMessageIdBigInt = BigInt(args.cloneSourceMeta.sourceMessageId);
+  const sourceMessageInGroup = groupedItems.some((item) => item.messageId === sourceMessageIdBigInt);
+  if (!sourceMessageInGroup) {
+    logger.warn('[typeb_group] sourceExpectedCount guard blocked: source message not in grouped terminal items', {
+      channelId: args.channelId.toString(),
+      filePath: args.filePath,
+      groupKey: args.groupedMeta.groupKey,
+      groupedId: args.groupedMeta.groupedId,
+      sourceChannelUsername: groupedSourceChannel,
+      sourceMessageId: args.cloneSourceMeta.sourceMessageId,
+      terminalCount,
+      blockedReason: 'source_message_not_in_group',
+    });
+    return null;
+  }
+
+  return terminalCount;
+}
+
 function parseCloneSourceMeta(filePath: string, groupedMeta: { groupKey: string; groupedId: string | null } | null) {
   if (!groupedMeta) return null;
 
@@ -56,7 +129,7 @@ function parseCloneSourceMeta(filePath: string, groupedMeta: { groupKey: string;
   if (!sourceChannelUsername || !/^\d+$/.test(sourceMessageId)) return null;
 
   return {
-    isCloneCrawlAsset: true,
+    isCloneCrawlAsset: true as const,
     sourceChannelUsername,
     sourceMessageId,
   };
@@ -332,6 +405,13 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
         groupedDiscovered += 1;
         groupedKeys.add(groupedMeta.groupKey);
       }
+      const sourceExpectedCount = await resolveSourceExpectedCount({
+        channelId: channel.id,
+        filePath,
+        groupedMeta,
+        cloneSourceMeta,
+      });
+
       const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
       const isTextOnlyCandidate = ext === 'txt' && !!groupedMeta;
 
@@ -531,6 +611,9 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
                 ingestRetryCount: 0,
                 ...(collectionMeta ?? {}),
                 ...(groupedMeta ?? {}),
+                ...(sourceExpectedCount && sourceExpectedCount > 0
+                  ? { sourceExpectedCount }
+                  : {}),
                 ...(cloneSourceMeta ?? {}),
               },
             },
@@ -551,6 +634,23 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
             资产ID: asset.id.toString(),
             处理动作: '新建资产',
             结果: '成功',
+          });
+
+          logger.info('[typeb_group][verify] sourceExpectedCount write snapshot', {
+            channelId: channel.id.toString(),
+            mediaAssetId: asset.id.toString(),
+            filePath,
+            groupKey: groupedMeta?.groupKey ?? null,
+            groupedId: groupedMeta?.groupedId ?? null,
+            cloneSourceMessageId: cloneSourceMeta?.sourceMessageId ?? null,
+            cloneSourceChannelUsername: cloneSourceMeta?.sourceChannelUsername ?? null,
+            sourceExpectedCount: sourceExpectedCount ?? null,
+            sourceExpectedCountWriteApplied: Boolean(groupedMeta?.groupKey && sourceExpectedCount && sourceExpectedCount > 0),
+            sourceExpectedCountWriteSource: groupedMeta?.groupKey
+              ? sourceExpectedCount && sourceExpectedCount > 0
+                ? 'asset_create_source_expected_count_from_clone_terminal_group_count'
+                : 'asset_create_source_expected_count_missing'
+              : 'none',
           });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -721,6 +821,9 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
             relayMaxRetries: definition.maxRetries,
             ...(collectionMeta ?? {}),
             ...(groupedMeta ?? {}),
+            ...(sourceExpectedCount && sourceExpectedCount > 0
+              ? { sourceExpectedCount }
+              : {}),
             ...(cloneSourceMeta ?? {}),
           },
         },
