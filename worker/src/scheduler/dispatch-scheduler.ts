@@ -7,7 +7,9 @@ import {
   DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED,
   MAX_SCHEDULE_BATCH,
   TYPEB_GROUP_READY_TIMEOUT_MS,
+  TYPEB_GROUP_HARD_DEADLINE_MS,
   TYPEB_GROUP_RETRY_CHECK_MS,
+  TYPEB_GROUP_SEAL_QUIET_PERIOD_MS,
   TYPEB_GROUP_SEND_ENABLED,
   TYPEB_GROUP_SEND_MIN_MEDIA_COUNT,
   TYPEB_GROUP_SEND_WHITELIST_CHANNEL_IDS,
@@ -22,8 +24,6 @@ const DISPATCH_HEAD_BYPASS_RETRY_THRESHOLD = 2;
 const DISPATCH_HEAD_BYPASS_DELAY_SEC = 10 * 60;
 const COLLECTION_SKIP_GRACE_MS = 5 * 60 * 1000;
 const COLLECTION_SKIP_REASON = 'auto_skip_missing_after_grace';
-const TYPEB_GROUP_READY_TIMEOUT_MS = 10 * 60 * 1000;
-const TYPEB_GROUP_RETRY_CHECK_MS = 10 * 1000;
 
 type CollectionGateEvalStats = {
   autoBypassCount: number;
@@ -664,6 +664,7 @@ export async function scheduleDueDispatchTasks() {
       let groupSize = 1;
       let queueJobName: 'dispatch-send' | 'dispatch-send-group' = 'dispatch-send';
       let queueJobId = `dispatch-${task.id.toString()}`;
+      let groupEnqueueGranted = true;
 
       if (task.groupKey) {
         const groupedTasks = await withPrismaRetry(
@@ -736,6 +737,37 @@ export async function scheduleDueDispatchTasks() {
               )
             : 0;
 
+        const uploadedCount = await withPrismaRetry(
+          () =>
+            prisma.mediaAsset.count({
+              where: {
+                channelId: task.channelId,
+                OR: [
+                  {
+                    sourceMeta: {
+                      path: ['groupKey'],
+                      equals: task.groupKey,
+                    },
+                  },
+                  {
+                    pathNormalized: {
+                      contains: `/${task.groupKey}/`,
+                    },
+                  },
+                  {
+                    localPath: {
+                      contains: `\\${task.groupKey}\\`,
+                    },
+                  },
+                ],
+                status: MediaStatus.relay_uploaded,
+                telegramFileId: { not: null },
+                dispatchMediaType: { not: null },
+              },
+            }),
+          { label: 'dispatch.scheduleDueDispatchTasks.countGroupUploadedAssets' },
+        );
+
         const channelInWhitelist =
           TYPEB_GROUP_SEND_WHITELIST_CHANNEL_IDS.length === 0 ||
           TYPEB_GROUP_SEND_WHITELIST_CHANNEL_IDS.includes(task.channelId.toString());
@@ -788,11 +820,14 @@ export async function scheduleDueDispatchTasks() {
                 readyDeadlineAt: new Date(groupScheduleSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
                 expectedMediaCount: Math.max(expectedMediaCount, groupSize),
                 actualReadyCount: readyCount,
+                actualUploadedCount: uploadedCount,
+                lastArrivalAt: now,
               },
               update: {
                 nextRunAt: now,
                 expectedMediaCount: Math.max(expectedMediaCount, groupSize),
                 actualReadyCount: readyCount,
+                actualUploadedCount: uploadedCount,
                 readyDeadlineAt: {
                   set: new Date(groupScheduleSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
                 },
@@ -801,19 +836,84 @@ export async function scheduleDueDispatchTasks() {
                 id: true,
                 scheduleSlot: true,
                 readyDeadlineAt: true,
+                expectedMediaCount: true,
+                actualUploadedCount: true,
+                lastArrivalAt: true,
+                sealedAt: true,
+                sealReason: true,
               },
             }),
           { label: 'dispatch.scheduleDueDispatchTasks.upsertGroupTask' },
         );
 
-        const readyDeadlineAt = groupTask.readyDeadlineAt
-          ? new Date(groupTask.readyDeadlineAt)
-          : new Date(new Date(groupTask.scheduleSlot).getTime() + TYPEB_GROUP_READY_TIMEOUT_MS);
-        const expectedTotal = Math.max(Number(groupTask.expectedMediaCount ?? 0), expectedMediaCount, groupSize);
-        const readyEnough = expectedTotal > 0 && readyCount === expectedTotal;
+        const expectedTotal = Math.max(
+          Number(groupTask.expectedMediaCount ?? 0),
+          expectedMediaCount,
+          groupSize,
+        );
+        const persistedUploadedCount = Number(groupTask.actualUploadedCount ?? 0);
+        const effectiveUploadedCount = Math.max(persistedUploadedCount, uploadedCount);
+        const firstSeenAt = new Date(groupTask.scheduleSlot);
+        const hardDeadlineAt = new Date(firstSeenAt.getTime() + TYPEB_GROUP_HARD_DEADLINE_MS);
+        const lastArrivalAt = groupTask.lastArrivalAt ? new Date(groupTask.lastArrivalAt) : null;
+        const quietReached =
+          Boolean(lastArrivalAt) &&
+          now.getTime() - (lastArrivalAt as Date).getTime() >= TYPEB_GROUP_SEAL_QUIET_PERIOD_MS;
 
-        if (!readyEnough) {
-          if (Date.now() >= readyDeadlineAt.getTime()) {
+        let sealedAt = groupTask.sealedAt ? new Date(groupTask.sealedAt) : null;
+        let sealReason = groupTask.sealReason ?? null;
+
+        if (!sealedAt && quietReached) {
+          const sealed = await withPrismaRetry(
+            () =>
+              (prisma as any).dispatchGroupTask.update({
+                where: { id: groupTask.id },
+                data: {
+                  sealedAt: now,
+                  sealReason: 'quiet_period_elapsed',
+                },
+                select: {
+                  sealedAt: true,
+                  sealReason: true,
+                },
+              }),
+            { label: 'dispatch.scheduleDueDispatchTasks.sealGroupByQuietPeriod' },
+          );
+
+          sealedAt = sealed?.sealedAt ? new Date(sealed.sealedAt) : now;
+          sealReason = sealed?.sealReason ?? 'quiet_period_elapsed';
+        }
+
+        const sealedEnough = Boolean(sealedAt);
+        const readyEnough = expectedTotal > 0 && readyCount === expectedTotal;
+        const uploadedEnough = expectedTotal > 0 && effectiveUploadedCount === expectedTotal;
+
+        if (!sealedEnough || !readyEnough || !uploadedEnough) {
+          logger.info('[typeb_group][diag] send gate blocked snapshot', {
+            taskId: task.id.toString(),
+            channelId: task.channelId.toString(),
+            groupKey: task.groupKey,
+            dispatchGroupTaskId: groupTask.id.toString(),
+            gateBlocked: true,
+            sealedEnough,
+            readyEnough,
+            uploadedEnough,
+            expectedTotal,
+            readyCount,
+            uploadedCount: effectiveUploadedCount,
+            persistedUploadedCount,
+            computedUploadedCount: uploadedCount,
+            lastArrivalAt: lastArrivalAt?.toISOString() ?? null,
+            quietPeriodMs: TYPEB_GROUP_SEAL_QUIET_PERIOD_MS,
+            quietReached,
+            sealedAt: sealedAt?.toISOString() ?? null,
+            sealReason,
+            firstSeenAt: firstSeenAt.toISOString(),
+            hardDeadlineAt: hardDeadlineAt.toISOString(),
+            now: now.toISOString(),
+            blockedReason: 'blocked_until_all_uploaded',
+          });
+          if (Date.now() >= hardDeadlineAt.getTime()) {
             await withPrismaRetry(
               () =>
                 prisma.$transaction([
@@ -821,8 +921,8 @@ export async function scheduleDueDispatchTasks() {
                     where: { id: groupTask.id },
                     data: {
                       status: TaskStatus.dead,
-                      telegramErrorCode: 'group_not_ready_timeout',
-                      telegramErrorMessage: `group not ready within ${TYPEB_GROUP_READY_TIMEOUT_MS}ms`,
+                      telegramErrorCode: 'group_not_fully_uploaded_timeout',
+                      telegramErrorMessage: `group not fully uploaded within ${TYPEB_GROUP_HARD_DEADLINE_MS}ms`,
                     },
                   }),
                   prisma.dispatchTask.updateMany({
@@ -833,8 +933,8 @@ export async function scheduleDueDispatchTasks() {
                     },
                     data: {
                       status: TaskStatus.dead,
-                      telegramErrorCode: 'group_not_ready_timeout',
-                      telegramErrorMessage: `group not ready within ${TYPEB_GROUP_READY_TIMEOUT_MS}ms`,
+                      telegramErrorCode: 'group_not_fully_uploaded_timeout',
+                      telegramErrorMessage: `group not fully uploaded within ${TYPEB_GROUP_READY_TIMEOUT_MS}ms`,
                       finishedAt: new Date(),
                     },
                   }),
@@ -842,14 +942,24 @@ export async function scheduleDueDispatchTasks() {
               { label: 'dispatch.scheduleDueDispatchTasks.groupTimeoutDead' },
             );
 
-            logger.warn('[typeb_group] grouped 任务组装超时，标记 dead（禁止单发降级）', {
+            logger.warn('[typeb_group] grouped 任务等待全上传超时，标记 dead（禁止单发降级）', {
               channelId: task.channelId.toString(),
               groupKey: task.groupKey,
               groupSize,
+              expectedMediaCount: expectedTotal,
               readyCount,
-              timeoutMs: TYPEB_GROUP_READY_TIMEOUT_MS,
-              readyDeadlineAt: readyDeadlineAt.toISOString(),
+              uploadedCount: effectiveUploadedCount,
+              lastArrivalAt: lastArrivalAt?.toISOString() ?? null,
+              quietPeriodMs: TYPEB_GROUP_SEAL_QUIET_PERIOD_MS,
+              quietReached,
+              sealedAt: sealedAt?.toISOString() ?? null,
+              sealReason,
+              timeoutMs: TYPEB_GROUP_HARD_DEADLINE_MS,
+              firstSeenAt: firstSeenAt.toISOString(),
+              hardDeadlineAt: hardDeadlineAt.toISOString(),
+              blockedReason: 'blocked_until_all_uploaded',
               typeb_group_ready_timeout_total: 1,
+              typeb_group_not_fully_uploaded_timeout_total: 1,
             });
             continue;
           }
@@ -866,22 +976,87 @@ export async function scheduleDueDispatchTasks() {
             { label: 'dispatch.scheduleDueDispatchTasks.groupNotReadyDelay' },
           );
 
-          logger.info('[typeb_group] grouped 任务未全量就绪，延后等待（禁止提前派发）', {
+          logger.info('[typeb_group] grouped 任务未全量上传就绪，延后等待（禁止提前派发）', {
             taskId: task.id.toString(),
             channelId: task.channelId.toString(),
             groupKey: task.groupKey,
             groupSize,
             expectedMediaCount: expectedTotal,
             readyCount,
+            uploadedCount: effectiveUploadedCount,
+            lastArrivalAt: lastArrivalAt?.toISOString() ?? null,
+            quietPeriodMs: TYPEB_GROUP_SEAL_QUIET_PERIOD_MS,
+            quietReached,
+            sealedAt: sealedAt?.toISOString() ?? null,
+            sealReason,
             readyAssert: 'blocked_until_ready_eq_expected',
-            readyDeadlineAt: readyDeadlineAt.toISOString(),
+            uploadedAssert: 'blocked_until_all_uploaded',
+            firstSeenAt: firstSeenAt.toISOString(),
+            hardDeadlineAt: hardDeadlineAt.toISOString(),
+            blockedReason: 'blocked_until_all_uploaded',
             typeb_group_not_ready_block_total: 1,
+            typeb_group_blocked_until_all_uploaded_total: 1,
+          });
+          continue;
+        }
+
+        const enqueueGate = await withPrismaRetry(
+          () =>
+            (prisma as any).dispatchGroupTask.updateMany({
+              where: {
+                id: groupTask.id,
+                status: { in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed] },
+              },
+              data: {
+                status: TaskStatus.scheduled,
+                nextRunAt: now,
+              },
+            }),
+          { label: 'dispatch.scheduleDueDispatchTasks.groupEnqueueCas' },
+        );
+
+        groupEnqueueGranted = enqueueGate.count > 0;
+        if (!groupEnqueueGranted) {
+          logger.info('[typeb_group] grouped 入队被并发抢占，跳过本次重复入队', {
+            channelId: task.channelId.toString(),
+            groupKey: task.groupKey,
+            dispatchGroupTaskId: groupTask.id.toString(),
+            reason: 'group_enqueue_cas_rejected',
+          });
+          logger.info('[typeb_group][diag] enqueue cas rejected snapshot', {
+            taskId: task.id.toString(),
+            channelId: task.channelId.toString(),
+            groupKey: task.groupKey,
+            dispatchGroupTaskId: groupTask.id.toString(),
+            sealedEnough,
+            readyEnough,
+            uploadedEnough,
+            expectedTotal,
+            readyCount,
+            uploadedCount: effectiveUploadedCount,
+            now: now.toISOString(),
           });
           continue;
         }
 
         queueJobName = 'dispatch-send-group';
         queueJobId = `dispatch-group-${groupTask.id.toString()}`;
+
+        logger.info('[typeb_group][diag] enqueue granted snapshot', {
+          taskId: task.id.toString(),
+          channelId: task.channelId.toString(),
+          groupKey: task.groupKey,
+          dispatchGroupTaskId: groupTask.id.toString(),
+          expectedTotal,
+          readyCount,
+          uploadedCount: effectiveUploadedCount,
+          sealedAt: sealedAt?.toISOString() ?? null,
+          sealReason,
+          quietReached,
+          lastArrivalAt: lastArrivalAt?.toISOString() ?? null,
+          queueJobName,
+          queueJobId,
+        });
       }
 
       await dispatchQueue.add(
@@ -1081,10 +1256,18 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
                 readyDeadlineAt: new Date(groupSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
                 expectedMediaCount: sorted.length,
                 actualReadyCount: 0,
+                actualUploadedCount: 0,
+                lastArrivalAt: now,
               },
               update: {
                 nextRunAt: groupSlot,
                 expectedMediaCount: sorted.length,
+                actualUploadedCount: {
+                  set: 0,
+                },
+                lastArrivalAt: {
+                  set: now,
+                },
                 readyDeadlineAt: new Date(groupSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
                 updatedAt: new Date(),
               },

@@ -1,8 +1,8 @@
 import { rm } from 'node:fs/promises';
 import path from 'node:path';
-import { DispatchMediaType, TaskStatus } from '@prisma/client';
+import { DispatchMediaType, MediaStatus, TaskStatus } from '@prisma/client';
 import { generateTextWithAiProfile } from '../ai-provider';
-import { DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED } from '../config/env';
+import { DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED, TYPEB_GROUP_SEAL_QUIET_PERIOD_MS } from '../config/env';
 import { prisma, withPrismaRetry } from '../infra/prisma';
 import { searchIndexQueue } from '../infra/redis';
 import { logger, logError } from '../logger';
@@ -362,13 +362,37 @@ export async function handleDispatchGroupJob(
           mediaAsset: {
             select: {
               id: true,
+              status: true,
               telegramFileId: true,
+              dispatchMediaType: true,
               sourceMeta: true,
             },
           },
         },
       }),
     { label: 'dispatch.handleDispatchGroupJob.findGroupTasks' },
+  );
+
+  const groupTaskState = await withPrismaRetry(
+    () =>
+      (prisma as any).dispatchGroupTask.findFirst({
+        where: {
+          channelId: seedTask.channelId,
+          groupKey: seedTask.groupKey,
+        },
+        orderBy: [{ updatedAt: 'desc' }],
+        select: {
+          id: true,
+          status: true,
+          expectedMediaCount: true,
+          actualReadyCount: true,
+          actualUploadedCount: true,
+          lastArrivalAt: true,
+          sealedAt: true,
+          sealReason: true,
+        },
+      }),
+    { label: 'dispatch.handleDispatchGroupJob.findDispatchGroupTaskState' },
   );
 
   const now = new Date();
@@ -422,14 +446,72 @@ export async function handleDispatchGroupJob(
   const excludedGroupTasks = normalizedGroupTasks.filter(
     (t) => !readyStatuses.has(t.status) && t.status !== TaskStatus.success,
   );
-  const expectedCount = Math.max(Number(seedTask.expectedMediaCount ?? 0), normalizedGroupTasks.length);
+  const uploadedReadyTasks = normalizedGroupTasks.filter(
+    (t) =>
+      t.mediaAsset.status === MediaStatus.relay_uploaded &&
+      Boolean(t.mediaAsset.telegramFileId) &&
+      Boolean(t.mediaAsset.dispatchMediaType),
+  );
+  const expectedCount = Math.max(
+    Number(seedTask.expectedMediaCount ?? 0),
+    Number(groupTaskState?.expectedMediaCount ?? 0),
+    normalizedGroupTasks.length,
+  );
+  const lastArrivalAt = groupTaskState?.lastArrivalAt ? new Date(groupTaskState.lastArrivalAt) : null;
+  const quietReached =
+    Boolean(lastArrivalAt) &&
+    now.getTime() - (lastArrivalAt as Date).getTime() >= TYPEB_GROUP_SEAL_QUIET_PERIOD_MS;
+
+  let sealedAt = groupTaskState?.sealedAt ? new Date(groupTaskState.sealedAt) : null;
+  let sealReason = groupTaskState?.sealReason ?? null;
+
+  if (!sealedAt && quietReached && groupTaskState?.id && lastArrivalAt) {
+    await withPrismaRetry(
+      () =>
+        (prisma as any).dispatchGroupTask.updateMany({
+          where: {
+            id: groupTaskState.id,
+            sealedAt: null,
+            lastArrivalAt: {
+              lte: new Date(now.getTime() - TYPEB_GROUP_SEAL_QUIET_PERIOD_MS),
+            },
+          },
+          data: {
+            sealedAt: now,
+            sealReason: 'quiet_period_elapsed_before_send',
+          },
+        }),
+      { label: 'dispatch.handleDispatchGroupJob.sealBeforeSendByQuietPeriodCas' },
+    );
+
+    const sealedState = await withPrismaRetry(
+      () =>
+        (prisma as any).dispatchGroupTask.findUnique({
+          where: { id: groupTaskState.id },
+          select: {
+            sealedAt: true,
+            sealReason: true,
+          },
+        }),
+      { label: 'dispatch.handleDispatchGroupJob.refetchSealState' },
+    );
+
+    sealedAt = sealedState?.sealedAt ? new Date(sealedState.sealedAt) : null;
+    sealReason = sealedState?.sealReason ?? null;
+  }
+
+  const sealedEnough = Boolean(sealedAt);
+  const readyEnough = pendingGroupTasks.length >= expectedCount;
+  const uploadedEnough = uploadedReadyTasks.length >= expectedCount;
 
   logger.info('[typeb_group] dispatch-send-group preflight snapshot', {
     dispatchTaskId: dispatchTaskIdRaw,
     groupKey: seedTask.groupKey,
     channelId: seedTask.channelId.toString(),
+    dispatchGroupTaskId: groupTaskState?.id?.toString?.() ?? null,
     expectedCount,
     readyCount: pendingGroupTasks.length,
+    uploadedCount: uploadedReadyTasks.length,
     successCount: alreadySuccess.length,
     recoveredDeadTaskIds: recoverableDeadTasks.map((t) => t.id.toString()),
     taskIds: normalizedGroupTasks.map((t) => t.id.toString()),
@@ -465,7 +547,14 @@ export async function handleDispatchGroupJob(
         localPath: typeof meta?.localPath === 'string' ? meta.localPath : null,
       };
     }),
+    lastArrivalAt: lastArrivalAt?.toISOString() ?? null,
+    quietPeriodMs: TYPEB_GROUP_SEAL_QUIET_PERIOD_MS,
+    quietReached,
+    sealedAt: sealedAt?.toISOString() ?? null,
+    sealReason,
     readyAssert: 'ready_count_eq_expected_or_wait',
+    uploadedAssert: 'blocked_until_all_uploaded',
+    blockedReason: !sealedEnough || !readyEnough || !uploadedEnough ? 'blocked_until_all_uploaded' : null,
   });
 
   if (pendingGroupTasks.length === 0 && alreadySuccess.length > 0) {
@@ -485,9 +574,29 @@ export async function handleDispatchGroupJob(
     };
   }
 
-  if (pendingGroupTasks.length < expectedCount) {
+  if (!sealedEnough || !readyEnough || !uploadedEnough) {
+    logger.warn('[typeb_group][diag] preflight blocked snapshot', {
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: seedTask.groupKey,
+      channelId: seedTask.channelId.toString(),
+      dispatchGroupTaskId: groupTaskState?.id?.toString?.() ?? null,
+      sealedEnough,
+      readyEnough,
+      uploadedEnough,
+      expectedCount,
+      readyCount: pendingGroupTasks.length,
+      uploadedCount: uploadedReadyTasks.length,
+      excludedCount: excludedGroupTasks.length,
+      lastArrivalAt: lastArrivalAt?.toISOString() ?? null,
+      quietPeriodMs: TYPEB_GROUP_SEAL_QUIET_PERIOD_MS,
+      quietReached,
+      sealedAt: sealedAt?.toISOString() ?? null,
+      sealReason,
+      blockedReason: 'blocked_until_all_uploaded',
+    });
+
     throw new Error(
-      `group_not_ready: ready=${pendingGroupTasks.length}, expected=${expectedCount}, excluded=${excludedGroupTasks.length}`,
+      `group_not_fully_uploaded: sealed=${sealedEnough ? 1 : 0}, ready=${pendingGroupTasks.length}, uploaded=${uploadedReadyTasks.length}, expected=${expectedCount}, excluded=${excludedGroupTasks.length}`,
     );
   }
 

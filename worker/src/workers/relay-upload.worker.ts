@@ -15,7 +15,7 @@ import {
 } from '../shared/file-utils';
 import { sendViaGramjs } from '../shared/gramjs/upload';
 import { getTelegramUpdates, sendTelegramRequest } from '../shared/telegram';
-import { DispatchMediaType, MediaStatus } from '@prisma/client';
+import { DispatchMediaType, MediaStatus, TaskStatus } from '@prisma/client';
 import { scheduleDueDispatchTasks } from '../scheduler/dispatch-scheduler';
 import {
   GRAMJS_FORWARD_TARGET_CHAT_ID,
@@ -263,6 +263,186 @@ async function logCloneRelayDispatchLinkSnapshot(context: {
   }
 }
 
+async function reconcileGroupedDispatchAfterRelayUpload(context: {
+  traceId: string;
+  mediaAssetId: string;
+}) {
+  const mediaAssetId = BigInt(context.mediaAssetId);
+  const asset = await prisma.mediaAsset.findUnique({
+    where: { id: mediaAssetId },
+    select: {
+      id: true,
+      channelId: true,
+      sourceMeta: true,
+      localPath: true,
+      pathNormalized: true,
+    },
+  });
+
+  if (!asset) return { skipped: true, reason: 'asset_not_found' as const };
+
+  const sourceMeta =
+    asset.sourceMeta && typeof asset.sourceMeta === 'object'
+      ? (asset.sourceMeta as Record<string, unknown>)
+      : null;
+
+  const groupKeyFromMeta = typeof sourceMeta?.groupKey === 'string' ? sourceMeta.groupKey.trim() : '';
+  const groupKey = groupKeyFromMeta || '';
+  if (!groupKey || !groupKey.toLowerCase().startsWith('grouped-')) {
+    return { skipped: true, reason: 'not_grouped_asset' as const };
+  }
+
+  const groupedAssets = await prisma.mediaAsset.findMany({
+    where: {
+      channelId: asset.channelId,
+      OR: [
+        {
+          sourceMeta: {
+            path: ['groupKey'],
+            equals: groupKey,
+          },
+        },
+        {
+          pathNormalized: {
+            contains: `/${groupKey}/`,
+          },
+        },
+        {
+          localPath: {
+            contains: `\\${groupKey}\\`,
+          },
+        },
+      ],
+    },
+    select: {
+      id: true,
+      createdAt: true,
+      sourceMeta: true,
+      status: true,
+      telegramFileId: true,
+      dispatchMediaType: true,
+    },
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+  });
+
+  if (groupedAssets.length === 0) {
+    return { skipped: true, reason: 'group_assets_empty' as const, groupKey };
+  }
+
+  const uploadedCount = groupedAssets.filter(
+    (a) => a.status === MediaStatus.relay_uploaded && Boolean(a.telegramFileId) && Boolean(a.dispatchMediaType),
+  ).length;
+
+  const existingTasks = await prisma.dispatchTask.findMany({
+    where: {
+      channelId: asset.channelId,
+      groupKey,
+      mediaAssetId: { in: groupedAssets.map((a) => a.id) },
+    },
+    select: {
+      id: true,
+      mediaAssetId: true,
+    },
+  });
+
+  const existingMediaAssetIdSet = new Set(existingTasks.map((t) => t.mediaAssetId.toString()));
+  const missingAssets = groupedAssets.filter((a) => !existingMediaAssetIdSet.has(a.id.toString()));
+
+  let createdDispatchTasks = 0;
+
+  if (missingAssets.length > 0) {
+    const seedTask = await prisma.dispatchTask.findFirst({
+      where: {
+        channelId: asset.channelId,
+        groupKey,
+      },
+      orderBy: [{ scheduleSlot: 'asc' }, { id: 'asc' }],
+      select: {
+        scheduleSlot: true,
+        plannedAt: true,
+        nextRunAt: true,
+        replyMarkup: true,
+        caption: true,
+        parseMode: true,
+        priority: true,
+        maxRetries: true,
+      },
+    });
+
+    const now = new Date();
+    const scheduleSlot = seedTask?.scheduleSlot ?? now;
+    const plannedAt = seedTask?.plannedAt ?? now;
+    const nextRunAt = now;
+
+    for (const missing of missingAssets) {
+      await prisma.dispatchTask.create({
+        data: {
+          channelId: asset.channelId,
+          mediaAssetId: missing.id,
+          groupKey,
+          scheduleSlot,
+          plannedAt,
+          nextRunAt,
+          replyMarkup: seedTask?.replyMarkup ?? null,
+          caption: seedTask?.caption ?? null,
+          parseMode: seedTask?.parseMode ?? 'HTML',
+          status: TaskStatus.scheduled,
+          priority: seedTask?.priority ?? 100,
+          retryCount: 0,
+          maxRetries: seedTask?.maxRetries ?? 6,
+        },
+      });
+      createdDispatchTasks += 1;
+    }
+  }
+
+  const now = new Date();
+  const groupTask = await (prisma as any).dispatchGroupTask.findFirst({
+    where: {
+      channelId: asset.channelId,
+      groupKey,
+    },
+    orderBy: [{ updatedAt: 'desc' }],
+    select: {
+      id: true,
+      scheduleSlot: true,
+      readyDeadlineAt: true,
+    },
+  });
+
+  if (groupTask?.id) {
+    await (prisma as any).dispatchGroupTask.update({
+      where: { id: groupTask.id },
+      data: {
+        expectedMediaCount: groupedAssets.length,
+        actualUploadedCount: uploadedCount,
+        lastArrivalAt: now,
+      },
+    });
+  }
+
+  logger.info('[typeb_group][diag] grouped reconcile after relay upload', {
+    traceId: context.traceId,
+    groupKey,
+    channelId: asset.channelId.toString(),
+    mediaAssetId: context.mediaAssetId,
+    groupAssetCount: groupedAssets.length,
+    uploadedCount,
+    existingDispatchTaskCount: existingTasks.length,
+    missingDispatchTaskCount: missingAssets.length,
+    createdDispatchTaskCount: createdDispatchTasks,
+    dispatchGroupTaskId: groupTask?.id?.toString?.() ?? null,
+  });
+
+  return {
+    skipped: false,
+    groupKey,
+    groupAssetCount: groupedAssets.length,
+    uploadedCount,
+    createdDispatchTasks,
+  };
+}
+
 async function triggerDispatchAfterRelayUpload(context: {
   traceId: string;
   mediaAssetId: string;
@@ -270,6 +450,11 @@ async function triggerDispatchAfterRelayUpload(context: {
   uploadMethod: 'gramjs_sendVideo' | 'sendVideo' | 'sendPhoto' | 'recover_after_hang_up';
 }) {
   try {
+    const reconcile = await reconcileGroupedDispatchAfterRelayUpload({
+      traceId: context.traceId,
+      mediaAssetId: context.mediaAssetId,
+    });
+
     await logCloneRelayDispatchLinkSnapshot({
       ...context,
       stage: 'before_dispatch_schedule',
@@ -292,6 +477,7 @@ async function triggerDispatchAfterRelayUpload(context: {
       queuedCount: result.queuedCount,
       autoBypassCount: result.autoBypassCount,
       blockedCount: result.blockedCount,
+      reconcile,
     });
   } catch (error) {
     logger.warn('[q_relay_upload] 上传成功后触发分发调度失败（不阻断当前任务）', {

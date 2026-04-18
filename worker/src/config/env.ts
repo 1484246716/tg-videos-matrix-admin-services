@@ -405,6 +405,20 @@ export const TYPEB_GROUP_RETRY_CHECK_MS = (() => {
   return Math.min(60 * 1000, Math.floor(n));
 })();
 
+/** TypeB grouped 封箱静默窗口（毫秒） */
+export const TYPEB_GROUP_SEAL_QUIET_PERIOD_MS = (() => {
+  const n = Number(process.env.TYPEB_GROUP_SEAL_QUIET_PERIOD_MS ?? '10000');
+  if (!Number.isFinite(n) || n < 5000) return 10000;
+  return Math.min(30 * 60 * 1000, Math.floor(n));
+})();
+
+/** TypeB grouped 组级硬截止（毫秒） */
+export const TYPEB_GROUP_HARD_DEADLINE_MS = (() => {
+  const n = Number(process.env.TYPEB_GROUP_HARD_DEADLINE_MS ?? '1200000');
+  if (!Number.isFinite(n) || n < 60000) return 1200000;
+  return Math.min(6 * 60 * 60 * 1000, Math.floor(n));
+})();
+
 /** TypeB grouped send 告警阈值（5分钟窗口） */
 export const TYPEB_GROUP_SEND_ALERT_FAILED_SPIKE_THRESHOLD = (() => {
   const n = Number(process.env.TYPEB_GROUP_SEND_ALERT_FAILED_SPIKE_THRESHOLD ?? '10');
