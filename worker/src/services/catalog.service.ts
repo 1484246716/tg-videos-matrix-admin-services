@@ -440,10 +440,17 @@ async function deleteCollectionNavStateMessages(args: {
   }
 }
 
-function buildCatalogIndexContent(channelName: string, totalPages: number) {
+function buildCatalogIndexContent(args: {
+  channelName: string;
+  totalPages: number;
+  collectionIndexLink?: string | null;
+}) {
   return [
-    `📚 ${channelName} 目录导航`,
-    `共 ${totalPages} 页，点击下方按钮跳转。`,
+    `📚 ${args.channelName} 目录导航`,
+    `共 ${args.totalPages} 页，点击下方按钮跳转。`,
+    ...(args.collectionIndexLink
+      ? [`<a href="${escapeHtml(args.collectionIndexLink)}">📚 合集索引</a>`]
+      : []),
     `更新时间：${new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19)}`,
   ].join('\n');
 }
@@ -660,6 +667,30 @@ type CollectionCatalogEpisode = {
   isMissingPlaceholder?: boolean;
 };
 
+function formatCollectionEpisodeTitle(args: {
+  episodeNo: number;
+  episodeTitle?: string | null;
+  sourceTitle?: string | null;
+  templateText?: string | null;
+}) {
+  const safeTitle = (args.episodeTitle || '').trim();
+  if (safeTitle) return safeTitle;
+
+  const fallbackTitle = (args.sourceTitle || '').trim() || `第${args.episodeNo}集`;
+  const safeTemplate = (args.templateText || '').trim();
+  if (safeTemplate) {
+    return safeTemplate
+      .replace(/\{episodeNo\}/g, String(args.episodeNo))
+      .replace(/\{title\}/g, fallbackTitle);
+  }
+
+  return fallbackTitle;
+}
+
+function buildCollectionEpisodeDedupKey(collectionName: string, episodeNo: number) {
+  return `${normalizeCollectionKey(collectionName)}#${episodeNo}`;
+}
+
 interface CollectionCatalogReadProvider {
   getCollections(channelId: bigint): Promise<CollectionCatalogConfig[]>;
   getCollectionEpisodes(channelId: bigint): Promise<CollectionCatalogEpisode[]>;
@@ -675,38 +706,99 @@ class DbCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
   }
 
   async getCollectionEpisodes(channelId: bigint): Promise<CollectionCatalogEpisode[]> {
-    if (TYPEC_READ_FROM_CATALOG_SOURCE) {
-      const sourceRows = await (prisma as any).catalogSourceItem.findMany({
+    const collections = await prisma.collection.findMany({
+      where: { channelId },
+      select: {
+        id: true,
+        name: true,
+        nameNormalized: true,
+        templateText: true,
+      },
+      orderBy: { id: 'asc' },
+    });
+
+    const collectionNameById = new Map<string, string>();
+    const collectionTemplateById = new Map<string, string | null>();
+    const collectionNameByNormalized = new Map<string, string>();
+    const collectionTemplateByNormalized = new Map<string, string | null>();
+    for (const collection of collections) {
+      const normalizedName = normalizeCollectionKey(collection.nameNormalized || collection.name);
+      collectionNameById.set(collection.id.toString(), collection.name);
+      collectionTemplateById.set(collection.id.toString(), collection.templateText ?? null);
+      collectionNameByNormalized.set(normalizedName, collection.name);
+      collectionTemplateByNormalized.set(normalizedName, collection.templateText ?? null);
+    }
+
+    const episodeRows = await prisma.collectionEpisode.findMany({
+      where: {
+        collection: {
+          channelId,
+        },
+      },
+      orderBy: [{ collectionId: 'asc' }, { episodeNo: 'asc' }],
+      select: {
+        collectionId: true,
+        mediaAssetId: true,
+        episodeNo: true,
+        episodeTitle: true,
+        telegramMessageLink: true,
+        mediaAsset: {
+          select: {
+            originalName: true,
+            sourceMeta: true,
+          },
+        },
+      },
+    });
+
+    const mediaAssetIds = [...new Set(episodeRows.map((row) => row.mediaAssetId))];
+    const dispatchLinkMap = new Map<string, string>();
+    if (mediaAssetIds.length > 0) {
+      const dispatchRows = await prisma.dispatchTask.findMany({
         where: {
           channelId,
-          isCollection: true,
+          status: TaskStatus.success,
           telegramMessageLink: { not: null },
+          mediaAssetId: { in: mediaAssetIds },
         },
-        orderBy: [{ publishedAt: 'desc' }],
+        orderBy: [{ finishedAt: 'desc' }, { id: 'desc' }],
         select: {
-          collectionName: true,
-          episodeNo: true,
-          title: true,
+          mediaAssetId: true,
           telegramMessageLink: true,
         },
       });
 
-      return sourceRows
-        .filter((row: any) => typeof row.collectionName === 'string' && Number.isInteger(row.episodeNo))
-        .map((row: any) => ({
-          collectionName: row.collectionName,
-          episodeNo: Number(row.episodeNo),
-          title: (row.title || `第${row.episodeNo}集`).trim(),
-          messageUrl: row.telegramMessageLink || '',
-        }));
+      for (const row of dispatchRows) {
+        const key = row.mediaAssetId.toString();
+        if (!dispatchLinkMap.has(key) && row.telegramMessageLink) {
+          dispatchLinkMap.set(key, row.telegramMessageLink);
+        }
+      }
+    }
+
+    const collectionEpisodes = new Map<string, CollectionCatalogEpisode>();
+    for (const row of episodeRows) {
+      const collectionIdKey = row.collectionId.toString();
+      const collectionName = collectionNameById.get(collectionIdKey);
+      if (!collectionName) continue;
+
+      const sourceTitle = getFileStem(row.mediaAsset?.originalName || '') || `第${row.episodeNo}集`;
+      const title = formatCollectionEpisodeTitle({
+        episodeNo: row.episodeNo,
+        episodeTitle: row.episodeTitle,
+        sourceTitle,
+        templateText: collectionTemplateById.get(collectionIdKey) ?? null,
+      });
+      const messageUrl = (row.telegramMessageLink || dispatchLinkMap.get(row.mediaAssetId.toString()) || '').trim();
+      collectionEpisodes.set(buildCollectionEpisodeDedupKey(collectionName, row.episodeNo), {
+        collectionName,
+        episodeNo: row.episodeNo,
+        title,
+        messageUrl,
+      });
     }
 
     const batchSize = TYPEC_COLLECTION_FULL_SCAN_BATCH_SIZE;
-    const tasks: Array<{
-      telegramMessageLink: string | null;
-      mediaAsset: { originalName: string | null; sourceMeta: unknown } | null;
-    }> = [];
-
     let cursorId: bigint | null = null;
     while (true) {
       const rows: Array<{
@@ -737,29 +829,30 @@ class DbCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
       if (rows.length === 0) break;
 
       for (const row of rows) {
-        tasks.push({
-          telegramMessageLink: row.telegramMessageLink,
-          mediaAsset: row.mediaAsset,
+        const meta = parseCollectionMeta(row.mediaAsset?.sourceMeta);
+        if (!meta) continue;
+
+        const normalizedName = normalizeCollectionKey(meta.collectionName);
+        const collectionName = collectionNameByNormalized.get(normalizedName) ?? meta.collectionName;
+        const key = buildCollectionEpisodeDedupKey(collectionName, meta.episodeNo);
+        if (collectionEpisodes.has(key)) continue;
+
+        const sourceTitle = getFileStem(row.mediaAsset?.originalName || '') || `第${meta.episodeNo}集`;
+
+        collectionEpisodes.set(key, {
+          collectionName,
+          episodeNo: meta.episodeNo,
+          title: formatCollectionEpisodeTitle({
+            episodeNo: meta.episodeNo,
+            sourceTitle,
+            templateText: collectionTemplateByNormalized.get(normalizedName) ?? null,
+          }),
+          messageUrl: row.telegramMessageLink || '',
         });
       }
 
       cursorId = rows[rows.length - 1].id;
       if (rows.length < batchSize) break;
-    }
-
-    const collectionEpisodes: CollectionCatalogEpisode[] = [];
-    for (const task of tasks) {
-      if (!task.telegramMessageLink) continue;
-      const meta = parseCollectionMeta(task.mediaAsset?.sourceMeta);
-      if (!meta) continue;
-
-      const episodeTitle = getFileStem(task.mediaAsset?.originalName || '') || `第${meta.episodeNo}集`;
-      collectionEpisodes.push({
-        collectionName: meta.collectionName,
-        episodeNo: meta.episodeNo,
-        title: episodeTitle,
-        messageUrl: task.telegramMessageLink,
-      });
     }
 
     const skippedCollectionAssets = await prisma.mediaAsset.findMany({
@@ -779,15 +872,13 @@ class DbCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
       const meta = parseCollectionMeta(asset.sourceMeta);
       if (!meta) continue;
 
-      const hasRealEpisode = collectionEpisodes.some(
-        (item) =>
-          normalizeCollectionKey(item.collectionName) === normalizeCollectionKey(meta.collectionName) &&
-          item.episodeNo === meta.episodeNo &&
-          !item.isMissingPlaceholder,
-      );
-      if (!hasRealEpisode) {
-        collectionEpisodes.push({
-          collectionName: meta.collectionName,
+      const normalizedName = normalizeCollectionKey(meta.collectionName);
+      const collectionName = collectionNameByNormalized.get(normalizedName) ?? meta.collectionName;
+      const key = buildCollectionEpisodeDedupKey(collectionName, meta.episodeNo);
+      const existing = collectionEpisodes.get(key);
+      if (!existing) {
+        collectionEpisodes.set(key, {
+          collectionName,
           episodeNo: meta.episodeNo,
           title: `第${meta.episodeNo}集（暂缺）`,
           messageUrl: '',
@@ -796,7 +887,14 @@ class DbCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
       }
     }
 
-    return collectionEpisodes;
+    return [...collectionEpisodes.values()].sort((a, b) => {
+      const collectionCompare = normalizeCollectionKey(a.collectionName).localeCompare(
+        normalizeCollectionKey(b.collectionName),
+        'zh-CN',
+      );
+      if (collectionCompare !== 0) return collectionCompare;
+      return a.episodeNo - b.episodeNo;
+    });
   }
 }
 
@@ -1313,7 +1411,10 @@ export async function handleCatalogJob(
         collectionDetailPageSize,
         source: hasCollectionSpecificPageSize ? 'collection.navPageSize' : 'channel.navPageSize_fallback',
       });
-      const episodePages = chunkVideos(episodes, collectionDetailPageSize);
+      const episodePages =
+        episodes.length > 0
+          ? chunkVideos(episodes, collectionDetailPageSize)
+          : [[] as CollectionCatalogEpisode[]];
       const existingDetailPages = existingNavState.detailPageMessageIds[name] ?? [];
       const publishedDetailPages: number[] = [];
       const detailOrphanCandidateIds = new Set<number>();
@@ -1332,10 +1433,12 @@ export async function handleCatalogJob(
           const safeUrl = escapeHtml(ep.messageUrl);
           return `<a href="${safeUrl}">${safeTitle}</a>`;
         });
+        const detailBodyLines =
+          pageLines.length > 0 ? pageLines : ['该合集暂无内容，后续更新后将自动补充。'];
 
         const detailText = [
           `📺 ${escapeHtml(name)}`,
-          ...pageLines,
+          ...detailBodyLines,
           ...(episodePages.length > 1 ? [`—— 第${pageIndex + 1}/${episodePages.length}页 ——`] : []),
         ].join('\n');
 
@@ -1690,7 +1793,11 @@ export async function handleCatalogJob(
       const indexPublishResult = await publishCatalogMessage({
         botToken,
         chatId: channel.tgChatId,
-        text: buildCatalogIndexContent(channel.name, pageContents.length),
+        text: buildCatalogIndexContent({
+          channelName: channel.name,
+          totalPages: pageContents.length,
+          collectionIndexLink: collectionIndexLinkInMainCatalog,
+        }),
         existingMessageId: existingMainNavMessageId,
         replyMarkup: indexReplyMarkup,
       });
@@ -1785,9 +1892,7 @@ export async function handleCatalogJob(
     const groupRenderedCount = TYPEC_READ_FROM_CATALOG_SOURCE
       ? await (prisma as any).catalogSourceItem.count({ where: { channelId, sourceType: 'group' } })
       : 0;
-    const collectionRenderedCount = TYPEC_READ_FROM_CATALOG_SOURCE
-      ? await (prisma as any).catalogSourceItem.count({ where: { channelId, isCollection: true } })
-      : 0;
+    const collectionRenderedCount = collectionEpisodesAll.length;
 
     catalogMetrics.publishItemsRenderedTotal += videos.length;
     catalogMetrics.publishGroupItemsRenderedTotal += Number(groupRenderedCount || 0);

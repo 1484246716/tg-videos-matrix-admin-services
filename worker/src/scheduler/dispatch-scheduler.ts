@@ -21,6 +21,23 @@ import { catalogSourceWriteMetrics } from '../shared/metrics';
 import { releaseChannelLock, tryAcquireChannelLock } from '../shared/channel-lock';
 import { updateTaskDefinitionRunStatus } from '../services/task-definition.service';
 
+/**
+ * dispatch-scheduler
+ *
+ * 职责：
+ * 1) 扫描可派发的 dispatchTask（pending/scheduled/failed 且到期），决定入队到 q_dispatch。
+ * 2) 扫描已完成中转(relay_uploaded)的 mediaAsset，创建 dispatchTask（并在真实组场景创建/更新 dispatchGroupTask）。
+ *
+ * 核心概念：
+ * - 单条派发（dispatch-send）：每条 dispatchTask 对应一个 mediaAsset，走 handleDispatchJob（AI 文案生成/分类/发送）。
+ * - 组派发（dispatch-send-group）：一批 dispatchTask 共享同一个真实 groupKey，走 handleDispatchGroupJob（sendMediaGroup）。
+ * - 合集顺序闸门：合集条目必须按 episodeNo 顺序派发，未满足时延后（或在满足自动旁路条件时标记跳过）。
+ *
+ * 重要约束（本文件修复点）：
+ * - 单资产任务不得写入伪 groupKey（如 asset-<id>、single-<id>）到 dispatchTask.groupKey，否则会被误判为组派发。
+ * - 只有“真实组”（grouped-* 或组内任务数 >= TYPEB_GROUP_SEND_MIN_MEDIA_COUNT）才允许走组派发。
+ */
+
 const DISPATCH_HEAD_BYPASS_RETRY_THRESHOLD = 2;
 const DISPATCH_HEAD_BYPASS_DELAY_SEC = 10 * 60;
 const COLLECTION_SKIP_GRACE_MS = 5 * 60 * 1000;
@@ -31,6 +48,10 @@ type CollectionGateEvalStats = {
   blockedCount: number;
 };
 
+/**
+ * 从文件名/文本中尽量解析 episodeNo（用于合集集号解析失败的兜底修复）。
+ * 注意：这里只是“尝试性”解析，不保证覆盖所有命名风格。
+ */
 function parseEpisodeNoFromText(text: string) {
   const patterns = [
     /\[第\s*(\d+)\s*(?:集|话|話)\]/,
@@ -48,6 +69,10 @@ function parseEpisodeNoFromText(text: string) {
   return null;
 }
 
+/**
+ * 频道发送频率控制：根据 lastPostAt + postIntervalSec 计算下次允许派发时间。
+ * 用于避免同频道短时间内高频发消息触发风控/刷屏。
+ */
 function computeDispatchNextAllowedAt(args: {
   lastPostAt: Date | null;
   postIntervalSec: number;
@@ -57,6 +82,10 @@ function computeDispatchNextAllowedAt(args: {
   return new Date(args.lastPostAt.getTime() + Math.max(0, args.postIntervalSec) * 1000);
 }
 
+/**
+ * 解析 mediaAsset.sourceMeta 中的合集元信息。
+ * 规则：sourceMeta.isCollection === true 且 collectionName 非空时才视为合集。
+ */
 function parseCollectionMeta(sourceMeta: unknown) {
   if (!sourceMeta || typeof sourceMeta !== 'object') return null;
   const meta = sourceMeta as Record<string, unknown>;
@@ -79,18 +108,36 @@ function parseCollectionMeta(sourceMeta: unknown) {
   };
 }
 
+/**
+ * 从 pathNormalized / localPath 中提取“真实组”的 groupKey。
+ *
+ * 重要：这里只识别 grouped-*，不再识别 single-*：
+ * - single-* 是单条素材目录标识，不是“组发送”的 groupKey
+ * - 误识别会导致单视频被调度到 group handler，进而派发失败
+ */
 function extractSecondaryGroupKeyFromPath(pathLike: string | null | undefined) {
   if (!pathLike) return null;
   const normalized = pathLike.replace(/\\/g, '/');
-  const matched = normalized.match(/\/(grouped-\d+|single-\d+)\//i);
+  const matched = normalized.match(/\/(grouped-\d+)\//i);
   return matched?.[1] ?? null;
 }
 
+/** 判断路径是否位于 grouped-* 目录下（用于防止 grouped 目录缺 groupKey 时错误降级为单发）。 */
 function isGroupedPath(pathLike: string | null | undefined) {
   if (!pathLike) return false;
   return /\/(grouped-\d+)\//i.test(pathLike.replace(/\\/g, '/'));
 }
 
+/** 只把 grouped-* 视为“真实组” groupKey 格式。 */
+function isGroupedStyleGroupKey(groupKey: string | null | undefined) {
+  if (!groupKey) return false;
+  return /^grouped-\d+$/i.test(groupKey.trim());
+}
+
+/**
+ * 从 sourceMeta 中读取源组预期总数（sourceExpectedCount）。
+ * 这是组发送门禁需要的关键字段：没有它就不能放行组派发。
+ */
 function parseSourceExpectedCount(sourceMeta: unknown) {
   if (!sourceMeta || typeof sourceMeta !== 'object' || Array.isArray(sourceMeta)) return null;
   const meta = sourceMeta as Record<string, unknown>;
@@ -100,6 +147,10 @@ function parseSourceExpectedCount(sourceMeta: unknown) {
   return null;
 }
 
+/**
+ * 从 channel.navReplyMarkup 中读取合集调度配置。
+ * 这是一个“可选扩展配置”，没有则返回默认值。
+ */
 function parseCollectionSchedulerConfig(navReplyMarkup: unknown) {
   const fallback = {
     collectionDispatchGateEnabled: true,
@@ -138,6 +189,15 @@ function parseCollectionSchedulerConfig(navReplyMarkup: unknown) {
   };
 }
 
+/**
+ * 合集顺序闸门：
+ * - 如果当前要派发的 episodeNo 前面存在未成功派发的 episode，则阻塞当前 episode 派发
+ * - 支持自动旁路（max retries / 超时）与缺失跳过（failed/deleted 且超过 grace）
+ *
+ * 返回：
+ * - allowed=true：允许派发
+ * - allowed=false：阻塞派发，blockedByEpisodeNo 指示阻塞来源集号
+ */
 async function canDispatchCollectionEpisode(args: {
   channelId: bigint;
   collectionName: string;
@@ -165,6 +225,7 @@ async function canDispatchCollectionEpisode(args: {
     { label: 'dispatch.canDispatchCollectionEpisode.collectionAssets' },
   );
 
+  // 只取“当前 episodeNo 之前”的集，作为顺序闸门的候选阻塞者。
   const prevEpisodes = collectionAssets
     .map((asset) => ({ id: asset.id, meta: parseCollectionMeta(asset.sourceMeta), status: asset.status, updatedAt: asset.updatedAt }))
     .filter((item) => item.meta && !item.meta.episodeParseFailed && item.meta.episodeNo !== null)
@@ -181,6 +242,7 @@ async function canDispatchCollectionEpisode(args: {
 
   const prevEpisodeAssetIds = prevEpisodes.map((item) => item.id);
 
+  // 前置集是否已有 dispatch success（成功即视为通过，不阻塞）。
   const successRows = await withPrismaRetry(
     () =>
       prisma.dispatchTask.findMany({
@@ -196,6 +258,7 @@ async function canDispatchCollectionEpisode(args: {
 
   const successSet = new Set(successRows.map((row) => row.mediaAssetId.toString()));
 
+  // 获取前置集最近一次 dispatch 结果，用于自动旁路（max retries / 超时）的判断。
   const latestDispatchRows = await withPrismaRetry(
     () =>
       prisma.dispatchTask.findMany({
@@ -245,6 +308,7 @@ async function canDispatchCollectionEpisode(args: {
       : null;
 
     if (COLLECTION_AUTO_BYPASS_ENABLED) {
+      // 满足条件则把“前置集”标记为 skipStatus，以允许后续集继续派发。
       const hitMaxRetries =
         COLLECTION_AUTO_BYPASS_ON_MAX_RETRIES &&
         latestDispatch &&
@@ -316,6 +380,7 @@ async function canDispatchCollectionEpisode(args: {
       }
     }
 
+    // 前置集如果已经 failed/deleted，且超过 grace，则标记 skipped_missing，避免无限阻塞后续集。
     const isFailedOrDeleted = prev.status === MediaStatus.failed || prev.status === MediaStatus.deleted;
     if (!isFailedOrDeleted) continue;
 
@@ -353,6 +418,7 @@ async function canDispatchCollectionEpisode(args: {
     { label: 'dispatch.canDispatchCollectionEpisode.refreshedAssets' },
   );
 
+  // 重新读取后，从 sourceMeta 里识别已跳过的集，构造 skippedSet。
   const skippedSet = new Set(
     refreshedAssets
       .filter((asset) => {
@@ -364,6 +430,7 @@ async function canDispatchCollectionEpisode(args: {
       .map((asset) => asset.id.toString()),
   );
 
+  // 找到最小的“未成功且未跳过”的前置集作为阻塞源。
   const blocked = prevEpisodes
     .filter((item) => !successSet.has(item.id.toString()) && !skippedSet.has(item.id.toString()))
     .sort((a, b) => (a.meta.episodeNo ?? 0) - (b.meta.episodeNo ?? 0))[0];
@@ -380,6 +447,17 @@ async function canDispatchCollectionEpisode(args: {
   };
 }
 
+/**
+ * 扫描 due dispatchTask 并入队 q_dispatch。
+ *
+ * 主要逻辑：
+ * 1) 合集顺序闸门（可阻塞/旁路/跳过）
+ * 2) 频道发送间隔限制
+ * 3) 频道锁（同一频道同一时间只入队一个任务）
+ * 4) 分发路径判断：
+ *    - 默认单条（dispatch-send）
+ *    - 只有真实组才走组派发（dispatch-send-group）
+ */
 export async function scheduleDueDispatchTasks() {
   const now = new Date();
   const gateStats: CollectionGateEvalStats = {
@@ -437,9 +515,11 @@ export async function scheduleDueDispatchTasks() {
       continue;
     }
 
+    // 合集元信息用于顺序闸门；非合集则为 null。
     let collectionMeta = parseCollectionMeta(task.mediaAsset.sourceMeta);
     const collectionCfg = parseCollectionSchedulerConfig(task.channel.navReplyMarkup);
 
+    // 合集集号解析失败时，尝试从文件名修复 episodeNo，避免长期阻塞。
     if (collectionMeta?.episodeParseFailed || (collectionMeta && collectionMeta.episodeNo === null)) {
       const fallbackEpisodeNo = parseEpisodeNoFromText(task.mediaAsset.originalName || '');
       if (fallbackEpisodeNo !== null) {
@@ -487,6 +567,7 @@ export async function scheduleDueDispatchTasks() {
       task.retryCount >= DISPATCH_HEAD_BYPASS_RETRY_THRESHOLD &&
       task.retryCount < task.maxRetries;
 
+    // 头阻塞旁路：非合集任务若反复失败，可延后以让后面的任务有机会先发（减少“头部卡死”）。
     if (shouldBypassHead) {
       const bypassNextRunAt = new Date(Date.now() + DISPATCH_HEAD_BYPASS_DELAY_SEC * 1000);
       await withPrismaRetry(
@@ -534,6 +615,7 @@ export async function scheduleDueDispatchTasks() {
       continue;
     }
 
+    // 合集顺序闸门：episodeNo 必须按顺序派发。
     if (
       collectionCfg.collectionDispatchGateEnabled &&
       collectionMeta &&
@@ -554,6 +636,7 @@ export async function scheduleDueDispatchTasks() {
           task.status === TaskStatus.failed &&
           task.retryCount >= DISPATCH_HEAD_BYPASS_RETRY_THRESHOLD;
 
+        // 合集头部旁路：如果前置集长期失败，允许延后本集的重试窗口（而不是频繁空转）。
         if (bypassReady) {
           const bypassNextRunAt = new Date(
             Date.now() + collectionCfg.collectionHeadBypassMinutes * 60 * 1000,
@@ -607,6 +690,7 @@ export async function scheduleDueDispatchTasks() {
       }
     }
 
+    // 频道发送间隔限制：未到窗口则延后。
     if (DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED) {
       const nextAllowedAt = computeDispatchNextAllowedAt({
         lastPostAt: task.channel.lastPostAt,
@@ -643,6 +727,7 @@ export async function scheduleDueDispatchTasks() {
       channelId: task.channelId,
     });
 
+    // 同频道同一时间只入队一个，避免并发派发造成频道频控/顺序混乱。
     if (!lock.acquired) {
       logger.info('[scheduler] 分发任务跳过（频道锁未获取）', {
         taskId: task.id.toString(),
@@ -653,6 +738,7 @@ export async function scheduleDueDispatchTasks() {
     }
 
     try {
+      // CAS 标记任务为 scheduled，避免并发重复入队。
       const updated = await withPrismaRetry(
         () =>
           prisma.dispatchTask.updateMany({
@@ -677,6 +763,7 @@ export async function scheduleDueDispatchTasks() {
       let groupEnqueueGranted = true;
 
       if (task.groupKey) {
+        // 注意：task.groupKey 只表示“可能属于组”，必须进一步判断是否为真实组。
         const groupedTasks = await withPrismaRetry(
           () =>
             prisma.dispatchTask.findMany({
@@ -695,310 +782,347 @@ export async function scheduleDueDispatchTasks() {
         );
 
         groupSize = groupedTasks.length;
+        const shouldUseGroupDispatch =
+          isGroupedStyleGroupKey(task.groupKey) || groupedTasks.length >= TYPEB_GROUP_SEND_MIN_MEDIA_COUNT;
 
-        const expectedMediaCount = await withPrismaRetry(
-          () =>
-            prisma.mediaAsset.count({
-              where: {
-                channelId: task.channelId,
-                OR: [
-                  {
-                    sourceMeta: {
-                      path: ['groupKey'],
-                      equals: task.groupKey,
-                    },
-                  },
-                  {
-                    pathNormalized: {
-                      contains: `/${task.groupKey}/`,
-                    },
-                  },
-                  {
-                    localPath: {
-                      contains: `\\${task.groupKey}\\`,
-                    },
-                  },
-                ],
-                status: {
-                  in: [
-                    MediaStatus.ready,
-                    MediaStatus.ingesting,
-                    MediaStatus.relay_uploaded,
-                  ],
-                },
-              },
-            }),
-          { label: 'dispatch.scheduleDueDispatchTasks.countGroupExpectedAssets' },
-        );
-
-        const readyCount =
-          groupedTasks.length > 0
-            ? await withPrismaRetry(
-                () =>
-                  prisma.mediaAsset.count({
-                    where: {
-                      id: { in: groupedTasks.map((t) => t.mediaAssetId) },
-                      status: MediaStatus.relay_uploaded,
-                      telegramFileId: { not: null },
-                      dispatchMediaType: { not: null },
-                    },
-                  }),
-                { label: 'dispatch.scheduleDueDispatchTasks.countGroupReadyAssets' },
-              )
-            : 0;
-
-        const uploadedCount = await withPrismaRetry(
-          () =>
-            prisma.mediaAsset.count({
-              where: {
-                channelId: task.channelId,
-                OR: [
-                  {
-                    sourceMeta: {
-                      path: ['groupKey'],
-                      equals: task.groupKey,
-                    },
-                  },
-                  {
-                    pathNormalized: {
-                      contains: `/${task.groupKey}/`,
-                    },
-                  },
-                  {
-                    localPath: {
-                      contains: `\\${task.groupKey}\\`,
-                    },
-                  },
-                ],
-                status: MediaStatus.relay_uploaded,
-                telegramFileId: { not: null },
-                dispatchMediaType: { not: null },
-              },
-            }),
-          { label: 'dispatch.scheduleDueDispatchTasks.countGroupUploadedAssets' },
-        );
-
-        const channelInWhitelist =
-          TYPEB_GROUP_SEND_WHITELIST_CHANNEL_IDS.length === 0 ||
-          TYPEB_GROUP_SEND_WHITELIST_CHANNEL_IDS.includes(task.channelId.toString());
-
-        if (!TYPEB_GROUP_SEND_ENABLED || !channelInWhitelist) {
-          await withPrismaRetry(
-            () =>
-              prisma.dispatchTask.update({
-                where: { id: task.id },
-                data: {
-                  status: TaskStatus.scheduled,
-                  nextRunAt: new Date(Date.now() + TYPEB_GROUP_RETRY_CHECK_MS),
-                },
-              }),
-            { label: 'dispatch.scheduleDueDispatchTasks.groupDisabledDelay' },
-          );
-
-          logger.warn('[typeb_group] grouped 任务不允许降级单发，等待组发送配置生效', {
+        // 非真实组（例如历史遗留的伪 groupKey）统一强制单条派发，避免误入 group handler。
+        if (!shouldUseGroupDispatch) {
+          logger.info('[typeb_group] 非真实组任务，强制走单条派发', {
             taskId: task.id.toString(),
             channelId: task.channelId.toString(),
+            mediaAssetId: task.mediaAssetId.toString(),
             groupKey: task.groupKey,
-            typebGroupSendEnabled: TYPEB_GROUP_SEND_ENABLED,
-            channelInWhitelist,
+            groupSize: groupedTasks.length,
+            dispatchPath: 'single',
+            reason: 'non_real_group_key_or_insufficient_group_size',
           });
-          continue;
-        }
+        } else {
 
-        const groupScheduleSlot = groupedTasks
-          .map((t) => t.scheduleSlot)
-          .sort((a, b) => a.getTime() - b.getTime())[0] ?? task.scheduleSlot;
-        const existingGroupTaskSnapshot = await withPrismaRetry(
-          () =>
-            (prisma as any).dispatchGroupTask.findFirst({
-              where: {
-                channelId: task.channelId,
-                groupKey: task.groupKey,
-              },
-              orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
-              select: {
-                id: true,
-                sourceExpectedCount: true,
-              },
-            }),
-          { label: 'dispatch.scheduleDueDispatchTasks.findExistingGroupTaskSnapshot' },
-        );
-        const inheritedSourceExpectedCount = Math.max(
-          0,
-          Number(existingGroupTaskSnapshot?.sourceExpectedCount ?? 0),
-        );
-
-        const groupTask = await withPrismaRetry(
-          () =>
-            (prisma as any).dispatchGroupTask.upsert({
-              where: {
-                channelId_scheduleSlot_groupKey: {
+          // 组派发门禁：统计组内“应该存在的媒体数”和“已上传完成的媒体数”，并结合 sourceExpectedCount 放行。
+          const expectedMediaCount = await withPrismaRetry(
+            () =>
+              prisma.mediaAsset.count({
+                where: {
                   channelId: task.channelId,
-                  scheduleSlot: groupScheduleSlot,
+                  OR: [
+                    {
+                      sourceMeta: {
+                        path: ['groupKey'],
+                        equals: task.groupKey,
+                      },
+                    },
+                    {
+                      pathNormalized: {
+                        contains: `/${task.groupKey}/`,
+                      },
+                    },
+                    {
+                      localPath: {
+                        contains: `\\${task.groupKey}\\`,
+                      },
+                    },
+                  ],
+                  status: {
+                    in: [
+                      MediaStatus.ready,
+                      MediaStatus.ingesting,
+                      MediaStatus.relay_uploaded,
+                    ],
+                  },
+                },
+              }),
+            { label: 'dispatch.scheduleDueDispatchTasks.countGroupExpectedAssets' },
+          );
+
+          const readyCount =
+            groupedTasks.length > 0
+              ? await withPrismaRetry(
+                  () =>
+                    prisma.mediaAsset.count({
+                      where: {
+                        id: { in: groupedTasks.map((t) => t.mediaAssetId) },
+                        status: MediaStatus.relay_uploaded,
+                        telegramFileId: { not: null },
+                        dispatchMediaType: { not: null },
+                      },
+                    }),
+                  { label: 'dispatch.scheduleDueDispatchTasks.countGroupReadyAssets' },
+                )
+              : 0;
+
+          const uploadedCount = await withPrismaRetry(
+            () =>
+              prisma.mediaAsset.count({
+                where: {
+                  channelId: task.channelId,
+                  OR: [
+                    {
+                      sourceMeta: {
+                        path: ['groupKey'],
+                        equals: task.groupKey,
+                      },
+                    },
+                    {
+                      pathNormalized: {
+                        contains: `/${task.groupKey}/`,
+                      },
+                    },
+                    {
+                      localPath: {
+                        contains: `\\${task.groupKey}\\`,
+                      },
+                    },
+                  ],
+                  status: MediaStatus.relay_uploaded,
+                  telegramFileId: { not: null },
+                  dispatchMediaType: { not: null },
+                },
+              }),
+            { label: 'dispatch.scheduleDueDispatchTasks.countGroupUploadedAssets' },
+          );
+
+          const channelInWhitelist =
+            TYPEB_GROUP_SEND_WHITELIST_CHANNEL_IDS.length === 0 ||
+            TYPEB_GROUP_SEND_WHITELIST_CHANNEL_IDS.includes(task.channelId.toString());
+
+          // 组发送开关/白名单未开启时，不允许降级单发（避免 grouped 语义被破坏），只延后重试。
+          if (!TYPEB_GROUP_SEND_ENABLED || !channelInWhitelist) {
+            await withPrismaRetry(
+              () =>
+                prisma.dispatchTask.update({
+                  where: { id: task.id },
+                  data: {
+                    status: TaskStatus.scheduled,
+                    nextRunAt: new Date(Date.now() + TYPEB_GROUP_RETRY_CHECK_MS),
+                  },
+                }),
+              { label: 'dispatch.scheduleDueDispatchTasks.groupDisabledDelay' },
+            );
+
+            logger.warn('[typeb_group] grouped 任务不允许降级单发，等待组发送配置生效', {
+              taskId: task.id.toString(),
+              channelId: task.channelId.toString(),
+              groupKey: task.groupKey,
+              typebGroupSendEnabled: TYPEB_GROUP_SEND_ENABLED,
+              channelInWhitelist,
+            });
+            continue;
+          }
+
+          const groupScheduleSlot = groupedTasks
+            .map((t) => t.scheduleSlot)
+            .sort((a, b) => a.getTime() - b.getTime())[0] ?? task.scheduleSlot;
+          const existingGroupTaskSnapshot = await withPrismaRetry(
+            () =>
+              (prisma as any).dispatchGroupTask.findFirst({
+                where: {
+                  channelId: task.channelId,
                   groupKey: task.groupKey,
                 },
-              },
-              create: {
-                channelId: task.channelId,
-                groupKey: task.groupKey,
-                scheduleSlot: groupScheduleSlot,
-                status: TaskStatus.pending,
-                retryCount: 0,
-                maxRetries: task.maxRetries,
-                nextRunAt: now,
-                readyDeadlineAt: new Date(groupScheduleSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
-                expectedMediaCount: Math.max(expectedMediaCount, groupSize),
-                ...(inheritedSourceExpectedCount > 0
-                  ? {
-                      sourceExpectedCount: inheritedSourceExpectedCount,
-                    }
-                  : {}),
-                actualReadyCount: readyCount,
-                actualUploadedCount: uploadedCount,
-                lastArrivalAt: now,
-              },
-              update: {
-                nextRunAt: now,
-                expectedMediaCount: Math.max(expectedMediaCount, groupSize),
-                ...(inheritedSourceExpectedCount > 0
-                  ? {
-                      sourceExpectedCount: {
-                        set: inheritedSourceExpectedCount,
-                      },
-                    }
-                  : {}),
-                actualReadyCount: readyCount,
-                actualUploadedCount: uploadedCount,
-                readyDeadlineAt: {
-                  set: new Date(groupScheduleSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
-                },
-              },
-              select: {
-                id: true,
-                scheduleSlot: true,
-                readyDeadlineAt: true,
-                expectedMediaCount: true,
-                sourceExpectedCount: true,
-                actualUploadedCount: true,
-                lastArrivalAt: true,
-                sealedAt: true,
-                sealReason: true,
-              },
-            }),
-          { label: 'dispatch.scheduleDueDispatchTasks.upsertGroupTask' },
-        );
-
-        const sourceExpectedCount = Number(groupTask.sourceExpectedCount ?? 0);
-        const expectedTotal = sourceExpectedCount;
-        const persistedUploadedCount = Number(groupTask.actualUploadedCount ?? 0);
-        const effectiveUploadedCount = Math.max(persistedUploadedCount, uploadedCount);
-
-        if (expectedTotal <= 0) {
-          await withPrismaRetry(
-            () =>
-              prisma.dispatchTask.update({
-                where: { id: task.id },
-                data: {
-                  status: TaskStatus.scheduled,
-                  nextRunAt: new Date(Date.now() + TYPEB_GROUP_RETRY_CHECK_MS),
+                orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+                select: {
+                  id: true,
+                  sourceExpectedCount: true,
                 },
               }),
-            { label: 'dispatch.scheduleDueDispatchTasks.groupMissingSourceTotalDelay' },
+            { label: 'dispatch.scheduleDueDispatchTasks.findExistingGroupTaskSnapshot' },
+          );
+          const inheritedSourceExpectedCount = Math.max(
+            0,
+            Number(existingGroupTaskSnapshot?.sourceExpectedCount ?? 0),
           );
 
-          logger.error('【分组闸门】缺少源组媒体总数，阻塞派发', {
+          const groupTask = await withPrismaRetry(
+            () =>
+              (prisma as any).dispatchGroupTask.upsert({
+                where: {
+                  channelId_scheduleSlot_groupKey: {
+                    channelId: task.channelId,
+                    scheduleSlot: groupScheduleSlot,
+                    groupKey: task.groupKey,
+                  },
+                },
+                create: {
+                  channelId: task.channelId,
+                  groupKey: task.groupKey,
+                  scheduleSlot: groupScheduleSlot,
+                  status: TaskStatus.pending,
+                  retryCount: 0,
+                  maxRetries: task.maxRetries,
+                  nextRunAt: now,
+                  readyDeadlineAt: new Date(groupScheduleSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
+                  expectedMediaCount: Math.max(expectedMediaCount, groupSize),
+                  ...(inheritedSourceExpectedCount > 0
+                    ? {
+                        sourceExpectedCount: inheritedSourceExpectedCount,
+                      }
+                    : {}),
+                  actualReadyCount: readyCount,
+                  actualUploadedCount: uploadedCount,
+                  lastArrivalAt: now,
+                },
+                update: {
+                  nextRunAt: now,
+                  expectedMediaCount: Math.max(expectedMediaCount, groupSize),
+                  ...(inheritedSourceExpectedCount > 0
+                    ? {
+                        sourceExpectedCount: {
+                          set: inheritedSourceExpectedCount,
+                        },
+                      }
+                    : {}),
+                  actualReadyCount: readyCount,
+                  actualUploadedCount: uploadedCount,
+                  readyDeadlineAt: {
+                    set: new Date(groupScheduleSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
+                  },
+                },
+                select: {
+                  id: true,
+                  scheduleSlot: true,
+                  readyDeadlineAt: true,
+                  expectedMediaCount: true,
+                  sourceExpectedCount: true,
+                  actualUploadedCount: true,
+                  lastArrivalAt: true,
+                  sealedAt: true,
+                  sealReason: true,
+                },
+              }),
+            { label: 'dispatch.scheduleDueDispatchTasks.upsertGroupTask' },
+          );
+
+          const sourceExpectedCount = Number(groupTask.sourceExpectedCount ?? 0);
+          const expectedTotal = sourceExpectedCount;
+          const persistedUploadedCount = Number(groupTask.actualUploadedCount ?? 0);
+          const effectiveUploadedCount = Math.max(persistedUploadedCount, uploadedCount);
+
+          // 门禁 1：没有 sourceExpectedCount 直接阻塞（这是你之前遇到的核心拦截条件）。
+          if (expectedTotal <= 0) {
+            await withPrismaRetry(
+              () =>
+                prisma.dispatchTask.update({
+                  where: { id: task.id },
+                  data: {
+                    status: TaskStatus.scheduled,
+                    nextRunAt: new Date(Date.now() + TYPEB_GROUP_RETRY_CHECK_MS),
+                  },
+                }),
+              { label: 'dispatch.scheduleDueDispatchTasks.groupMissingSourceTotalDelay' },
+            );
+
+            logger.error('【分组闸门】缺少源组媒体总数，阻塞派发', {
+              taskId: task.id.toString(),
+              channelId: task.channelId.toString(),
+              groupKey: task.groupKey,
+              dispatchGroupTaskId: groupTask.id.toString(),
+              sourceExpectedCount: expectedTotal,
+              expectedMediaCount: Number(groupTask.expectedMediaCount ?? 0),
+              actualUploadedCount: effectiveUploadedCount,
+            });
+            continue;
+          }
+
+          // 门禁 2：上传数超过预期总数，属于数据不一致，阻塞并告警。
+          if (effectiveUploadedCount > expectedTotal) {
+            await withPrismaRetry(
+              () =>
+                prisma.dispatchTask.update({
+                  where: { id: task.id },
+                  data: {
+                    status: TaskStatus.scheduled,
+                    nextRunAt: new Date(Date.now() + TYPEB_GROUP_RETRY_CHECK_MS),
+                  },
+                }),
+              { label: 'dispatch.scheduleDueDispatchTasks.groupUploadedOverflowDelay' },
+            );
+
+            logger.error('【分组闸门】已上传数超过源总数，阻塞并告警', {
+              taskId: task.id.toString(),
+              channelId: task.channelId.toString(),
+              groupKey: task.groupKey,
+              dispatchGroupTaskId: groupTask.id.toString(),
+              sourceExpectedCount: expectedTotal,
+              actualUploadedCount: effectiveUploadedCount,
+            });
+            continue;
+          }
+
+          // 门禁 3：上传未完成则等待。
+          if (effectiveUploadedCount < expectedTotal) {
+            await withPrismaRetry(
+              () =>
+                prisma.dispatchTask.update({
+                  where: { id: task.id },
+                  data: {
+                    status: TaskStatus.scheduled,
+                    nextRunAt: new Date(Date.now() + TYPEB_GROUP_RETRY_CHECK_MS),
+                  },
+                }),
+              { label: 'dispatch.scheduleDueDispatchTasks.groupWaitingUploadDelay' },
+            );
+
+            logger.info('【分组闸门】组内上传未完成，继续等待', {
+              taskId: task.id.toString(),
+              channelId: task.channelId.toString(),
+              groupKey: task.groupKey,
+              dispatchGroupTaskId: groupTask.id.toString(),
+              sourceExpectedCount: expectedTotal,
+              actualUploadedCount: effectiveUploadedCount,
+            });
+            continue;
+          }
+
+          // 门禁放行后，使用 dispatchGroupTask 做一次 CAS 抢占，避免并发重复入队组发送。
+          logger.info('【分组闸门】上传数与源总数一致，放行派发', {
             taskId: task.id.toString(),
             channelId: task.channelId.toString(),
             groupKey: task.groupKey,
             dispatchGroupTaskId: groupTask.id.toString(),
             sourceExpectedCount: expectedTotal,
-            expectedMediaCount: Number(groupTask.expectedMediaCount ?? 0),
             actualUploadedCount: effectiveUploadedCount,
           });
-          continue;
-        }
 
-        if (effectiveUploadedCount > expectedTotal) {
-          await withPrismaRetry(
+          const enqueueGate = await withPrismaRetry(
             () =>
-              prisma.dispatchTask.update({
-                where: { id: task.id },
+              (prisma as any).dispatchGroupTask.updateMany({
+                where: {
+                  id: groupTask.id,
+                  status: { in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed] },
+                },
                 data: {
                   status: TaskStatus.scheduled,
-                  nextRunAt: new Date(Date.now() + TYPEB_GROUP_RETRY_CHECK_MS),
+                  nextRunAt: now,
                 },
               }),
-            { label: 'dispatch.scheduleDueDispatchTasks.groupUploadedOverflowDelay' },
+            { label: 'dispatch.scheduleDueDispatchTasks.groupEnqueueCas' },
           );
 
-          logger.error('【分组闸门】已上传数超过源总数，阻塞并告警', {
-            taskId: task.id.toString(),
-            channelId: task.channelId.toString(),
-            groupKey: task.groupKey,
-            dispatchGroupTaskId: groupTask.id.toString(),
-            sourceExpectedCount: expectedTotal,
-            actualUploadedCount: effectiveUploadedCount,
-          });
-          continue;
-        }
+          groupEnqueueGranted = enqueueGate.count > 0;
+          if (!groupEnqueueGranted) {
+            logger.info('[typeb_group] grouped 入队被并发抢占，跳过本次重复入队', {
+              channelId: task.channelId.toString(),
+              groupKey: task.groupKey,
+              dispatchGroupTaskId: groupTask.id.toString(),
+              reason: 'group_enqueue_cas_rejected',
+            });
+            logger.info('[typeb_group][diag] enqueue cas rejected snapshot', {
+              taskId: task.id.toString(),
+              channelId: task.channelId.toString(),
+              groupKey: task.groupKey,
+              dispatchGroupTaskId: groupTask.id.toString(),
+              expectedTotal,
+              readyCount,
+              uploadedCount: effectiveUploadedCount,
+              now: now.toISOString(),
+            });
+            continue;
+          }
 
-        if (effectiveUploadedCount < expectedTotal) {
-          await withPrismaRetry(
-            () =>
-              prisma.dispatchTask.update({
-                where: { id: task.id },
-                data: {
-                  status: TaskStatus.scheduled,
-                  nextRunAt: new Date(Date.now() + TYPEB_GROUP_RETRY_CHECK_MS),
-                },
-              }),
-            { label: 'dispatch.scheduleDueDispatchTasks.groupWaitingUploadDelay' },
-          );
+          queueJobName = 'dispatch-send-group';
+          queueJobId = `dispatch-group-${groupTask.id.toString()}`;
 
-          logger.info('【分组闸门】组内上传未完成，继续等待', {
-            taskId: task.id.toString(),
-            channelId: task.channelId.toString(),
-            groupKey: task.groupKey,
-            dispatchGroupTaskId: groupTask.id.toString(),
-            sourceExpectedCount: expectedTotal,
-            actualUploadedCount: effectiveUploadedCount,
-          });
-          continue;
-        }
-
-        logger.info('【分组闸门】上传数与源总数一致，放行派发', {
-          taskId: task.id.toString(),
-          channelId: task.channelId.toString(),
-          groupKey: task.groupKey,
-          dispatchGroupTaskId: groupTask.id.toString(),
-          sourceExpectedCount: expectedTotal,
-          actualUploadedCount: effectiveUploadedCount,
-        });
-
-        const enqueueGate = await withPrismaRetry(
-          () =>
-            (prisma as any).dispatchGroupTask.updateMany({
-              where: {
-                id: groupTask.id,
-                status: { in: [TaskStatus.pending, TaskStatus.scheduled, TaskStatus.failed] },
-              },
-              data: {
-                status: TaskStatus.scheduled,
-                nextRunAt: now,
-              },
-            }),
-          { label: 'dispatch.scheduleDueDispatchTasks.groupEnqueueCas' },
-        );
-
-        groupEnqueueGranted = enqueueGate.count > 0;
-        if (!groupEnqueueGranted) {
-          logger.info('[typeb_group] grouped 入队被并发抢占，跳过本次重复入队', {
-            channelId: task.channelId.toString(),
-            groupKey: task.groupKey,
-            dispatchGroupTaskId: groupTask.id.toString(),
-            reason: 'group_enqueue_cas_rejected',
-          });
-          logger.info('[typeb_group][diag] enqueue cas rejected snapshot', {
+          logger.info('[typeb_group][diag] enqueue granted snapshot', {
             taskId: task.id.toString(),
             channelId: task.channelId.toString(),
             groupKey: task.groupKey,
@@ -1006,39 +1130,25 @@ export async function scheduleDueDispatchTasks() {
             expectedTotal,
             readyCount,
             uploadedCount: effectiveUploadedCount,
-            now: now.toISOString(),
+            queueJobName,
+            queueJobId,
           });
-          continue;
+
+          logger.info('[typeb_group][verify] expectedTotal source snapshot', {
+            taskId: task.id.toString(),
+            channelId: task.channelId.toString(),
+            groupKey: task.groupKey,
+            dispatchGroupTaskId: groupTask.id.toString(),
+            sourceExpectedCount: Number(groupTask.sourceExpectedCount ?? 0),
+            fallbackExpectedMediaCount: Number(groupTask.expectedMediaCount ?? 0),
+            expectedTotal,
+            readyCount,
+            uploadedCount: effectiveUploadedCount,
+          });
         }
-
-        queueJobName = 'dispatch-send-group';
-        queueJobId = `dispatch-group-${groupTask.id.toString()}`;
-
-        logger.info('[typeb_group][diag] enqueue granted snapshot', {
-          taskId: task.id.toString(),
-          channelId: task.channelId.toString(),
-          groupKey: task.groupKey,
-          dispatchGroupTaskId: groupTask.id.toString(),
-          expectedTotal,
-          readyCount,
-          uploadedCount: effectiveUploadedCount,
-          queueJobName,
-          queueJobId,
-        });
-
-        logger.info('[typeb_group][verify] expectedTotal source snapshot', {
-          taskId: task.id.toString(),
-          channelId: task.channelId.toString(),
-          groupKey: task.groupKey,
-          dispatchGroupTaskId: groupTask.id.toString(),
-          sourceExpectedCount: Number(groupTask.sourceExpectedCount ?? 0),
-          fallbackExpectedMediaCount: Number(groupTask.expectedMediaCount ?? 0),
-          expectedTotal,
-          readyCount,
-          uploadedCount: effectiveUploadedCount,
-        });
       }
 
+      // 真正入队到 q_dispatch（dispatch-send / dispatch-send-group）。
       await dispatchQueue.add(
         queueJobName,
         {
@@ -1111,6 +1221,16 @@ export async function scheduleDueDispatchTasks() {
   };
 }
 
+/**
+ * 任务定义调度器入口：扫描 relay_uploaded 且未创建 dispatchTask 的 mediaAsset，创建 dispatchTask。
+ *
+ * 关键点：
+ * - primaryGroupKey：来自 sourceMeta.groupKey（权威）
+ * - secondaryGroupKey：从路径中推断（只允许 grouped-*）
+ * - bucketGroupKey：内部用于“把属于同一组的一批资产聚在一起”的 key
+ *   - 若缺 groupKey，会临时用 asset-<id> 做 bucket key
+ *   - 但该值不会写入 dispatchTask.groupKey（避免单资产误被 group 化）
+ */
 export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
   try {
     const definition = await getTaskDefinitionModel().findUnique({
@@ -1166,6 +1286,7 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
       let groupKey = primaryGroupKey;
       if (!groupKey && secondaryGroupKey) {
         groupKey = secondaryGroupKey;
+        // secondaryGroupKey 仅作为“grouped-*”路径场景的补丁来源；普通 single 目录不会进入这里。
         logger.info('[typeb_group] 使用 secondaryGroupKey 修复分组', {
           mediaAssetId: asset.id.toString(),
           channelId: asset.channelId.toString(),
@@ -1185,6 +1306,7 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
       }
 
       if (!groupKey && fromGroupedPath) {
+        // grouped 目录里必须能找到 groupKey，否则宁可跳过也不要误判为单发（避免 grouped 不完整时乱序）。
         logger.warn('[typeb_group] grouped 路径缺失可用 groupKey，阻止错误分组', {
           mediaAssetId: asset.id.toString(),
           channelId: asset.channelId.toString(),
@@ -1196,23 +1318,31 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
         continue;
       }
 
-      if (!groupKey) {
-        groupKey = `asset-${asset.id.toString()}`;
-      }
-
-      const key = `${asset.channelId.toString()}::${groupKey}`;
+      // bucketGroupKey 是内部聚合 key：缺 groupKey 时使用 asset-<id>，仅用于把单资产放入独立 bucket。
+      const bucketGroupKey = groupKey ?? `asset-${asset.id.toString()}`;
+      const key = `${asset.channelId.toString()}::${bucketGroupKey}`;
       const bucket = grouped.get(key);
       if (bucket) bucket.push(asset);
       else grouped.set(key, [asset]);
     }
 
     for (const [key, assets] of grouped) {
-      const [, groupKey] = key.split('::');
+      const [, bucketGroupKey] = key.split('::');
       const sorted = [...assets].sort((a, b) =>
         String(a.originalName || '').localeCompare(String(b.originalName || ''), 'zh-CN'),
       );
+      // 这里再次用 sourceMeta.groupKey 做权威回读：bucketGroupKey 只在 grouped-* 场景作为 fallback。
+      const sourceMeta = (sorted[0]?.sourceMeta ?? {}) as Record<string, unknown>;
+      const primaryGroupKeyRaw = sourceMeta.groupKey;
+      const primaryGroupKey =
+        typeof primaryGroupKeyRaw === 'string' && primaryGroupKeyRaw.trim()
+          ? primaryGroupKeyRaw.trim()
+          : null;
+      const groupKey = primaryGroupKey ?? (isGroupedStyleGroupKey(bucketGroupKey) ? bucketGroupKey : null);
       const groupSlot = new Date(now.getTime());
       const isRealGroup = sorted.length > 1;
+      // 只有真实组才持久化 groupKey 到 dispatchTask，避免单资产误入组派发。
+      const shouldPersistGroupKey = isRealGroup || isGroupedStyleGroupKey(groupKey);
       const sourceExpectedCountCandidates = sorted
         .map((asset) => parseSourceExpectedCount(asset.sourceMeta))
         .filter((n): n is number => typeof n === 'number' && n > 0);
@@ -1243,7 +1373,8 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
         Number(existingGroupTaskSnapshot?.sourceExpectedCount ?? 0),
       );
 
-      if (groupKey.toLowerCase().startsWith('grouped-') && sorted.length === 1) {
+      if (isGroupedStyleGroupKey(groupKey) && sorted.length === 1) {
+        // grouped-* 单元素：一般意味着组还没抓齐/还在上传中，不降级为单发，等待后续补齐。
         logger.warn('[typeb_group] grouped 单元素组已识别，保持等待组装不降级单发', {
           channelId: sorted[0].channelId.toString(),
           groupKey,
@@ -1257,6 +1388,7 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
       }
 
       if (isRealGroup && groupKey) {
+        // 真实组才创建/更新 dispatchGroupTask（组发送门禁的数据载体）。
         await withPrismaRetry(
           () =>
             (prisma as any).dispatchGroupTask.upsert({
@@ -1320,7 +1452,8 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
               data: {
                 channelId: asset.channelId,
                 mediaAssetId: asset.id,
-                groupKey,
+                // 关键修复点：单资产任务 groupKey 为 null；只有真实组才持久化 groupKey。
+                groupKey: shouldPersistGroupKey ? groupKey : null,
                 status: TaskStatus.pending,
                 scheduleSlot: slot,
                 plannedAt: slot,
