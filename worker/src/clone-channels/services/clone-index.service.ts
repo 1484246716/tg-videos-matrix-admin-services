@@ -644,12 +644,15 @@ async function writeGroupSourceExpectedCountFromCrawl(params: {
   channelId: bigint;
   channelUsername: string;
 }) {
-  const dbChannelUsername = toDbChannelUsername(normalizeChannelUsername(params.channelUsername));
+  const normalizedChannelUsername = normalizeChannelUsername(params.channelUsername);
+  const dbChannelUsername = toDbChannelUsername(normalizedChannelUsername);
 
   const groupedItems = await prisma.cloneCrawlItem.findMany({
     where: {
       taskId: params.taskId,
-      channelUsername: dbChannelUsername,
+      channelUsername: {
+        in: [normalizedChannelUsername, dbChannelUsername],
+      },
       groupKey: { not: null },
     },
     select: {
@@ -660,6 +663,17 @@ async function writeGroupSourceExpectedCountFromCrawl(params: {
       localPath: true,
     },
   });
+
+  if (groupedItems.length === 0) {
+    logger.warn('【爬虫分组计数】本次索引未找到可统计的分组媒体', {
+      任务ID: params.taskId.toString(),
+      频道ID: params.channelId.toString(),
+      频道用户名: params.channelUsername,
+      标准化频道用户名: normalizedChannelUsername,
+      数据库频道用户名候选: [normalizedChannelUsername, dbChannelUsername],
+    });
+    return;
+  }
 
   const groupedCounter = new Map<string, { total: number; video: number; image: number; groupedId: string | null }>();
 
@@ -699,14 +713,41 @@ async function writeGroupSourceExpectedCountFromCrawl(params: {
     });
 
     if (!latestGroupTask?.id) {
-      logger.info('【爬虫分组计数】统计完成但未找到可写入组任务，等待调度创建后补写', {
+      const now = new Date();
+      const created = await (prisma as any).dispatchGroupTask.create({
+        data: {
+          channelId: params.channelId,
+          groupKey,
+          scheduleSlot: now,
+          status: 'pending',
+          retryCount: 0,
+          maxRetries: 6,
+          nextRunAt: now,
+          expectedMediaCount: stat.total,
+          sourceExpectedCount: stat.total,
+          actualReadyCount: 0,
+          actualUploadedCount: 0,
+          lastArrivalAt: now,
+        },
+        select: {
+          id: true,
+          sourceExpectedCount: true,
+        },
+      });
+
+      logger.info('【爬虫分组计数】统计完成并写入 sourceExpectedCount', {
         频道ID: params.channelId.toString(),
         组键: groupKey,
         分组ID: stat.groupedId,
         统计视频数: stat.video,
         统计图片数: stat.image,
         统计媒体总数: stat.total,
+        原值: 0,
+        新值: Number(created.sourceExpectedCount ?? 0),
         写入策略: 'GREATEST',
+        是否更新: true,
+        写入方式: 'create_placeholder_dispatch_group_task',
+        dispatchGroupTaskId: created.id.toString(),
       });
       continue;
     }
@@ -717,6 +758,7 @@ async function writeGroupSourceExpectedCountFromCrawl(params: {
     const updated = await (prisma as any).dispatchGroupTask.update({
       where: { id: latestGroupTask.id },
       data: {
+        expectedMediaCount: Math.max(stat.total, 0),
         sourceExpectedCount: newValue,
       },
       select: {
@@ -736,6 +778,7 @@ async function writeGroupSourceExpectedCountFromCrawl(params: {
       新值: Number(updated.sourceExpectedCount ?? 0),
       写入策略: 'GREATEST',
       是否更新: Number(updated.sourceExpectedCount ?? 0) !== oldValue,
+      写入方式: 'update_existing_dispatch_group_task',
       dispatchGroupTaskId: updated.id.toString(),
     });
   }

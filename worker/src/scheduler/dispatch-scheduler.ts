@@ -808,6 +808,25 @@ export async function scheduleDueDispatchTasks() {
         const groupScheduleSlot = groupedTasks
           .map((t) => t.scheduleSlot)
           .sort((a, b) => a.getTime() - b.getTime())[0] ?? task.scheduleSlot;
+        const existingGroupTaskSnapshot = await withPrismaRetry(
+          () =>
+            (prisma as any).dispatchGroupTask.findFirst({
+              where: {
+                channelId: task.channelId,
+                groupKey: task.groupKey,
+              },
+              orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+              select: {
+                id: true,
+                sourceExpectedCount: true,
+              },
+            }),
+          { label: 'dispatch.scheduleDueDispatchTasks.findExistingGroupTaskSnapshot' },
+        );
+        const inheritedSourceExpectedCount = Math.max(
+          0,
+          Number(existingGroupTaskSnapshot?.sourceExpectedCount ?? 0),
+        );
 
         const groupTask = await withPrismaRetry(
           () =>
@@ -829,6 +848,11 @@ export async function scheduleDueDispatchTasks() {
                 nextRunAt: now,
                 readyDeadlineAt: new Date(groupScheduleSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
                 expectedMediaCount: Math.max(expectedMediaCount, groupSize),
+                ...(inheritedSourceExpectedCount > 0
+                  ? {
+                      sourceExpectedCount: inheritedSourceExpectedCount,
+                    }
+                  : {}),
                 actualReadyCount: readyCount,
                 actualUploadedCount: uploadedCount,
                 lastArrivalAt: now,
@@ -836,6 +860,13 @@ export async function scheduleDueDispatchTasks() {
               update: {
                 nextRunAt: now,
                 expectedMediaCount: Math.max(expectedMediaCount, groupSize),
+                ...(inheritedSourceExpectedCount > 0
+                  ? {
+                      sourceExpectedCount: {
+                        set: inheritedSourceExpectedCount,
+                      },
+                    }
+                  : {}),
                 actualReadyCount: readyCount,
                 actualUploadedCount: uploadedCount,
                 readyDeadlineAt: {
@@ -1189,6 +1220,28 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
         sourceExpectedCountCandidates.length > 0
           ? Math.max(...sourceExpectedCountCandidates)
           : null;
+      const existingGroupTaskSnapshot =
+        isRealGroup && groupKey
+          ? await withPrismaRetry(
+              () =>
+                (prisma as any).dispatchGroupTask.findFirst({
+                  where: {
+                    channelId: sorted[0].channelId,
+                    groupKey,
+                  },
+                  orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+                  select: {
+                    id: true,
+                    sourceExpectedCount: true,
+                  },
+                }),
+              { label: 'dispatch.scheduleDispatchForDefinition.findExistingGroupTaskSnapshot' },
+            )
+          : null;
+      const inheritedSourceExpectedCount = Math.max(
+        Number(groupSourceExpectedCount ?? 0),
+        Number(existingGroupTaskSnapshot?.sourceExpectedCount ?? 0),
+      );
 
       if (groupKey.toLowerCase().startsWith('grouped-') && sorted.length === 1) {
         logger.warn('[typeb_group] grouped 单元素组已识别，保持等待组装不降级单发', {
@@ -1224,7 +1277,11 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
                 nextRunAt: groupSlot,
                 readyDeadlineAt: new Date(groupSlot.getTime() + TYPEB_GROUP_READY_TIMEOUT_MS),
                 expectedMediaCount: sorted.length,
-                sourceExpectedCount: groupSourceExpectedCount,
+                ...(inheritedSourceExpectedCount > 0
+                  ? {
+                      sourceExpectedCount: inheritedSourceExpectedCount,
+                    }
+                  : {}),
                 actualReadyCount: 0,
                 actualUploadedCount: 0,
                 lastArrivalAt: now,
@@ -1232,10 +1289,10 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
               update: {
                 nextRunAt: groupSlot,
                 expectedMediaCount: sorted.length,
-                ...(groupSourceExpectedCount && groupSourceExpectedCount > 0
+                ...(inheritedSourceExpectedCount > 0
                   ? {
                       sourceExpectedCount: {
-                        set: groupSourceExpectedCount,
+                        set: inheritedSourceExpectedCount,
                       },
                     }
                   : {}),

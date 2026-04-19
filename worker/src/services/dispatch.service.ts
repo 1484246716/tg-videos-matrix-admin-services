@@ -140,6 +140,38 @@ function normalizeCaptionText(raw?: string | null) {
   return raw.replace(/^\uFEFF/, '').trim();
 }
 
+function truncateCatalogTitle(text: string, maxChars = 15) {
+  const chars = Array.from(text);
+  if (chars.length <= maxChars) return text;
+  return `${chars.slice(0, maxChars).join('')}...`;
+}
+
+function extractCatalogShortTitle(raw?: string | null) {
+  const caption = normalizeCaptionText(raw);
+  if (!caption) return null;
+
+  const matchedTitle = caption.match(/(?:^|\n)\s*📺?\s*片名\s*[：:]\s*(.+)/);
+  const candidateSource =
+    matchedTitle?.[1]?.trim() ||
+    caption
+      .split('\n')
+      .map((line) => line.trim())
+      .find(Boolean) ||
+    '';
+
+  const normalized = normalizeTitleFallback(
+    candidateSource
+      .replace(/^#+\s*/, '')
+      .replace(/^[-*]+\s*/, '')
+      .replace(/^📺\s*/, '')
+      .replace(/^片名\s*[：:]\s*/, '')
+      .trim(),
+    '精彩视频',
+  );
+
+  return truncateCatalogTitle(normalized, 15);
+}
+
 function resolveCaptionFromSourceMeta(meta: Record<string, unknown> | null | undefined) {
   if (!meta) return '';
   const direct = typeof meta.caption === 'string' ? meta.caption : '';
@@ -1152,7 +1184,7 @@ export async function handleDispatchGroupJob(
         telegramMessageId: firstMessageId,
         telegramMessageLink: groupMessageLink,
         caption: caption || null,
-        title: (caption || '').trim() || null,
+        title: extractCatalogShortTitle(caption),
         sourceMeta: primaryMeta,
       });
     }
@@ -1696,7 +1728,7 @@ export async function handleDispatchJob(
       telegramMessageId: sendResult.messageId,
       telegramMessageLink: sendResult.messageLink || null,
       caption: finalCaption || null,
-      title: (finalCaption || '').trim() || null,
+      title: extractCatalogShortTitle(finalCaption),
       sourceMeta: mediaSourceMeta,
     });
 
