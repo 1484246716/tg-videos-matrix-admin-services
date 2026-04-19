@@ -7,6 +7,34 @@ export const taskdefMetrics = {
   runDurationMsTotal: 0,
 };
 
+export const catalogMetrics = {
+  tickTotal: 0,
+  publishRunTotal: 0,
+  publishRunSchedulerTotal: 0,
+  publishRunManualRepairTotal: 0,
+  publishRunSuccessTotal: 0,
+  publishRunFailedTotal: 0,
+  publishRunSkippedTotal: 0,
+  publishEmptyRunTotal: 0,
+  publishItemsRenderedTotal: 0,
+  publishGroupItemsRenderedTotal: 0,
+  publishCollectionItemsRenderedTotal: 0,
+  publishDurationMsTotal: 0,
+  publishEmptyRunConsecutive: 0,
+  manualRepairTriggeredTotal: 0,
+  manualRepairAlreadyInProgressTotal: 0,
+};
+
+export const catalogSourceWriteMetrics = {
+  upsertTotal: 0,
+  upsertSuccessTotal: 0,
+  upsertFailedTotal: 0,
+  upsertSingleTotal: 0,
+  upsertGroupTotal: 0,
+  dedupHitTotal: 0,
+  upsertDurationMsTotal: 0,
+};
+
 export const METRICS_LOG_INTERVAL_TICKS = 60;
 
 export const TYPEA_INGEST_ERROR_CODE = {

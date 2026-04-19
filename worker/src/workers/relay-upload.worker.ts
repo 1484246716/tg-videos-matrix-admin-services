@@ -478,6 +478,16 @@ async function reconcileGroupedDispatchAfterRelayUpload(context: {
     dispatchGroupTaskId: groupTask?.id?.toString?.() ?? null,
   });
 
+  logger.info('【中转上传计数】上传成功后更新组已上传数量', {
+    traceId: context.traceId,
+    频道ID: asset.channelId.toString(),
+    组键: groupKey,
+    组内资产总数: groupedAssets.length,
+    已上传数: uploadedCount,
+    新建派发任务数: createdDispatchTasks,
+    dispatchGroupTaskId: groupTask?.id?.toString?.() ?? null,
+  });
+
   logger.info('[typeb_group][verify] dispatchGroupTask expected source snapshot', {
     traceId: context.traceId,
     channelId: asset.channelId.toString(),

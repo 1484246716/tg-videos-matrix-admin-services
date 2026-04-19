@@ -6,6 +6,7 @@ import {
   NotFoundException,
   HttpException,
 } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 import { access, mkdir, rename, rm } from 'node:fs/promises';
@@ -461,74 +462,138 @@ export class ChannelService {
     const configuredPageSize = Number(channel.navPageSize ?? 20);
     const safePageSize = Math.min(100, Math.max(1, Number.isFinite(configuredPageSize) ? configuredPageSize : 20));
 
-    const where: Prisma.DispatchTaskWhereInput = {
-      channelId: channel.id,
-      status: 'success',
-      telegramMessageLink: { not: null },
-    };
-
-    const total = await this.prisma.dispatchTask.count({ where });
-
+    const readFromCatalogSource = process.env.TYPEC_READ_FROM_CATALOG_SOURCE !== 'false';
     const skip = (safePage - 1) * safePageSize;
-    const dispatchTasks = await this.prisma.dispatchTask.findMany({
-      where,
-      orderBy: { finishedAt: 'desc' },
-      skip,
-      take: safePageSize,
-      select: {
-        id: true,
-        mediaAssetId: true,
-        caption: true,
-        telegramMessageLink: true,
-        mediaAsset: {
-          select: {
-            sourceMeta: true,
-          },
-        },
-      },
-    });
 
-    const videos = [...dispatchTasks].reverse().map((t, idx) => {
-      const caption = (t.caption || '').trim();
-      const titleMatch = caption.match(/(?:^|\n)\s*📺?\s*片名\s*[：:]\s*(.+)/);
-      const actorMatch = caption.match(/(?:^|\n)\s*(?:👥\s*)?主演\s*[：:]\s*(.+)/);
+    const { total, videos } = readFromCatalogSource
+      ? await (async () => {
+          const where = {
+            channelId: channel.id,
+            telegramMessageLink: { not: null },
+          } as any;
 
-      const parts = caption
-        .split('\n')
-        .map((l) => l.trim())
-        .filter(Boolean);
+          const total = await (this.prisma as any).catalogSourceItem.count({ where });
+          const rows = await (this.prisma as any).catalogSourceItem.findMany({
+            where,
+            orderBy: { publishedAt: 'desc' },
+            skip,
+            take: safePageSize,
+            select: {
+              id: true,
+              sourceDispatchTaskId: true,
+              title: true,
+              caption: true,
+              telegramMessageLink: true,
+            },
+          });
 
-      let shortTitle = '未命名视频';
-      if (titleMatch?.[1]?.trim()) {
-        const rawTitle = titleMatch[1].trim();
-        const wrapped = rawTitle.match(/《[^》]+》/);
-        const displayTitle = wrapped ? wrapped[0] : `《${rawTitle.replace(/^《|》$/g, '').trim()}》`;
-        shortTitle = actorMatch?.[1]?.trim()
-          ? `📺片名：${displayTitle} 👥主演: ${actorMatch[1].trim()}`
-          : `📺片名：${displayTitle}`;
-      } else if (parts.length >= 2) {
-        shortTitle = `${parts[0]} ${parts[1]}`;
-      } else if (parts.length === 1) {
-        shortTitle = parts[0];
-      }
+          const videos = [...rows].reverse().map((t: any, idx: number) => {
+            const caption = (t.caption || '').trim();
+            const titleMatch = caption.match(/(?:^|\n)\s*📺?\s*片名\s*[：:]\s*(.+)/);
+            const actorMatch = caption.match(/(?:^|\n)\s*(?:👥\s*)?主演\s*[：:]\s*(.+)/);
 
-      const sourceMeta =
-        t.mediaAsset?.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
-          ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
-          : {};
-      const customCatalogTitle =
-        typeof sourceMeta.catalogCustomTitle === 'string' ? sourceMeta.catalogCustomTitle.trim() : '';
+            const parts = caption
+              .split('\n')
+              .map((l: string) => l.trim())
+              .filter(Boolean);
 
-      const link = t.telegramMessageLink || '';
-      return {
-        id: t.id.toString(),
-        mediaAssetId: t.mediaAssetId.toString(),
-        title: customCatalogTitle || shortTitle,
-        link,
-        readonlyLink: link,
-        order: idx + 1,
-      };
-    });
+            let shortTitle = '未命名视频';
+            if (titleMatch?.[1]?.trim()) {
+              const rawTitle = titleMatch[1].trim();
+              const wrapped = rawTitle.match(/《[^》]+》/);
+              const displayTitle = wrapped ? wrapped[0] : `《${rawTitle.replace(/^《|》$/g, '').trim()}》`;
+              shortTitle = actorMatch?.[1]?.trim()
+                ? `📺片名：${displayTitle} 👥主演: ${actorMatch[1].trim()}`
+                : `📺片名：${displayTitle}`;
+            } else if (parts.length >= 2) {
+              shortTitle = `${parts[0]} ${parts[1]}`;
+            } else if (parts.length === 1) {
+              shortTitle = parts[0];
+            }
+
+            const link = t.telegramMessageLink || '';
+            return {
+              id: t.id.toString(),
+              mediaAssetId: t.sourceDispatchTaskId ? t.sourceDispatchTaskId.toString() : '',
+              title: (t.title || shortTitle || '未命名视频').trim(),
+              link,
+              readonlyLink: link,
+              order: idx + 1,
+            };
+          });
+
+          return { total, videos };
+        })()
+      : await (async () => {
+          const where: Prisma.DispatchTaskWhereInput = {
+            channelId: channel.id,
+            status: 'success',
+            telegramMessageLink: { not: null },
+          };
+
+          const total = await this.prisma.dispatchTask.count({ where });
+          const dispatchTasks = await this.prisma.dispatchTask.findMany({
+            where,
+            orderBy: { finishedAt: 'desc' },
+            skip,
+            take: safePageSize,
+            select: {
+              id: true,
+              mediaAssetId: true,
+              caption: true,
+              telegramMessageLink: true,
+              mediaAsset: {
+                select: {
+                  sourceMeta: true,
+                },
+              },
+            },
+          });
+
+          const videos = [...dispatchTasks].reverse().map((t, idx) => {
+            const caption = (t.caption || '').trim();
+            const titleMatch = caption.match(/(?:^|\n)\s*📺?\s*片名\s*[：:]\s*(.+)/);
+            const actorMatch = caption.match(/(?:^|\n)\s*(?:👥\s*)?主演\s*[：:]\s*(.+)/);
+
+            const parts = caption
+              .split('\n')
+              .map((l) => l.trim())
+              .filter(Boolean);
+
+            let shortTitle = '未命名视频';
+            if (titleMatch?.[1]?.trim()) {
+              const rawTitle = titleMatch[1].trim();
+              const wrapped = rawTitle.match(/《[^》]+》/);
+              const displayTitle = wrapped ? wrapped[0] : `《${rawTitle.replace(/^《|》$/g, '').trim()}》`;
+              shortTitle = actorMatch?.[1]?.trim()
+                ? `📺片名：${displayTitle} 👥主演: ${actorMatch[1].trim()}`
+                : `📺片名：${displayTitle}`;
+            } else if (parts.length >= 2) {
+              shortTitle = `${parts[0]} ${parts[1]}`;
+            } else if (parts.length === 1) {
+              shortTitle = parts[0];
+            }
+
+            const sourceMeta =
+              t.mediaAsset?.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
+                ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
+                : {};
+            const customCatalogTitle =
+              typeof sourceMeta.catalogCustomTitle === 'string' ? sourceMeta.catalogCustomTitle.trim() : '';
+
+            const link = t.telegramMessageLink || '';
+            return {
+              id: t.id.toString(),
+              mediaAssetId: t.mediaAssetId.toString(),
+              title: customCatalogTitle || shortTitle,
+              link,
+              readonlyLink: link,
+              order: idx + 1,
+            };
+          });
+
+          return { total, videos };
+        })();
 
     const titleLineRaw = (channel.navTemplateText || '').split('\n').find((line) => line.trim()) || '';
     const defaultTitle = `${channel.name} 知识库/资源大全`;
@@ -606,6 +671,32 @@ export class ChannelService {
         id: true,
       },
     });
+
+    const dispatchTask = await this.prisma.dispatchTask.findFirst({
+      where: {
+        mediaAssetId: mediaAsset.id,
+        channelId: channel.id,
+        status: 'success',
+        telegramMessageId: { not: null },
+      },
+      orderBy: { finishedAt: 'desc' },
+      select: {
+        telegramMessageId: true,
+      },
+    });
+
+    if (dispatchTask?.telegramMessageId) {
+      await (this.prisma as any).catalogSourceItem.updateMany({
+        where: {
+          channelId: channel.id,
+          telegramMessageId: dispatchTask.telegramMessageId,
+        },
+        data: {
+          title: nextTitle,
+          updatedAt: new Date(),
+        },
+      });
+    }
 
     return this.serializeBigInt({
       id: updated.id,
@@ -750,6 +841,7 @@ export class ChannelService {
     const queue = this.getCatalogQueue();
     const channelIdRaw = channel.id.toString();
     const jobId = `catalog-manual-repair-${channelIdRaw}`;
+    const runId = randomUUID();
 
     const existingJob = await queue.getJob(jobId);
     if (existingJob) {
@@ -777,6 +869,7 @@ export class ChannelService {
         selfHealOnly: true,
         manualRepair: true,
         source: 'channels_manual_repair',
+        runId,
       },
       {
         jobId,
@@ -793,6 +886,7 @@ export class ChannelService {
       manualRepair: true,
       selfHealOnly: true,
       jobId,
+      runId,
     };
   }
 

@@ -142,6 +142,52 @@ export const TYPEC_SELF_HEAL_ON_SKIP =
 export const TYPEC_SELF_HEAL_ON_RUN =
   process.env.TYPEC_SELF_HEAL_ON_RUN !== 'false';
 
+/** TypeC 目录读取是否切换到 catalog_source_item（默认 true） */
+export const TYPEC_READ_FROM_CATALOG_SOURCE =
+  process.env.TYPEC_READ_FROM_CATALOG_SOURCE !== 'false';
+
+/** TypeC 指标日志输出间隔（按调度 tick 计数） */
+export const TYPEC_METRICS_LOG_INTERVAL_TICKS = (() => {
+  const n = Number(process.env.TYPEC_METRICS_LOG_INTERVAL_TICKS ?? '30');
+  if (!Number.isFinite(n) || n < 1) return 30;
+  return Math.min(600, Math.floor(n));
+})();
+
+/** TypeC 告警：连续空目录阈值 */
+export const TYPEC_ALERT_EMPTY_RUN_CONSECUTIVE_THRESHOLD = (() => {
+  const n = Number(process.env.TYPEC_ALERT_EMPTY_RUN_CONSECUTIVE_THRESHOLD ?? '3');
+  if (!Number.isFinite(n) || n < 1) return 3;
+  return Math.min(100, Math.floor(n));
+})();
+
+/** TypeC 告警：失败次数阈值（窗口内累计） */
+export const TYPEC_ALERT_FAILED_RUN_THRESHOLD = (() => {
+  const n = Number(process.env.TYPEC_ALERT_FAILED_RUN_THRESHOLD ?? '5');
+  if (!Number.isFinite(n) || n < 1) return 5;
+  return Math.min(1000, Math.floor(n));
+})();
+
+/** TypeC 告警：手动修复排队等待阈值（秒） */
+export const TYPEC_ALERT_MANUAL_REPAIR_QUEUE_LAG_SECONDS = (() => {
+  const n = Number(process.env.TYPEC_ALERT_MANUAL_REPAIR_QUEUE_LAG_SECONDS ?? '120');
+  if (!Number.isFinite(n) || n < 10) return 120;
+  return Math.min(3600, Math.floor(n));
+})();
+
+/** catalog_source_item 回填批次大小 */
+export const TYPEC_CATALOG_SOURCE_BACKFILL_BATCH_SIZE = (() => {
+  const n = Number(process.env.TYPEC_CATALOG_SOURCE_BACKFILL_BATCH_SIZE ?? '1000');
+  if (!Number.isFinite(n) || n < 100) return 1000;
+  return Math.min(5000, Math.floor(n));
+})();
+
+/** catalog_source_item 回填批次间隔（毫秒） */
+export const TYPEC_CATALOG_SOURCE_BACKFILL_SLEEP_MS = (() => {
+  const n = Number(process.env.TYPEC_CATALOG_SOURCE_BACKFILL_SLEEP_MS ?? '100');
+  if (!Number.isFinite(n) || n < 0) return 100;
+  return Math.min(5000, Math.floor(n));
+})();
+
 /** TypeC 自愈时是否允许执行孤儿消息清理（false 关闭） */
 export const TYPEC_SELF_HEAL_CLEANUP_ENABLED =
   process.env.TYPEC_SELF_HEAL_CLEANUP_ENABLED !== 'false';

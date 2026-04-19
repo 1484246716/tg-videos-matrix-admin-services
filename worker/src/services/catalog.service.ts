@@ -6,11 +6,14 @@ import {
   TYPEC_COLLECTION_DATA_SOURCE,
   TYPEC_COLLECTION_FULL_SCAN_BATCH_SIZE,
   TYPEC_COLLECTION_INDEX_SHOW_EMPTY,
+  TYPEC_READ_FROM_CATALOG_SOURCE,
   TYPEC_SELF_HEAL_ON_RUN,
 } from '../config/env';
 import { prisma } from '../infra/prisma';
+import { randomUUID } from 'node:crypto';
 import { logError, logger } from '../logger';
 import { releaseChannelLock, tryAcquireChannelLock } from '../shared/channel-lock';
+import { catalogMetrics } from '../shared/metrics';
 import {
   editMessageTextByTelegram,
   pinMessageByTelegram,
@@ -672,6 +675,32 @@ class DbCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
   }
 
   async getCollectionEpisodes(channelId: bigint): Promise<CollectionCatalogEpisode[]> {
+    if (TYPEC_READ_FROM_CATALOG_SOURCE) {
+      const sourceRows = await (prisma as any).catalogSourceItem.findMany({
+        where: {
+          channelId,
+          isCollection: true,
+          telegramMessageLink: { not: null },
+        },
+        orderBy: [{ publishedAt: 'desc' }],
+        select: {
+          collectionName: true,
+          episodeNo: true,
+          title: true,
+          telegramMessageLink: true,
+        },
+      });
+
+      return sourceRows
+        .filter((row: any) => typeof row.collectionName === 'string' && Number.isInteger(row.episodeNo))
+        .map((row: any) => ({
+          collectionName: row.collectionName,
+          episodeNo: Number(row.episodeNo),
+          title: (row.title || `第${row.episodeNo}集`).trim(),
+          messageUrl: row.telegramMessageLink || '',
+        }));
+    }
+
     const batchSize = TYPEC_COLLECTION_FULL_SCAN_BATCH_SIZE;
     const tasks: Array<{
       telegramMessageLink: string | null;
@@ -854,16 +883,38 @@ class CachedCollectionCatalogReadProvider implements CollectionCatalogReadProvid
 
 export async function handleCatalogJob(
   channelIdRaw: string,
-  options?: { selfHealOnly?: boolean },
+  options?: { selfHealOnly?: boolean; triggerType?: 'scheduler' | 'manual_repair'; runId?: string },
 ) {
+  const runStartedAt = Date.now();
+  const runId = options?.runId || randomUUID();
+  const triggerType = options?.triggerType || 'scheduler';
   let catalogTaskId: bigint | null = null;
   const channelId = BigInt(channelIdRaw);
 
+  catalogMetrics.publishRunTotal += 1;
+  if (triggerType === 'manual_repair') {
+    catalogMetrics.publishRunManualRepairTotal += 1;
+  } else {
+    catalogMetrics.publishRunSchedulerTotal += 1;
+  }
+
+  logger.info('[q_catalog] 目录发布开始', {
+    runId,
+    channelId: channelIdRaw,
+    triggerType,
+    selfHealOnly: Boolean(options?.selfHealOnly),
+    dataSource: TYPEC_READ_FROM_CATALOG_SOURCE ? 'catalog_source_item' : 'dispatch_task',
+  });
+
   const channelLock = await tryAcquireChannelLock({ scope: 'catalog', channelId });
   if (!channelLock.acquired) {
+    catalogMetrics.publishRunSkippedTotal += 1;
     logger.info('[q_catalog] 跳过执行：同频道已有进行中的目录任务', {
+      runId,
       channelId: channelIdRaw,
+      triggerType,
       lockKey: channelLock.lockKey,
+      reason: 'catalog_channel_lock_not_acquired',
     });
     return { ok: true, skipped: true, reason: 'catalog_channel_lock_not_acquired' };
   }
@@ -880,6 +931,13 @@ export async function handleCatalogJob(
 
   if (!channel) throw new Error(`未找到频道: ${channelIdRaw}`);
   if (!channel.navEnabled || channel.status !== 'active') {
+    catalogMetrics.publishRunSkippedTotal += 1;
+    logger.info('[q_catalog] 跳过执行：频道未启用目录或未激活', {
+      runId,
+      channelId: channelIdRaw,
+      triggerType,
+      reason: 'channel_nav_disabled_or_inactive',
+    });
     return { ok: true, skipped: true, reason: '导航未启用或频道未激活' };
   }
   if (!channel.navTemplateText || !channel.defaultBot) {
@@ -960,66 +1018,126 @@ export async function handleCatalogJob(
   });
 
   const recentLimit = channel.navRecentLimit ?? 60;
-  const dispatchTasks = await prisma.dispatchTask.findMany({
-    where: { channelId, status: TaskStatus.success, telegramMessageId: { not: null } },
-    orderBy: { finishedAt: 'desc' },
-    take: recentLimit,
-    select: {
-      caption: true,
-      telegramMessageLink: true,
-      mediaAsset: {
-        select: {
-          originalName: true,
-          sourceMeta: true,
-        },
-      },
-    },
-  });
-
-  if (dispatchTasks.length === 0) {
-    if (catalogTaskId) {
-      await prisma.catalogTask.update({
-        where: { id: catalogTaskId },
-        data: {
-          status: CatalogTaskStatus.cancelled,
-          finishedAt: new Date(),
-          errorMessage: '没有可用的成功分发记录',
-        },
-      });
-    }
-    return { ok: true, skipped: true, reason: '没有可用的成功分发记录' };
-  }
-
-  const orderedDispatchTasks = [...dispatchTasks].reverse();
   const channelAny = channel as any;
   const collectionNavEnabled =
     typeof channelAny.collection_nav_enabled === 'boolean' ? channelAny.collection_nav_enabled : true;
 
-  const regularDispatchTasks = collectionNavEnabled
-    ? orderedDispatchTasks.filter((task) => !parseCollectionMeta(task.mediaAsset?.sourceMeta))
-    : orderedDispatchTasks;
+  const videos = TYPEC_READ_FROM_CATALOG_SOURCE
+    ? await (async () => {
+        const sourceRows = await (prisma as any).catalogSourceItem.findMany({
+          where: {
+            channelId,
+            ...(collectionNavEnabled ? { isCollection: false } : {}),
+          },
+          orderBy: [{ publishedAt: 'desc' }],
+          take: recentLimit,
+          select: {
+            title: true,
+            caption: true,
+            telegramMessageLink: true,
+          },
+        });
 
-  const videos = regularDispatchTasks.map((t) => {
-    const sourceMeta =
-      t.mediaAsset?.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
-        ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
-        : {};
-    const customCatalogTitle =
-      typeof sourceMeta.catalogCustomTitle === 'string' ? sourceMeta.catalogCustomTitle.trim() : '';
-    const fallbackTitle = getFileStem(t.mediaAsset?.originalName || '未命名视频');
-    const safeCaption = isAiFailureText(t.caption) ? fallbackTitle : (t.caption || '').trim();
+        if (sourceRows.length === 0) {
+          if (catalogTaskId) {
+            await prisma.catalogTask.update({
+              where: { id: catalogTaskId },
+              data: {
+                status: CatalogTaskStatus.cancelled,
+                finishedAt: new Date(),
+                errorMessage: '没有可用的目录投影记录',
+              },
+            });
+          }
+          return [] as CatalogVideo[];
+        }
 
-    let shortTitle = buildCatalogShortTitle(safeCaption, fallbackTitle);
+        return sourceRows
+          .filter((row: any) => Boolean(row.telegramMessageLink))
+          .map((row: any) => {
+            const fallbackTitle = '未命名视频';
+            const safeCaption = isAiFailureText(row.caption) ? fallbackTitle : (row.caption || '').trim();
+            const shortTitle = (row.title || buildCatalogShortTitle(safeCaption, fallbackTitle) || fallbackTitle).trim();
+            return {
+              message_url: row.telegramMessageLink || '',
+              short_title: shortTitle,
+            };
+          });
+      })()
+    : await (async () => {
+        const dispatchTasks = await prisma.dispatchTask.findMany({
+          where: { channelId, status: TaskStatus.success, telegramMessageId: { not: null } },
+          orderBy: { finishedAt: 'desc' },
+          take: recentLimit,
+          select: {
+            caption: true,
+            telegramMessageLink: true,
+            mediaAsset: {
+              select: {
+                originalName: true,
+                sourceMeta: true,
+              },
+            },
+          },
+        });
 
-    if (isAiFailureText(shortTitle)) {
-      shortTitle = fallbackTitle;
-    }
+        if (dispatchTasks.length === 0) {
+          if (catalogTaskId) {
+            await prisma.catalogTask.update({
+              where: { id: catalogTaskId },
+              data: {
+                status: CatalogTaskStatus.cancelled,
+                finishedAt: new Date(),
+                errorMessage: '没有可用的成功分发记录',
+              },
+            });
+          }
+          return [] as CatalogVideo[];
+        }
 
-    return {
-      message_url: t.telegramMessageLink || '',
-      short_title: customCatalogTitle || shortTitle,
-    };
-  });
+        const orderedDispatchTasks = [...dispatchTasks].reverse();
+        const regularDispatchTasks = collectionNavEnabled
+          ? orderedDispatchTasks.filter((task) => !parseCollectionMeta(task.mediaAsset?.sourceMeta))
+          : orderedDispatchTasks;
+
+        return regularDispatchTasks.map((t) => {
+          const sourceMeta =
+            t.mediaAsset?.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
+              ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
+              : {};
+          const customCatalogTitle =
+            typeof sourceMeta.catalogCustomTitle === 'string' ? sourceMeta.catalogCustomTitle.trim() : '';
+          const fallbackTitle = getFileStem(t.mediaAsset?.originalName || '未命名视频');
+          const safeCaption = isAiFailureText(t.caption) ? fallbackTitle : (t.caption || '').trim();
+
+          let shortTitle = buildCatalogShortTitle(safeCaption, fallbackTitle);
+
+          if (isAiFailureText(shortTitle)) {
+            shortTitle = fallbackTitle;
+          }
+
+          return {
+            message_url: t.telegramMessageLink || '',
+            short_title: customCatalogTitle || shortTitle,
+          };
+        });
+      })();
+
+  if (videos.length === 0) {
+    catalogMetrics.publishRunSkippedTotal += 1;
+    catalogMetrics.publishEmptyRunTotal += 1;
+    catalogMetrics.publishEmptyRunConsecutive += 1;
+    logger.info('[q_catalog] 跳过执行：无可用目录记录', {
+      runId,
+      channelId: channelIdRaw,
+      triggerType,
+      reason: 'no_catalog_records',
+      dataSource: TYPEC_READ_FROM_CATALOG_SOURCE ? 'catalog_source_item' : 'dispatch_task',
+    });
+    return { ok: true, skipped: true, reason: '没有可用的目录记录' };
+  }
+
+  catalogMetrics.publishEmptyRunConsecutive = 0;
 
   const dbCollectionReadProvider: CollectionCatalogReadProvider = new DbCollectionCatalogReadProvider();
   const collectionReadProvider: CollectionCatalogReadProvider =
@@ -1655,12 +1773,26 @@ export async function handleCatalogJob(
     });
 
     logger.info('[q_catalog] TypeC自愈修复统计', {
+      runId,
       channelId: channelIdRaw,
+      triggerType,
       selfHealEnabledOnRun,
       self_heal_fixed_count: selfHealFixedCount,
       self_heal_fallback_count: selfHealFallbackCount,
       self_heal_orphan_cleaned_count: selfHealOrphanCleanedCount,
     });
+
+    const groupRenderedCount = TYPEC_READ_FROM_CATALOG_SOURCE
+      ? await (prisma as any).catalogSourceItem.count({ where: { channelId, sourceType: 'group' } })
+      : 0;
+    const collectionRenderedCount = TYPEC_READ_FROM_CATALOG_SOURCE
+      ? await (prisma as any).catalogSourceItem.count({ where: { channelId, isCollection: true } })
+      : 0;
+
+    catalogMetrics.publishItemsRenderedTotal += videos.length;
+    catalogMetrics.publishGroupItemsRenderedTotal += Number(groupRenderedCount || 0);
+    catalogMetrics.publishCollectionItemsRenderedTotal += Number(collectionRenderedCount || 0);
+    catalogMetrics.publishRunSuccessTotal += 1;
 
     if (catalogTaskId) {
       await prisma.catalogTask.update({
@@ -1678,14 +1810,37 @@ export async function handleCatalogJob(
       });
     }
 
+    const runDurationMs = Date.now() - runStartedAt;
+    catalogMetrics.publishDurationMsTotal += runDurationMs;
+
+    logger.info('[q_catalog] 目录发布完成', {
+      runId,
+      channelId: channelIdRaw,
+      triggerType,
+      result: 'success',
+      dataSource: TYPEC_READ_FROM_CATALOG_SOURCE ? 'catalog_source_item' : 'dispatch_task',
+      renderedCount: videos.length,
+      groupItemCount: Number(groupRenderedCount || 0),
+      collectionItemCount: Number(collectionRenderedCount || 0),
+      pageCount: pageContents.length,
+      durationMs: runDurationMs,
+    });
+
     return {
       ok: true,
       channelId: channelIdRaw,
       messageId: finalMessageId,
       pageCount: pageContents.length,
       navPageSize,
+      runId,
+      triggerType,
+      durationMs: runDurationMs,
     };
   } catch (error) {
+    catalogMetrics.publishRunFailedTotal += 1;
+    const runDurationMs = Date.now() - runStartedAt;
+    catalogMetrics.publishDurationMsTotal += runDurationMs;
+
     if (catalogTaskId) {
       await prisma.catalogTask.update({
         where: { id: catalogTaskId },
@@ -1703,7 +1858,12 @@ export async function handleCatalogJob(
     }
 
     logError('[q_catalog] 发布频道导航失败', {
+      runId,
       channelId: channelIdRaw,
+      triggerType,
+      result: 'failed',
+      dataSource: TYPEC_READ_FROM_CATALOG_SOURCE ? 'catalog_source_item' : 'dispatch_task',
+      durationMs: runDurationMs,
       errorName: error instanceof Error ? error.name : 'UnknownError',
       errorMessage: error instanceof Error ? error.message : String(error),
       errorStack: error instanceof Error ? error.stack : null,

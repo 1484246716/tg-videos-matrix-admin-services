@@ -11,6 +11,7 @@ import { prisma, withPrismaRetry } from '../infra/prisma';
 import { searchIndexQueue } from '../infra/redis';
 import { logger, logError } from '../logger';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
+import { catalogSourceWriteMetrics } from '../shared/metrics';
 import { sendPhotoByTelegram, sendTelegramRequest, sendVideoByTelegram, TelegramError } from '../shared/telegram';
 import { classifyAndAssignForTypeB } from './typeb-category.service';
 
@@ -318,6 +319,188 @@ function buildGroupCaptionFromTasks(tasks: Array<{ mediaAsset: { sourceMeta: unk
   }
 
   return { caption: '', captionSource: 'none' as const };
+}
+
+function resolveCollectionInfoFromSourceMeta(meta: Record<string, unknown> | null | undefined) {
+  const isCollection = meta?.isCollection === true;
+  if (!isCollection) {
+    return { isCollection: false, collectionName: null as string | null, episodeNo: null as number | null };
+  }
+
+  const rawCollectionName = typeof meta?.collectionName === 'string' ? meta.collectionName.trim() : '';
+  const collectionName = rawCollectionName || null;
+
+  const episodeNo =
+    typeof meta?.episodeNo === 'number'
+      ? meta.episodeNo
+      : typeof meta?.episodeNo === 'string' && /^\d+$/.test(meta.episodeNo)
+        ? Number(meta.episodeNo)
+        : null;
+
+  return { isCollection: true, collectionName, episodeNo };
+}
+
+async function upsertCatalogSourceItemFromSingle(args: {
+  channelId: bigint;
+  dispatchTaskId: bigint;
+  telegramMessageId: number;
+  telegramMessageLink: string | null;
+  caption: string | null;
+  title: string | null;
+  sourceMeta: Record<string, unknown> | null;
+}) {
+  const startedAt = Date.now();
+  catalogSourceWriteMetrics.upsertTotal += 1;
+  catalogSourceWriteMetrics.upsertSingleTotal += 1;
+
+  try {
+    const collectionInfo = resolveCollectionInfoFromSourceMeta(args.sourceMeta);
+
+    const existing = await withPrismaRetry(
+      () =>
+        (prisma as any).catalogSourceItem.findUnique({
+          where: {
+            channelId_telegramMessageId: {
+              channelId: args.channelId,
+              telegramMessageId: BigInt(args.telegramMessageId),
+            },
+          },
+          select: { id: true },
+        }),
+      { label: 'dispatch.upsertCatalogSourceItemFromSingle.findExisting' },
+    );
+
+    await withPrismaRetry(
+      () =>
+        (prisma as any).catalogSourceItem.upsert({
+          where: {
+            channelId_telegramMessageId: {
+              channelId: args.channelId,
+              telegramMessageId: BigInt(args.telegramMessageId),
+            },
+          },
+          update: {
+            telegramMessageLink: args.telegramMessageLink,
+            sourceType: 'single',
+            title: args.title,
+            caption: args.caption,
+            isCollection: collectionInfo.isCollection,
+            collectionName: collectionInfo.collectionName,
+            episodeNo: collectionInfo.episodeNo,
+            sourceDispatchTaskId: args.dispatchTaskId,
+            publishedAt: new Date(),
+          },
+          create: {
+            channelId: args.channelId,
+            telegramMessageId: BigInt(args.telegramMessageId),
+            telegramMessageLink: args.telegramMessageLink,
+            sourceType: 'single',
+            title: args.title,
+            caption: args.caption,
+            isCollection: collectionInfo.isCollection,
+            collectionName: collectionInfo.collectionName,
+            episodeNo: collectionInfo.episodeNo,
+            sourceDispatchTaskId: args.dispatchTaskId,
+            publishedAt: new Date(),
+          },
+        }),
+      { label: 'dispatch.upsertCatalogSourceItemFromSingle' },
+    );
+
+    if (existing) {
+      catalogSourceWriteMetrics.dedupHitTotal += 1;
+    }
+
+    catalogSourceWriteMetrics.upsertSuccessTotal += 1;
+  } catch (error) {
+    catalogSourceWriteMetrics.upsertFailedTotal += 1;
+    throw error;
+  } finally {
+    catalogSourceWriteMetrics.upsertDurationMsTotal += Date.now() - startedAt;
+  }
+}
+
+async function upsertCatalogSourceItemFromGroup(args: {
+  channelId: bigint;
+  seedDispatchTaskId: bigint;
+  groupKey: string;
+  telegramMessageId: number;
+  telegramMessageLink: string | null;
+  caption: string | null;
+  title: string | null;
+  sourceMeta: Record<string, unknown> | null;
+}) {
+  const startedAt = Date.now();
+  catalogSourceWriteMetrics.upsertTotal += 1;
+  catalogSourceWriteMetrics.upsertGroupTotal += 1;
+
+  try {
+    const collectionInfo = resolveCollectionInfoFromSourceMeta(args.sourceMeta);
+
+    const existing = await withPrismaRetry(
+      () =>
+        (prisma as any).catalogSourceItem.findUnique({
+          where: {
+            channelId_telegramMessageId: {
+              channelId: args.channelId,
+              telegramMessageId: BigInt(args.telegramMessageId),
+            },
+          },
+          select: { id: true },
+        }),
+      { label: 'dispatch.upsertCatalogSourceItemFromGroup.findExisting' },
+    );
+
+    await withPrismaRetry(
+      () =>
+        (prisma as any).catalogSourceItem.upsert({
+          where: {
+            channelId_telegramMessageId: {
+              channelId: args.channelId,
+              telegramMessageId: BigInt(args.telegramMessageId),
+            },
+          },
+          update: {
+            telegramMessageLink: args.telegramMessageLink,
+            sourceType: 'group',
+            groupKey: args.groupKey,
+            title: args.title,
+            caption: args.caption,
+            isCollection: collectionInfo.isCollection,
+            collectionName: collectionInfo.collectionName,
+            episodeNo: collectionInfo.episodeNo,
+            sourceDispatchTaskId: args.seedDispatchTaskId,
+            publishedAt: new Date(),
+          },
+          create: {
+            channelId: args.channelId,
+            telegramMessageId: BigInt(args.telegramMessageId),
+            telegramMessageLink: args.telegramMessageLink,
+            sourceType: 'group',
+            groupKey: args.groupKey,
+            title: args.title,
+            caption: args.caption,
+            isCollection: collectionInfo.isCollection,
+            collectionName: collectionInfo.collectionName,
+            episodeNo: collectionInfo.episodeNo,
+            sourceDispatchTaskId: args.seedDispatchTaskId,
+            publishedAt: new Date(),
+          },
+        }),
+      { label: 'dispatch.upsertCatalogSourceItemFromGroup' },
+    );
+
+    if (existing) {
+      catalogSourceWriteMetrics.dedupHitTotal += 1;
+    }
+
+    catalogSourceWriteMetrics.upsertSuccessTotal += 1;
+  } catch (error) {
+    catalogSourceWriteMetrics.upsertFailedTotal += 1;
+    throw error;
+  } finally {
+    catalogSourceWriteMetrics.upsertDurationMsTotal += Date.now() - startedAt;
+  }
 }
 
 export async function handleDispatchGroupJob(
@@ -926,6 +1109,10 @@ export async function handleDispatchGroupJob(
 
     const firstMessageId = sendResult.messageIds?.[0] ?? sendResult.messageId;
 
+    const groupMessageLink = firstMessageId
+      ? `https://t.me/c/${seedTask.channel.tgChatId.replace('-100', '')}/${firstMessageId}`
+      : null;
+
     await withPrismaRetry(
       () =>
         prisma.$transaction([
@@ -937,9 +1124,7 @@ export async function handleDispatchGroupJob(
                 finishedAt: new Date(),
                 botId: bot.id,
                 telegramMessageId: firstMessageId ? BigInt(firstMessageId) : undefined,
-                telegramMessageLink: firstMessageId
-                  ? `https://t.me/c/${seedTask.channel.tgChatId.replace('-100', '')}/${firstMessageId}`
-                  : null,
+                telegramMessageLink: groupMessageLink,
                 telegramErrorCode: null,
                 telegramErrorMessage: null,
               },
@@ -952,6 +1137,25 @@ export async function handleDispatchGroupJob(
         ]),
       { label: 'dispatch.handleDispatchGroupJob.markGroupSuccess' },
     );
+
+    if (firstMessageId) {
+      const primaryTask = sortedGroupTasks[0];
+      const primaryMeta =
+        primaryTask?.mediaAsset?.sourceMeta && typeof primaryTask.mediaAsset.sourceMeta === 'object'
+          ? (primaryTask.mediaAsset.sourceMeta as Record<string, unknown>)
+          : null;
+
+      await upsertCatalogSourceItemFromGroup({
+        channelId: seedTask.channelId,
+        seedDispatchTaskId: seedTask.id,
+        groupKey: seedTask.groupKey,
+        telegramMessageId: firstMessageId,
+        telegramMessageLink: groupMessageLink,
+        caption: caption || null,
+        title: (caption || '').trim() || null,
+        sourceMeta: primaryMeta,
+      });
+    }
 
     logger.info('[typeb_metrics] group send success', {
       typeb_group_send_success_total: 1,
@@ -1485,6 +1689,16 @@ export async function handleDispatchJob(
         ]),
       { label: 'dispatch.handleDispatchJob.markSuccessAndUpdateChannel' },
     );
+
+    await upsertCatalogSourceItemFromSingle({
+      channelId: task.channelId,
+      dispatchTaskId,
+      telegramMessageId: sendResult.messageId,
+      telegramMessageLink: sendResult.messageLink || null,
+      caption: finalCaption || null,
+      title: (finalCaption || '').trim() || null,
+      sourceMeta: mediaSourceMeta,
+    });
 
     await prisma.dispatchTaskLog.create({
       data: {

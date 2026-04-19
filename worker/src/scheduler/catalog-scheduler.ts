@@ -1,5 +1,9 @@
 import {
   CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED,
+  TYPEC_ALERT_EMPTY_RUN_CONSECUTIVE_THRESHOLD,
+  TYPEC_ALERT_FAILED_RUN_THRESHOLD,
+  TYPEC_ALERT_MANUAL_REPAIR_QUEUE_LAG_SECONDS,
+  TYPEC_METRICS_LOG_INTERVAL_TICKS,
   TYPEC_SELF_HEAL_ENABLED,
   TYPEC_SELF_HEAL_ON_SKIP,
 } from '../config/env';
@@ -7,6 +11,7 @@ import { prisma } from '../infra/prisma';
 import { catalogQueue } from '../infra/redis';
 import { logger } from '../logger';
 import { releaseChannelLock, tryAcquireChannelLock } from '../shared/channel-lock';
+import { catalogMetrics } from '../shared/metrics';
 import { updateTaskDefinitionRunStatus } from '../services/task-definition.service';
 
 function computeCatalogNextAllowedAt(args: {
@@ -19,6 +24,7 @@ function computeCatalogNextAllowedAt(args: {
 }
 
 export async function scheduleDueCatalogTasks() {
+  catalogMetrics.tickTotal += 1;
   const now = new Date();
 
   const channels = await prisma.channel.findMany({
@@ -113,6 +119,44 @@ export async function scheduleDueCatalogTasks() {
 
   if (queuedCount > 0) {
     logger.info('[scheduler] 已入队频道导航任务', { count: queuedCount });
+  }
+
+  if (catalogMetrics.tickTotal % TYPEC_METRICS_LOG_INTERVAL_TICKS === 0) {
+    const publishRuns = catalogMetrics.publishRunSuccessTotal + catalogMetrics.publishRunFailedTotal;
+    const avgDurationMs =
+      publishRuns > 0 ? Math.round(catalogMetrics.publishDurationMsTotal / publishRuns) : 0;
+
+    logger.info('typec_metrics', {
+      tag: 'typec_metrics',
+      message: 'TypeC 目录链路指标快照',
+      ...catalogMetrics,
+      avgDurationMs,
+      alertThresholds: {
+        emptyRunConsecutive: TYPEC_ALERT_EMPTY_RUN_CONSECUTIVE_THRESHOLD,
+        failedRun: TYPEC_ALERT_FAILED_RUN_THRESHOLD,
+        manualRepairQueueLagSeconds: TYPEC_ALERT_MANUAL_REPAIR_QUEUE_LAG_SECONDS,
+      },
+    });
+  }
+
+  if (catalogMetrics.publishEmptyRunConsecutive >= TYPEC_ALERT_EMPTY_RUN_CONSECUTIVE_THRESHOLD) {
+    logger.error('typec_alert_empty_run_consecutive', {
+      tag: 'typec_alert_empty_run_consecutive',
+      message: 'TypeC 连续空目录发布告警',
+      consecutive: catalogMetrics.publishEmptyRunConsecutive,
+      threshold: TYPEC_ALERT_EMPTY_RUN_CONSECUTIVE_THRESHOLD,
+      suggestion: '请检查 catalog_source_item 是否有数据写入，以及读源开关是否正确。',
+    });
+  }
+
+  if (catalogMetrics.publishRunFailedTotal >= TYPEC_ALERT_FAILED_RUN_THRESHOLD) {
+    logger.error('typec_alert_failed_run_spike', {
+      tag: 'typec_alert_failed_run_spike',
+      message: 'TypeC 发布失败次数达到告警阈值',
+      failedTotal: catalogMetrics.publishRunFailedTotal,
+      threshold: TYPEC_ALERT_FAILED_RUN_THRESHOLD,
+      suggestion: '请检查 worker 错误日志与 Telegram API 可用性。',
+    });
   }
 }
 

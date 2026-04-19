@@ -244,10 +244,17 @@ function resolveFileExtensionByMime(mimeType?: string | null) {
   return '.bin';
 }
 
-function resolveMediaBaseName(channelUsername: string, messageId: bigint, mimeType?: string | null) {
-  const channelBase = channelUsername.replace(/^@/, '');
-  const stem = sanitizeFileName(`${channelBase}-${messageId.toString()}`) || 'media';
-  return `${stem}${resolveFileExtensionByMime(mimeType)}`;
+function resolveMediaBaseName(params: {
+  channelUsername: string;
+  messageId: bigint;
+  mimeType?: string | null;
+  mediaType: 'image' | 'video';
+  mediaIndex: number;
+}) {
+  const ext = resolveFileExtensionByMime(params.mimeType);
+  const channelBase = params.channelUsername.replace(/^@/, '');
+  const fallbackStem = sanitizeFileName(`${channelBase}-${params.messageId.toString()}`) || 'media';
+  return `${fallbackStem}-${params.mediaType}${Math.max(1, params.mediaIndex)}${ext}`;
 }
 
 function resolveGroupDirName(groupedId: string | undefined, messageId: bigint) {
@@ -257,6 +264,26 @@ function resolveGroupDirName(groupedId: string | undefined, messageId: bigint) {
 
 function resolveGroupedTargetPath(baseTargetPath: string, groupedId: string | undefined, messageId: bigint) {
   return path.join(baseTargetPath, resolveGroupDirName(groupedId, messageId));
+}
+
+function inferCloneItemMediaKind(item: {
+  hasVideo: boolean;
+  mimeType?: string | null;
+  localPath?: string | null;
+}) {
+  if (item.hasVideo) return 'video' as const;
+
+  const mime = String(item.mimeType ?? '').toLowerCase();
+  if (mime.startsWith('image/')) return 'image' as const;
+  if (mime.startsWith('video/')) return 'video' as const;
+
+  const pathLike = String(item.localPath ?? '').toLowerCase();
+  if (!pathLike) return null;
+
+  if (/(\.mp4|\.mov|\.mkv|\.webm)$/.test(pathLike)) return 'video' as const;
+  if (/(\.jpg|\.jpeg|\.png|\.webp)$/.test(pathLike)) return 'image' as const;
+
+  return null;
 }
 
 async function persistMessageText(params: {
@@ -271,9 +298,7 @@ async function persistMessageText(params: {
 
   await mkdir(params.targetPath, { recursive: true });
 
-  const mediaName = resolveMediaBaseName(params.channelUsername, params.messageId, params.mimeType);
-  const stem = mediaName.replace(/\.[^.]+$/i, '');
-  const txtPath = path.join(params.targetPath, `${stem}.txt`);
+  const txtPath = path.join(params.targetPath, 'message.txt');
   await writeFile(txtPath, content, 'utf8');
 }
 
@@ -451,6 +476,7 @@ async function upsertIndexedItems(params: {
   let deduped = 0;
   let queuedDownloads = 0;
   let maxMessageId: bigint | undefined;
+  const groupMediaIndex = new Map<string, { image: number; video: number }>();
 
   for (const row of params.items) {
     if (!maxMessageId || row.messageId > maxMessageId) maxMessageId = row.messageId;
@@ -505,6 +531,17 @@ async function upsertIndexedItems(params: {
     }
 
     if (params.crawlMode === 'index_and_download' && isDownloadableMedia) {
+      const groupCounter = groupMediaIndex.get(row.groupKey) ?? { image: 0, video: 0 };
+      const mediaType: 'image' | 'video' = row.hasVideo ? 'video' : 'image';
+      if (mediaType === 'video') {
+        groupCounter.video += 1;
+      } else {
+        groupCounter.image += 1;
+      }
+      groupMediaIndex.set(row.groupKey, groupCounter);
+
+      const mediaIndex = mediaType === 'video' ? groupCounter.video : groupCounter.image;
+
       const downloadJob = {
         taskId: params.taskId.toString(),
         runId: params.runId.toString(),
@@ -521,7 +558,13 @@ async function upsertIndexedItems(params: {
         expectedMimeType: row.mimeType,
         groupedId: row.groupedId,
         groupKey: row.groupKey,
-        expectedFileName: resolveMediaBaseName(params.channelUsername, row.messageId, row.mimeType),
+        expectedFileName: resolveMediaBaseName({
+          channelUsername: params.channelUsername,
+          messageId: row.messageId,
+          mimeType: row.mimeType,
+          mediaType,
+          mediaIndex,
+        }),
         targetPath: groupedTargetPath,
         priority:
           row.fileSize && row.fileSize > BigInt(1024 * 1024 * 1024)
@@ -594,6 +637,108 @@ async function upsertIndexedItems(params: {
   });
 
   return { inserted, deduped, queuedDownloads, maxMessageId };
+}
+
+async function writeGroupSourceExpectedCountFromCrawl(params: {
+  taskId: bigint;
+  channelId: bigint;
+  channelUsername: string;
+}) {
+  const dbChannelUsername = toDbChannelUsername(normalizeChannelUsername(params.channelUsername));
+
+  const groupedItems = await prisma.cloneCrawlItem.findMany({
+    where: {
+      taskId: params.taskId,
+      channelUsername: dbChannelUsername,
+      groupKey: { not: null },
+    },
+    select: {
+      groupKey: true,
+      groupedId: true,
+      hasVideo: true,
+      mimeType: true,
+      localPath: true,
+    },
+  });
+
+  const groupedCounter = new Map<string, { total: number; video: number; image: number; groupedId: string | null }>();
+
+  for (const item of groupedItems) {
+    const groupKey = item.groupKey?.trim();
+    if (!groupKey) continue;
+
+    const mediaKind = inferCloneItemMediaKind(item);
+    if (!mediaKind) continue;
+
+    const bucket = groupedCounter.get(groupKey) ?? {
+      total: 0,
+      video: 0,
+      image: 0,
+      groupedId: item.groupedId ?? null,
+    };
+
+    bucket.total += 1;
+    if (mediaKind === 'video') bucket.video += 1;
+    else bucket.image += 1;
+
+    if (!bucket.groupedId && item.groupedId) bucket.groupedId = item.groupedId;
+    groupedCounter.set(groupKey, bucket);
+  }
+
+  for (const [groupKey, stat] of groupedCounter) {
+    const latestGroupTask = await (prisma as any).dispatchGroupTask.findFirst({
+      where: {
+        channelId: params.channelId,
+        groupKey,
+      },
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+      select: {
+        id: true,
+        sourceExpectedCount: true,
+      },
+    });
+
+    if (!latestGroupTask?.id) {
+      logger.info('【爬虫分组计数】统计完成但未找到可写入组任务，等待调度创建后补写', {
+        频道ID: params.channelId.toString(),
+        组键: groupKey,
+        分组ID: stat.groupedId,
+        统计视频数: stat.video,
+        统计图片数: stat.image,
+        统计媒体总数: stat.total,
+        写入策略: 'GREATEST',
+      });
+      continue;
+    }
+
+    const oldValue = Number(latestGroupTask.sourceExpectedCount ?? 0);
+    const newValue = Math.max(oldValue, stat.total);
+
+    const updated = await (prisma as any).dispatchGroupTask.update({
+      where: { id: latestGroupTask.id },
+      data: {
+        sourceExpectedCount: newValue,
+      },
+      select: {
+        id: true,
+        sourceExpectedCount: true,
+      },
+    });
+
+    logger.info('【爬虫分组计数】统计完成并写入 sourceExpectedCount', {
+      频道ID: params.channelId.toString(),
+      组键: groupKey,
+      分组ID: stat.groupedId,
+      统计视频数: stat.video,
+      统计图片数: stat.image,
+      统计媒体总数: stat.total,
+      原值: oldValue,
+      新值: Number(updated.sourceExpectedCount ?? 0),
+      写入策略: 'GREATEST',
+      是否更新: Number(updated.sourceExpectedCount ?? 0) !== oldValue,
+      dispatchGroupTaskId: updated.id.toString(),
+    });
+  }
 }
 
 export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
@@ -684,6 +829,28 @@ export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
           lastErrorCode: null,
           lastErrorMessage: null,
         },
+      });
+    }
+
+    const mappedChannel = await prisma.channel.findFirst({
+      where: {
+        folderPath: task.targetPath,
+      },
+      select: { id: true, folderPath: true, tgUsername: true },
+    });
+
+    if (mappedChannel?.id) {
+      await writeGroupSourceExpectedCountFromCrawl({
+        taskId,
+        channelId: mappedChannel.id,
+        channelUsername,
+      });
+    } else {
+      logger.warn('【爬虫分组计数】未匹配到业务频道，跳过 sourceExpectedCount 写入', {
+        taskId: job.taskId,
+        runId: job.runId,
+        channelUsername,
+        taskTargetPath: task.targetPath,
       });
     }
 

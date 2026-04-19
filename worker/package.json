@@ -8,6 +8,8 @@
     "dev": "pnpm run prisma:generate:safe && ts-node-dev --respawn --transpile-only src/main.ts",
     "build": "pnpm run prisma:generate && tsc -p tsconfig.json",
     "start": "pnpm run prisma:generate && node dist/main.js",
+    "backfill:catalog-source": "pnpm run prisma:generate:safe && ts-node-dev --transpile-only src/scripts/catalog-source-backfill.ts",
+    "reconcile:catalog-source": "pnpm run prisma:generate:safe && ts-node-dev --transpile-only src/scripts/catalog-source-reconcile-sample.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "echo \"lint placeholder\"",

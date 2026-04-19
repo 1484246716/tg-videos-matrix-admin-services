@@ -132,6 +132,7 @@ model Channel {
   last_collection_nav_update_at     DateTime?        @db.Timestamptz(6)
   catalogHistories                  CatalogHistory[]
   catalogTasks                      CatalogTask[]
+  catalogSourceItems                CatalogSourceItem[]
   aiModelProfile                    AiModelProfile?  @relation(fields: [aiModelProfileId], references: [id])
   catalogTemplate                   CatalogTemplate? @relation(fields: [catalogTemplateId], references: [id])
   createdByUser                     User?            @relation(fields: [createdBy], references: [id])
@@ -381,6 +382,31 @@ model CatalogHistory {
   @@map("catalog_histories")
 }
 
+model CatalogSourceItem {
+  id                   BigInt                @id @default(autoincrement())
+  channelId            BigInt                @map("channel_id")
+  telegramMessageId    BigInt                @map("telegram_message_id")
+  telegramMessageLink  String?               @map("telegram_message_link") @db.VarChar(255)
+  sourceType           CatalogSourceItemType @map("source_type")
+  groupKey             String?               @map("group_key") @db.VarChar(128)
+  title                String?               @db.VarChar(255)
+  caption              String?
+  isCollection         Boolean               @default(false) @map("is_collection")
+  collectionName       String?               @map("collection_name") @db.VarChar(128)
+  episodeNo            Int?                  @map("episode_no")
+  publishedAt          DateTime              @default(now()) @map("published_at") @db.Timestamptz(6)
+  sourceDispatchTaskId BigInt?               @map("source_dispatch_task_id")
+  createdAt            DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
+  channel              Channel               @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, telegramMessageId])
+  @@index([channelId, publishedAt(sort: Desc)])
+  @@index([channelId, isCollection, collectionName, episodeNo])
+  @@index([channelId, sourceType, publishedAt(sort: Desc)])
+  @@map("catalog_source_item")
+}
+
 model CollectionSnapshot {
   id                       BigInt   @id @default(autoincrement())
   channelId                BigInt   @map("channel_id")
@@ -608,6 +634,11 @@ enum CatalogTaskStatus {
   success
   failed
   cancelled
+}
+
+enum CatalogSourceItemType {
+  single
+  group
 }
 
 enum RiskLevel {
