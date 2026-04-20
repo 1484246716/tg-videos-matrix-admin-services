@@ -353,23 +353,77 @@ function buildGroupCaptionFromTasks(tasks: Array<{ mediaAsset: { sourceMeta: unk
   return { caption: '', captionSource: 'none' as const };
 }
 
-function resolveCollectionInfoFromSourceMeta(meta: Record<string, unknown> | null | undefined) {
-  const isCollection = meta?.isCollection === true;
-  if (!isCollection) {
-    return { isCollection: false, collectionName: null as string | null, episodeNo: null as number | null };
+function getSourceMetaObject(sourceMeta: unknown) {
+  return sourceMeta && typeof sourceMeta === 'object' ? (sourceMeta as Record<string, unknown>) : null;
+}
+
+function parseCollectionSourceMeta(sourceMeta: unknown) {
+  const meta = getSourceMetaObject(sourceMeta);
+  if (meta?.isCollection !== true) {
+    return { isCollection: false as const, collectionName: null, episodeNo: null };
   }
 
-  const rawCollectionName = typeof meta?.collectionName === 'string' ? meta.collectionName.trim() : '';
-  const collectionName = rawCollectionName || null;
-
+  const collectionName = typeof meta.collectionName === 'string' ? meta.collectionName.trim() : '';
   const episodeNo =
-    typeof meta?.episodeNo === 'number'
+    typeof meta.episodeNo === 'number'
       ? meta.episodeNo
-      : typeof meta?.episodeNo === 'string' && /^\d+$/.test(meta.episodeNo)
+      : typeof meta.episodeNo === 'string' && /^\d+$/.test(meta.episodeNo)
         ? Number(meta.episodeNo)
         : null;
 
-  return { isCollection: true, collectionName, episodeNo };
+  return {
+    isCollection: true as const,
+    collectionName: collectionName || null,
+    episodeNo,
+  };
+}
+
+async function deleteCatalogSourceItemFromSingle(args: {
+  channelId: bigint;
+  telegramMessageId: number;
+}) {
+  const deleted = await withPrismaRetry(
+    () =>
+      (prisma as any).catalogSourceItem.deleteMany({
+        where: {
+          channelId: args.channelId,
+          telegramMessageId: BigInt(args.telegramMessageId),
+        },
+      }),
+    { label: 'dispatch.deleteCatalogSourceItemFromSingle' },
+  );
+
+  const deletedCount = Number(deleted?.count || 0);
+  if (deletedCount > 0) {
+    catalogSourceWriteMetrics.deletedCollectionTotal += deletedCount;
+  }
+  return deletedCount;
+}
+
+async function deleteCatalogSourceItemFromGroup(args: {
+  channelId: bigint;
+  groupKey: string;
+  telegramMessageId: number | null;
+}) {
+  const deleted = await withPrismaRetry(
+    () =>
+      (prisma as any).catalogSourceItem.deleteMany({
+        where: {
+          channelId: args.channelId,
+          OR: [
+            { groupKey: args.groupKey },
+            ...(args.telegramMessageId ? [{ telegramMessageId: BigInt(args.telegramMessageId) }] : []),
+          ],
+        },
+      }),
+    { label: 'dispatch.deleteCatalogSourceItemFromGroup' },
+  );
+
+  const deletedCount = Number(deleted?.count || 0);
+  if (deletedCount > 0) {
+    catalogSourceWriteMetrics.deletedCollectionTotal += deletedCount;
+  }
+  return deletedCount;
 }
 
 async function upsertCatalogSourceItemFromSingle(args: {
@@ -379,15 +433,12 @@ async function upsertCatalogSourceItemFromSingle(args: {
   telegramMessageLink: string | null;
   caption: string | null;
   title: string | null;
-  sourceMeta: Record<string, unknown> | null;
 }) {
   const startedAt = Date.now();
   catalogSourceWriteMetrics.upsertTotal += 1;
   catalogSourceWriteMetrics.upsertSingleTotal += 1;
 
   try {
-    const collectionInfo = resolveCollectionInfoFromSourceMeta(args.sourceMeta);
-
     const existing = await withPrismaRetry(
       () =>
         (prisma as any).catalogSourceItem.findUnique({
@@ -416,9 +467,6 @@ async function upsertCatalogSourceItemFromSingle(args: {
             sourceType: 'single',
             title: args.title,
             caption: args.caption,
-            isCollection: collectionInfo.isCollection,
-            collectionName: collectionInfo.collectionName,
-            episodeNo: collectionInfo.episodeNo,
             sourceDispatchTaskId: args.dispatchTaskId,
             publishedAt: new Date(),
           },
@@ -429,9 +477,6 @@ async function upsertCatalogSourceItemFromSingle(args: {
             sourceType: 'single',
             title: args.title,
             caption: args.caption,
-            isCollection: collectionInfo.isCollection,
-            collectionName: collectionInfo.collectionName,
-            episodeNo: collectionInfo.episodeNo,
             sourceDispatchTaskId: args.dispatchTaskId,
             publishedAt: new Date(),
           },
@@ -460,15 +505,12 @@ async function upsertCatalogSourceItemFromGroup(args: {
   telegramMessageLink: string | null;
   caption: string | null;
   title: string | null;
-  sourceMeta: Record<string, unknown> | null;
 }) {
   const startedAt = Date.now();
   catalogSourceWriteMetrics.upsertTotal += 1;
   catalogSourceWriteMetrics.upsertGroupTotal += 1;
 
   try {
-    const collectionInfo = resolveCollectionInfoFromSourceMeta(args.sourceMeta);
-
     const existing = await withPrismaRetry(
       () =>
         (prisma as any).catalogSourceItem.findUnique({
@@ -498,9 +540,6 @@ async function upsertCatalogSourceItemFromGroup(args: {
             groupKey: args.groupKey,
             title: args.title,
             caption: args.caption,
-            isCollection: collectionInfo.isCollection,
-            collectionName: collectionInfo.collectionName,
-            episodeNo: collectionInfo.episodeNo,
             sourceDispatchTaskId: args.seedDispatchTaskId,
             publishedAt: new Date(),
           },
@@ -512,9 +551,6 @@ async function upsertCatalogSourceItemFromGroup(args: {
             groupKey: args.groupKey,
             title: args.title,
             caption: args.caption,
-            isCollection: collectionInfo.isCollection,
-            collectionName: collectionInfo.collectionName,
-            episodeNo: collectionInfo.episodeNo,
             sourceDispatchTaskId: args.seedDispatchTaskId,
             publishedAt: new Date(),
           },
@@ -1170,13 +1206,25 @@ export async function handleDispatchGroupJob(
       { label: 'dispatch.handleDispatchGroupJob.markGroupSuccess' },
     );
 
-    if (firstMessageId) {
-      const primaryTask = sortedGroupTasks[0];
-      const primaryMeta =
-        primaryTask?.mediaAsset?.sourceMeta && typeof primaryTask.mediaAsset.sourceMeta === 'object'
-          ? (primaryTask.mediaAsset.sourceMeta as Record<string, unknown>)
-          : null;
+    const hasCollectionSource = sortedGroupTasks.some(
+      (task) => parseCollectionSourceMeta(task.mediaAsset?.sourceMeta).isCollection,
+    );
 
+    if (firstMessageId && hasCollectionSource) {
+      const deletedCount = await deleteCatalogSourceItemFromGroup({
+        channelId: seedTask.channelId,
+        groupKey: seedTask.groupKey,
+        telegramMessageId: firstMessageId,
+      });
+      catalogSourceWriteMetrics.skippedCollectionTotal += 1;
+      logger.info('[catalog_source_item] skip collection group projection', {
+        dispatchTaskId: dispatchTaskIdRaw,
+        channelId: seedTask.channelId.toString(),
+        groupKey: seedTask.groupKey,
+        telegramMessageId: String(firstMessageId),
+        deletedCount,
+      });
+    } else if (firstMessageId) {
       await upsertCatalogSourceItemFromGroup({
         channelId: seedTask.channelId,
         seedDispatchTaskId: seedTask.id,
@@ -1185,7 +1233,6 @@ export async function handleDispatchGroupJob(
         telegramMessageLink: groupMessageLink,
         caption: caption || null,
         title: extractCatalogShortTitle(caption),
-        sourceMeta: primaryMeta,
       });
     }
 
@@ -1423,14 +1470,10 @@ export async function handleDispatchJob(
         ? `视频实测时长约 ${Math.floor(task.mediaAsset.durationSec / 60)} 分 ${task.mediaAsset.durationSec % 60} 秒（请据此填写“单集片长”，不要瞎编）`
         : '未探测到可靠视频时长（“单集片长”请谨慎表述为未知或约略，不要乱填具体分钟数）';
 
-    const isCollectionAsset = mediaSourceMeta?.isCollection === true;
-    const collectionName = typeof mediaSourceMeta?.collectionName === 'string' ? mediaSourceMeta.collectionName.trim() : '';
-    const episodeNo =
-      typeof mediaSourceMeta?.episodeNo === 'number'
-        ? mediaSourceMeta.episodeNo
-        : typeof mediaSourceMeta?.episodeNo === 'string' && /^\d+$/.test(mediaSourceMeta.episodeNo)
-          ? Number(mediaSourceMeta.episodeNo)
-          : null;
+    const collectionMeta = parseCollectionSourceMeta(mediaSourceMeta);
+    const isCollectionAsset = collectionMeta.isCollection;
+    const collectionName = collectionMeta.collectionName ?? '';
+    const episodeNo = collectionMeta.episodeNo;
 
     const enhancedCollectionVideoName =
       isCollectionAsset && collectionName && episodeNo !== null
@@ -1722,15 +1765,31 @@ export async function handleDispatchJob(
       { label: 'dispatch.handleDispatchJob.markSuccessAndUpdateChannel' },
     );
 
-    await upsertCatalogSourceItemFromSingle({
-      channelId: task.channelId,
-      dispatchTaskId,
-      telegramMessageId: sendResult.messageId,
-      telegramMessageLink: sendResult.messageLink || null,
-      caption: finalCaption || null,
-      title: extractCatalogShortTitle(finalCaption),
-      sourceMeta: mediaSourceMeta,
-    });
+    if (isCollectionAsset) {
+      const deletedCount = await deleteCatalogSourceItemFromSingle({
+        channelId: task.channelId,
+        telegramMessageId: sendResult.messageId,
+      });
+      catalogSourceWriteMetrics.skippedCollectionTotal += 1;
+      logger.info('[catalog_source_item] skip collection single projection', {
+        dispatchTaskId: dispatchTaskIdRaw,
+        channelId: task.channelId.toString(),
+        mediaAssetId: task.mediaAsset.id.toString(),
+        telegramMessageId: String(sendResult.messageId),
+        collectionName,
+        episodeNo,
+        deletedCount,
+      });
+    } else {
+      await upsertCatalogSourceItemFromSingle({
+        channelId: task.channelId,
+        dispatchTaskId,
+        telegramMessageId: sendResult.messageId,
+        telegramMessageLink: sendResult.messageLink || null,
+        caption: finalCaption || null,
+        title: extractCatalogShortTitle(finalCaption),
+      });
+    }
 
     await prisma.dispatchTaskLog.create({
       data: {

@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { mkdir, readdir, rename, stat, unlink } from 'node:fs/promises';
+import { mkdir, readdir, rename, stat, unlink, open } from 'node:fs/promises';
 import { basename, dirname, extname, join, normalize, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -315,15 +315,46 @@ export async function waitForFileStable(filePath: string) {
   });
 }
 
+/**
+ * 局部采样快速哈希算法 (用于大文件秒传去重)
+ * 相比于全量读取几十上百兆的视频做 Hash (会导致 CPU 打满并阻塞长达几十分钟)，
+ * 我们通过混合文件大小，并只抽样读取视频的头部、中部和尾部各 1MB 进行 Hash。
+ * 由于只有在视频文件写入完成后才会调用本函数，所以计算结果稳定可靠，且耗时降至几十毫秒级别。
+ */
 export async function hashFile(filePath: string): Promise<string> {
-  return new Promise((resolveHash, reject) => {
+  const CHUNK_SIZE = 1024 * 1024; // 抽取 1MB 块
+  const handle = await open(filePath, 'r');
+  
+  try {
+    const fileStat = await handle.stat();
+    const fileSize = fileStat.size;
     const hash = createHash('sha256');
-    const stream = createReadStream(filePath);
+    
+    // 1. 混合文件大小作为盐值，避免同 Hash 冲突
+    hash.update(fileSize.toString());
 
-    stream.on('data', (chunk) => hash.update(chunk));
-    stream.on('end', () => resolveHash(hash.digest('hex')));
-    stream.on('error', reject);
-  });
+    if (fileSize <= CHUNK_SIZE * 3) {
+      // 如果文件很小 (比如小于 3MB)，直接全量读
+      const buf = await handle.readFile();
+      hash.update(buf);
+    } else {
+      // 对于大文件，抽取：头部1M，中部1M，尾部1M
+      const chunks = [
+        { start: 0, length: CHUNK_SIZE },
+        { start: Math.floor(fileSize / 2), length: CHUNK_SIZE },
+        { start: fileSize - CHUNK_SIZE, length: CHUNK_SIZE }
+      ];
+
+      for (const { start, length } of chunks) {
+        const buf = Buffer.alloc(length);
+        await handle.read(buf, 0, length, start);
+        hash.update(buf);
+      }
+    }
+    return hash.digest('hex');
+  } finally {
+    await handle.close();
+  }
 }
 
 export function normalizeRelayPath(filePath: string): string {

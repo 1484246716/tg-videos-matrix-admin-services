@@ -38,6 +38,37 @@ const INGEST_STUCK_FORCE_DELETE_GRACE_MS = Number(
   process.env.TYPEA_INGEST_STALE_MS || '1800000',
 );
 
+type GroupLifecycleStatus = 'running' | 'success' | 'failed' | 'partial_failed';
+
+type GroupDispatchAggregate = {
+  total: number;
+  success: number;
+  running: number;
+  failed: number;
+};
+
+function resolveGroupLifecycleStatus(args: {
+  taskStatus?: string | null;
+  aggregate: GroupDispatchAggregate;
+}): GroupLifecycleStatus {
+  const taskStatus = (args.taskStatus || '').toLowerCase();
+  if (taskStatus === 'success') return 'success';
+  if (taskStatus === 'failed' || taskStatus === 'dead' || taskStatus === 'cancelled') {
+    return args.aggregate.success > 0 ? 'partial_failed' : 'failed';
+  }
+  if (taskStatus === 'running' || taskStatus === 'pending' || taskStatus === 'scheduled') {
+    return 'running';
+  }
+
+  const { total, success, running, failed } = args.aggregate;
+  if (total > 0 && success === total) return 'success';
+  if (success > 0 && failed > 0) return 'partial_failed';
+  if (running > 0) return 'running';
+  if (failed > 0 && success === 0) return 'failed';
+  if (success > 0 && success < total) return 'running';
+  return 'running';
+}
+
 async function removeFileIfExists(filePath?: string | null) {
   if (!filePath) return { deleted: false, reason: 'empty_path' };
 
@@ -60,7 +91,7 @@ async function removeFileIfExists(filePath?: string | null) {
 
 @Injectable()
 export class MediaLifecycleService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly prisma: PrismaService) { }
 
   async list(params: {
     channelId?: string;
@@ -82,29 +113,29 @@ export class MediaLifecycleService {
       channelId: params.channelId ? BigInt(params.channelId) : undefined,
       ...(tfid
         ? {
-            OR: [
-              {
-                telegramFileId: {
-                  contains: tfid,
-                  mode: 'insensitive' as const,
-                },
+          OR: [
+            {
+              telegramFileId: {
+                contains: tfid,
+                mode: 'insensitive' as const,
               },
-              {
-                telegramFileUniqueId: {
-                  contains: tfid,
-                  mode: 'insensitive' as const,
-                },
+            },
+            {
+              telegramFileUniqueId: {
+                contains: tfid,
+                mode: 'insensitive' as const,
               },
-            ],
-          }
+            },
+          ],
+        }
         : {}),
       ...(normalizedMediaType === 'collection'
         ? {
-            sourceMeta: {
-              path: ['isCollection'],
-              equals: true,
-            },
-          }
+          sourceMeta: {
+            path: ['isCollection'],
+            equals: true,
+          },
+        }
         : {}),
       originalName: params.keyword ? { contains: params.keyword, mode: 'insensitive' as const } : undefined,
       status: stageFilter?.mediaStatus ? stageFilter.mediaStatus : undefined,
@@ -112,8 +143,8 @@ export class MediaLifecycleService {
         params.role === 'admin'
           ? undefined
           : {
-              createdBy: params.userId ? BigInt(params.userId) : undefined,
-            },
+            createdBy: params.userId ? BigInt(params.userId) : undefined,
+          },
     };
 
     const usePagination = Number.isFinite(params.page) || Number.isFinite(params.pageSize);
@@ -146,6 +177,46 @@ export class MediaLifecycleService {
       })
       : [];
 
+    const groupKeySet = new Set<string>();
+    const groupKeyChannelMap = new Map<string, bigint>();
+    for (const task of dispatchTasks) {
+      if (!task.groupKey) continue;
+      const composite = `${task.channelId.toString()}:${task.groupKey}`;
+      groupKeySet.add(composite);
+      if (!groupKeyChannelMap.has(composite)) {
+        groupKeyChannelMap.set(composite, task.channelId);
+      }
+    }
+
+    const groupTaskWhere = Array.from(groupKeySet).map((composite) => {
+      const splitAt = composite.indexOf(':');
+      const groupKey = splitAt >= 0 ? composite.slice(splitAt + 1) : composite;
+      return {
+        channelId: groupKeyChannelMap.get(composite)!,
+        groupKey,
+      };
+    });
+
+    const dispatchGroupTasks = groupTaskWhere.length
+      ? await this.prisma.dispatchGroupTask.findMany({
+        where: {
+          OR: groupTaskWhere,
+        },
+        select: {
+          channelId: true,
+          groupKey: true,
+          status: true,
+          expectedMediaCount: true,
+          actualReadyCount: true,
+          actualUploadedCount: true,
+        },
+      })
+      : [];
+
+    const dispatchGroupTaskMap = new Map<string, (typeof dispatchGroupTasks)[number]>();
+    for (const groupTask of dispatchGroupTasks) {
+      dispatchGroupTaskMap.set(`${groupTask.channelId.toString()}:${groupTask.groupKey}`, groupTask);
+    }
 
     const dispatchMap = new Map<string, typeof dispatchTasks>();
     dispatchTasks.forEach((task) => {
@@ -165,6 +236,44 @@ export class MediaLifecycleService {
           : {};
       const isCollection = sourceMeta.isCollection === true;
 
+      const groupKey = latestDispatch?.groupKey || null;
+      let groupStatus: GroupLifecycleStatus | null = null;
+      let groupProgress: { success: number; total: number } | null = null;
+
+      if (groupKey) {
+        const groupDispatches = dispatchTasks.filter(
+          (task) => task.channelId === asset.channelId && task.groupKey === groupKey,
+        );
+
+        const aggregate: GroupDispatchAggregate = groupDispatches.reduce(
+          (acc, task) => {
+            acc.total += 1;
+            if (task.status === 'success') {
+              acc.success += 1;
+            } else if (task.status === 'failed' || task.status === 'dead' || task.status === 'cancelled') {
+              acc.failed += 1;
+            } else {
+              acc.running += 1;
+            }
+            return acc;
+          },
+          { total: 0, success: 0, running: 0, failed: 0 },
+        );
+
+        const groupTask = dispatchGroupTaskMap.get(`${asset.channelId.toString()}:${groupKey}`) ?? null;
+        groupStatus = resolveGroupLifecycleStatus({
+          taskStatus: groupTask?.status ?? null,
+          aggregate,
+        });
+
+        const expected = Number(groupTask?.expectedMediaCount ?? 0);
+        const total = expected > 0 ? expected : aggregate.total;
+        groupProgress = {
+          success: aggregate.success,
+          total,
+        };
+      }
+
       return {
         id: asset.id.toString(),
         originalName: asset.originalName,
@@ -183,12 +292,15 @@ export class MediaLifecycleService {
         ingestDurationSec: asset.ingestDurationSec,
         latestDispatch: latestDispatch
           ? {
-              id: latestDispatch.id.toString(),
-              status: latestDispatch.status,
-              channelName: (latestDispatch as any).channel?.name ?? null,
-              telegramMessageLink: latestDispatch.telegramMessageLink,
-              telegramErrorMessage: latestDispatch.telegramErrorMessage,
-            }
+            id: latestDispatch.id.toString(),
+            status: latestDispatch.status,
+            channelName: (latestDispatch as any).channel?.name ?? null,
+            telegramMessageLink: latestDispatch.telegramMessageLink,
+            telegramErrorMessage: latestDispatch.telegramErrorMessage,
+            groupKey,
+            groupStatus,
+            groupProgress,
+          }
           : null,
         mediaType: isCollection ? 'collection' : 'normal',
         collectionName:
@@ -197,8 +309,8 @@ export class MediaLifecycleService {
             : null,
         episodeNo:
           isCollection &&
-          (typeof sourceMeta.episodeNo === 'number' ||
-            (typeof sourceMeta.episodeNo === 'string' && /^\d+$/.test(sourceMeta.episodeNo)))
+            (typeof sourceMeta.episodeNo === 'number' ||
+              (typeof sourceMeta.episodeNo === 'string' && /^\d+$/.test(sourceMeta.episodeNo)))
             ? Number(sourceMeta.episodeNo)
             : null,
         ingestErrorCode:
@@ -295,8 +407,8 @@ export class MediaLifecycleService {
           role === 'admin'
             ? undefined
             : {
-                createdBy: userId ? BigInt(userId) : undefined,
-              },
+              createdBy: userId ? BigInt(userId) : undefined,
+            },
       },
       include: { channel: { select: { id: true, name: true } } },
     });
@@ -374,8 +486,8 @@ export class MediaLifecycleService {
           role === 'admin'
             ? undefined
             : {
-                createdBy: userId ? BigInt(userId) : undefined,
-              },
+              createdBy: userId ? BigInt(userId) : undefined,
+            },
       },
       select: { id: true, status: true, updatedAt: true, ingestError: true },
     });
@@ -414,8 +526,8 @@ export class MediaLifecycleService {
           role === 'admin'
             ? undefined
             : {
-                createdBy: userId ? BigInt(userId) : undefined,
-              },
+              createdBy: userId ? BigInt(userId) : undefined,
+            },
       },
       select: { id: true, status: true, updatedAt: true },
     });
@@ -468,8 +580,8 @@ export class MediaLifecycleService {
           role === 'admin'
             ? undefined
             : {
-                createdBy: userId ? BigInt(userId) : undefined,
-              },
+              createdBy: userId ? BigInt(userId) : undefined,
+            },
       },
       select: {
         id: true,
@@ -515,8 +627,8 @@ export class MediaLifecycleService {
           role === 'admin'
             ? undefined
             : {
-                createdBy: userId ? BigInt(userId) : undefined,
-              },
+              createdBy: userId ? BigInt(userId) : undefined,
+            },
       },
       select: {
         id: true,
@@ -546,8 +658,9 @@ export class MediaLifecycleService {
     return { ok: true };
   }
 
-  async remove(id: string, force = false, userId?: string, role?: string) {
+  async remove(id: string, force = false, userId?: string, role?: string, groupKey?: string) {
     const mediaAssetId = BigInt(id);
+    const safeGroupKey = (groupKey || '').trim();
 
     const existing = await this.prisma.mediaAsset.findFirst({
       where: {
@@ -556,11 +669,12 @@ export class MediaLifecycleService {
           role === 'admin'
             ? undefined
             : {
-                createdBy: userId ? BigInt(userId) : undefined,
-              },
+              createdBy: userId ? BigInt(userId) : undefined,
+            },
       },
       select: {
         id: true,
+        channelId: true,
         status: true,
         updatedAt: true,
         sourceMeta: true,
@@ -573,16 +687,49 @@ export class MediaLifecycleService {
       throw new NotFoundException('media asset not found');
     }
 
-    if (existing.status === 'ingesting' && !force) {
+    const linkedDispatchTasks = await this.prisma.dispatchTask.findMany({
+      where: {
+        channelId: existing.channelId,
+        ...(safeGroupKey
+          ? { groupKey: safeGroupKey }
+          : { mediaAssetId: existing.id }),
+      },
+      select: {
+        id: true,
+        mediaAssetId: true,
+      },
+    });
+
+    const targetMediaAssetIdSet = new Set<string>([existing.id.toString()]);
+    for (const task of linkedDispatchTasks) {
+      targetMediaAssetIdSet.add(task.mediaAssetId.toString());
+    }
+
+    const targetMediaAssetIds = [...targetMediaAssetIdSet].map((rawId) => BigInt(rawId));
+
+    const targetAssets = await this.prisma.mediaAsset.findMany({
+      where: { id: { in: targetMediaAssetIds } },
+      select: {
+        id: true,
+        status: true,
+        updatedAt: true,
+        sourceMeta: true,
+        localPath: true,
+        archivePath: true,
+      },
+    });
+
+    const forceNeededAsset = targetAssets.find((asset) => asset.status === 'ingesting');
+    if (forceNeededAsset && !force) {
       const sourceMeta =
-        existing.sourceMeta && typeof existing.sourceMeta === 'object'
-          ? (existing.sourceMeta as Record<string, unknown>)
+        forceNeededAsset.sourceMeta && typeof forceNeededAsset.sourceMeta === 'object'
+          ? (forceNeededAsset.sourceMeta as Record<string, unknown>)
           : {};
       const ingestErrorCode =
         typeof sourceMeta.ingestErrorCode === 'string'
           ? sourceMeta.ingestErrorCode
           : '';
-      const updatedAtMs = new Date(existing.updatedAt).getTime();
+      const updatedAtMs = new Date(forceNeededAsset.updatedAt).getTime();
       const isLikelyStuck =
         ingestErrorCode === INGEST_STUCK_TIMEOUT_CODE ||
         (!!updatedAtMs && !Number.isNaN(updatedAtMs)
@@ -599,15 +746,26 @@ export class MediaLifecycleService {
     }
 
     try {
-      const localDelete = await removeFileIfExists(existing.localPath);
-      const archiveDelete =
-        existing.archivePath && existing.archivePath !== existing.localPath
-          ? await removeFileIfExists(existing.archivePath)
-          : { deleted: false, reason: 'same_or_empty_path' };
-
-      const hasPhysicalDeleteError = [localDelete, archiveDelete].some(
-        (result) => result.reason !== 'deleted' && result.reason !== 'not_found' && result.reason !== 'same_or_empty_path',
+      const fileDeleteResults = await Promise.all(
+        targetAssets.map(async (asset) => {
+          const localDelete = await removeFileIfExists(asset.localPath);
+          const archiveDelete =
+            asset.archivePath && asset.archivePath !== asset.localPath
+              ? await removeFileIfExists(asset.archivePath)
+              : { deleted: false, reason: 'same_or_empty_path' };
+          return {
+            mediaAssetId: asset.id.toString(),
+            local: localDelete,
+            archive: archiveDelete,
+          };
+        }),
       );
+
+      const hasPhysicalDeleteError = fileDeleteResults.some((item) => {
+        return [item.local, item.archive].some(
+          (result) => result.reason !== 'deleted' && result.reason !== 'not_found' && result.reason !== 'same_or_empty_path',
+        );
+      });
 
       if (hasPhysicalDeleteError) {
         throw new InternalServerErrorException('物理文件删除失败，请检查文件权限后重试');
@@ -615,13 +773,23 @@ export class MediaLifecycleService {
 
       const deleted = await this.prisma.$transaction(async (tx) => {
         const dispatchTasks = await tx.dispatchTask.findMany({
-          where: { mediaAssetId },
-          select: { id: true },
+          where: {
+            channelId: existing.channelId,
+            ...(safeGroupKey
+              ? { groupKey: safeGroupKey }
+              : { mediaAssetId: { in: targetMediaAssetIds } }),
+          },
+          select: { id: true, mediaAssetId: true, telegramMessageId: true },
         });
 
         const dispatchTaskIds = dispatchTasks.map((task) => task.id);
 
         if (dispatchTaskIds.length > 0) {
+          const sourceDispatchTaskIds = dispatchTasks.map((task) => task.id);
+          const messageIds = dispatchTasks
+            .map((task) => task.telegramMessageId)
+            .filter((value): value is bigint => Boolean(value));
+
           await tx.riskEvent.deleteMany({
             where: { dispatchTaskId: { in: dispatchTaskIds } },
           });
@@ -630,23 +798,47 @@ export class MediaLifecycleService {
             where: { dispatchTaskId: { in: dispatchTaskIds } },
           });
 
+          await (tx as any).catalogSourceItem.deleteMany({
+            where: {
+              channelId: existing.channelId,
+              OR: [
+                { sourceDispatchTaskId: { in: sourceDispatchTaskIds } },
+                ...(safeGroupKey ? [{ groupKey: safeGroupKey }] : []),
+                ...(messageIds.length > 0 ? [{ telegramMessageId: { in: messageIds } }] : []),
+              ],
+            },
+          });
+
           await tx.dispatchTask.deleteMany({
             where: { id: { in: dispatchTaskIds } },
           });
+
+          if (safeGroupKey) {
+            await tx.dispatchGroupTask.deleteMany({
+              where: {
+                channelId: existing.channelId,
+                groupKey: safeGroupKey,
+              },
+            });
+          }
         }
 
-        return tx.mediaAsset.delete({
-          where: { id: mediaAssetId },
+        await tx.mediaAsset.deleteMany({
+          where: { id: { in: targetMediaAssetIds } },
         });
+
+        return {
+          deletedMediaAssetIds: targetMediaAssetIds.map((assetId) => assetId.toString()),
+          deletedDispatchTaskCount: dispatchTaskIds.length,
+        };
       });
 
       return {
-        id: deleted.id.toString(),
+        id: existing.id.toString(),
         ok: true,
-        physicalDeleted: {
-          local: localDelete,
-          archive: archiveDelete,
-        },
+        deletedMediaAssetIds: deleted.deletedMediaAssetIds,
+        deletedDispatchTaskCount: deleted.deletedDispatchTaskCount,
+        physicalDeleted: fileDeleteResults,
       };
     } catch (error) {
       if (

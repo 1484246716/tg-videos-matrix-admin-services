@@ -31,6 +31,8 @@ export const catalogSourceWriteMetrics = {
   upsertFailedTotal: 0,
   upsertSingleTotal: 0,
   upsertGroupTotal: 0,
+  skippedCollectionTotal: 0,
+  deletedCollectionTotal: 0,
   dedupHitTotal: 0,
   upsertDurationMsTotal: 0,
 };

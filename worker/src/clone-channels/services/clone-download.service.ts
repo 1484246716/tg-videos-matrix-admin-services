@@ -563,10 +563,18 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
       messageId: item.messageId,
     });
     const resolvedMimeHint = job.expectedMimeType ?? item.mimeType;
+
+    let textAsFileName = '';
+    if (item.messageText) {
+      const cleanText = sanitizeFileName(item.messageText.replace(/[\r\n]+/g, ' '));
+      textAsFileName = cleanText.length > 120 ? cleanText.slice(0, 120).trim() + '...' : cleanText;
+    }
+    const targetExpectedBase = textAsFileName || job.expectedFileName;
+
     const fileName = resolveTargetFileName({
       channelUsername: item.channelUsername,
       messageId: item.messageId,
-      expectedFileName: job.expectedFileName,
+      expectedFileName: targetExpectedBase,
       mimeType: resolvedMimeHint,
     });
 

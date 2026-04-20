@@ -79,7 +79,18 @@ export class MediaLifecycleController {
 
   @Permissions('media-lifecycle:delete')
   @Delete(':id')
-  remove(@Param('id') id: string, @Query('force') force?: string, @Request() req?: AuthRequest) {
-    return this.mediaLifecycleService.remove(id, force === '1' || force === 'true', req?.user.userId, req?.user.role);
+  remove(
+    @Param('id') id: string,
+    @Query('force') force?: string,
+    @Query('groupKey') groupKey?: string,
+    @Request() req?: AuthRequest,
+  ) {
+    return this.mediaLifecycleService.remove(
+      id,
+      force === '1' || force === 'true',
+      req?.user.userId,
+      req?.user.role,
+      groupKey,
+    );
   }
 }

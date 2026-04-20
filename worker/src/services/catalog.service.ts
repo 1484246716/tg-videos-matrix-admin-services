@@ -899,7 +899,7 @@ class DbCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
 }
 
 class CachedCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
-  constructor(private readonly dbProvider: CollectionCatalogReadProvider) {}
+  constructor(private readonly dbProvider: CollectionCatalogReadProvider) { }
 
   async getCollections(channelId: bigint): Promise<CollectionCatalogConfig[]> {
     return this.dbProvider.getCollections(channelId);
@@ -1019,114 +1019,111 @@ export async function handleCatalogJob(
 
   try {
     const channel = await prisma.channel.findUnique({
-    where: { id: channelId },
-    include: {
-      defaultBot: {
-        select: { id: true, status: true, tokenEncrypted: true },
+      where: { id: channelId },
+      include: {
+        defaultBot: {
+          select: { id: true, status: true, tokenEncrypted: true },
+        },
       },
-    },
-  });
-
-  if (!channel) throw new Error(`未找到频道: ${channelIdRaw}`);
-  if (!channel.navEnabled || channel.status !== 'active') {
-    catalogMetrics.publishRunSkippedTotal += 1;
-    logger.info('[q_catalog] 跳过执行：频道未启用目录或未激活', {
-      runId,
-      channelId: channelIdRaw,
-      triggerType,
-      reason: 'channel_nav_disabled_or_inactive',
     });
-    return { ok: true, skipped: true, reason: '导航未启用或频道未激活' };
-  }
-  if (!channel.navTemplateText || !channel.defaultBot) {
-    throw new Error(`频道缺少导航模板或默认机器人: ${channelIdRaw}`);
-  }
-  if (channel.defaultBot.status !== 'active') {
-    throw new Error(`频道机器人未启用: ${channelIdRaw}`);
-  }
 
-  if (CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED && !options?.selfHealOnly) {
-    const guardNow = new Date();
-    const intervalSec = Math.max(0, channel.navIntervalSec ?? 0);
-    const nextAllowedAt = channel.lastNavUpdateAt
-      ? new Date(channel.lastNavUpdateAt.getTime() + intervalSec * 1000)
-      : guardNow;
-
-    if (nextAllowedAt.getTime() > guardNow.getTime()) {
-      return {
-        ok: true,
-        skipped: true,
-        reason: 'nav_interval_not_due',
+    if (!channel) throw new Error(`未找到频道: ${channelIdRaw}`);
+    if (!channel.navEnabled || channel.status !== 'active') {
+      catalogMetrics.publishRunSkippedTotal += 1;
+      logger.info('[q_catalog] 跳过执行：频道未启用目录或未激活', {
+        runId,
         channelId: channelIdRaw,
-        nextAllowedAt: nextAllowedAt.toISOString(),
-      };
+        triggerType,
+        reason: 'channel_nav_disabled_or_inactive',
+      });
+      return { ok: true, skipped: true, reason: '导航未启用或频道未激活' };
     }
-  }
+    if (!channel.navTemplateText || !channel.defaultBot) {
+      throw new Error(`频道缺少导航模板或默认机器人: ${channelIdRaw}`);
+    }
+    if (channel.defaultBot.status !== 'active') {
+      throw new Error(`频道机器人未启用: ${channelIdRaw}`);
+    }
 
-  const bot = channel.defaultBot;
+    if (CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED && !options?.selfHealOnly) {
+      const guardNow = new Date();
+      const intervalSec = Math.max(0, channel.navIntervalSec ?? 0);
+      const nextAllowedAt = channel.lastNavUpdateAt
+        ? new Date(channel.lastNavUpdateAt.getTime() + intervalSec * 1000)
+        : guardNow;
 
-  let catalogTemplate = await prisma.catalogTemplate.findFirst({
-    where: { isActive: true },
-    select: { id: true },
-    orderBy: { createdAt: 'desc' },
-  });
+      if (nextAllowedAt.getTime() > guardNow.getTime()) {
+        return {
+          ok: true,
+          skipped: true,
+          reason: 'nav_interval_not_due',
+          channelId: channelIdRaw,
+          nextAllowedAt: nextAllowedAt.toISOString(),
+        };
+      }
+    }
 
-  if (!catalogTemplate) {
-    catalogTemplate = await prisma.catalogTemplate.create({
-      data: {
-        name: '默认模板',
-        bodyTemplate: '{{#each videos}}\\n{{this.short_title}}\\n{{this.message_url}}\\n{{/each}}',
-        recentLimit: 60,
-        isActive: true,
-      },
+    const bot = channel.defaultBot;
+
+    let catalogTemplate = await prisma.catalogTemplate.findFirst({
+      where: { isActive: true },
       select: { id: true },
+      orderBy: { createdAt: 'desc' },
     });
-  }
 
-  const now = new Date();
-  const reuseWindowMs = 2 * 60 * 1000;
-  const recentExisting = await prisma.catalogTask.findFirst({
-    where: {
-      channelId,
-      status: { in: [CatalogTaskStatus.pending, CatalogTaskStatus.running] },
-    },
-    orderBy: { createdAt: 'desc' },
-    select: { id: true, createdAt: true },
-  });
+    if (!catalogTemplate) {
+      catalogTemplate = await prisma.catalogTemplate.create({
+        data: {
+          name: '默认模板',
+          bodyTemplate: '{{#each videos}}\\n{{this.short_title}}\\n{{this.message_url}}\\n{{/each}}',
+          recentLimit: 60,
+          isActive: true,
+        },
+        select: { id: true },
+      });
+    }
 
-  if (recentExisting && now.getTime() - recentExisting.createdAt.getTime() <= reuseWindowMs) {
-    catalogTaskId = recentExisting.id;
-  } else {
-    const created = await prisma.catalogTask.create({
-      data: {
+    const now = new Date();
+    const reuseWindowMs = 2 * 60 * 1000;
+    const recentExisting = await prisma.catalogTask.findFirst({
+      where: {
         channelId,
-        catalogTemplateId: catalogTemplate.id,
-        status: CatalogTaskStatus.pending,
-        plannedAt: now,
-        pinAfterPublish: false,
+        status: { in: [CatalogTaskStatus.pending, CatalogTaskStatus.running] },
       },
-      select: { id: true },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, createdAt: true },
     });
-    catalogTaskId = created.id;
-  }
 
-  await prisma.catalogTask.update({
-    where: { id: catalogTaskId },
-    data: { status: CatalogTaskStatus.running, startedAt: now },
-  });
+    if (recentExisting && now.getTime() - recentExisting.createdAt.getTime() <= reuseWindowMs) {
+      catalogTaskId = recentExisting.id;
+    } else {
+      const created = await prisma.catalogTask.create({
+        data: {
+          channelId,
+          catalogTemplateId: catalogTemplate.id,
+          status: CatalogTaskStatus.pending,
+          plannedAt: now,
+          pinAfterPublish: false,
+        },
+        select: { id: true },
+      });
+      catalogTaskId = created.id;
+    }
 
-  const recentLimit = channel.navRecentLimit ?? 60;
-  const channelAny = channel as any;
-  const collectionNavEnabled =
-    typeof channelAny.collection_nav_enabled === 'boolean' ? channelAny.collection_nav_enabled : true;
+    await prisma.catalogTask.update({
+      where: { id: catalogTaskId },
+      data: { status: CatalogTaskStatus.running, startedAt: now },
+    });
 
-  const videos = TYPEC_READ_FROM_CATALOG_SOURCE
-    ? await (async () => {
+    const recentLimit = channel.navRecentLimit ?? 60;
+    const channelAny = channel as any;
+    const collectionNavEnabled =
+      typeof channelAny.collection_nav_enabled === 'boolean' ? channelAny.collection_nav_enabled : true;
+
+    const videos = TYPEC_READ_FROM_CATALOG_SOURCE
+      ? await (async () => {
         const sourceRows = await (prisma as any).catalogSourceItem.findMany({
-          where: {
-            channelId,
-            ...(collectionNavEnabled ? { isCollection: false } : {}),
-          },
+          where: { channelId },
           orderBy: [{ publishedAt: 'desc' }],
           take: recentLimit,
           select: {
@@ -1150,7 +1147,9 @@ export async function handleCatalogJob(
           return [] as CatalogVideo[];
         }
 
-        return sourceRows
+        const orderedSourceRows = [...sourceRows].reverse();
+
+        return orderedSourceRows
           .filter((row: any) => Boolean(row.telegramMessageLink))
           .map((row: any) => {
             const fallbackTitle = '未命名视频';
@@ -1162,7 +1161,7 @@ export async function handleCatalogJob(
             };
           });
       })()
-    : await (async () => {
+      : await (async () => {
         const dispatchTasks = await prisma.dispatchTask.findMany({
           where: { channelId, status: TaskStatus.success, telegramMessageId: { not: null } },
           orderBy: { finishedAt: 'desc' },
@@ -1221,761 +1220,761 @@ export async function handleCatalogJob(
         });
       })();
 
-  if (videos.length === 0) {
-    catalogMetrics.publishRunSkippedTotal += 1;
-    catalogMetrics.publishEmptyRunTotal += 1;
-    catalogMetrics.publishEmptyRunConsecutive += 1;
-    logger.info('[q_catalog] 跳过执行：无可用目录记录', {
-      runId,
-      channelId: channelIdRaw,
-      triggerType,
-      reason: 'no_catalog_records',
-      dataSource: TYPEC_READ_FROM_CATALOG_SOURCE ? 'catalog_source_item' : 'dispatch_task',
-    });
-    return { ok: true, skipped: true, reason: '没有可用的目录记录' };
-  }
-
-  catalogMetrics.publishEmptyRunConsecutive = 0;
-
-  const dbCollectionReadProvider: CollectionCatalogReadProvider = new DbCollectionCatalogReadProvider();
-  const collectionReadProvider: CollectionCatalogReadProvider =
-    TYPEC_COLLECTION_DATA_SOURCE === 'cache'
-      ? new CachedCollectionCatalogReadProvider(dbCollectionReadProvider)
-      : dbCollectionReadProvider;
-
-  logger.info('[q_catalog] 合集数据源选择', {
-    channelId: channelIdRaw,
-    requestedDataSource: TYPEC_COLLECTION_DATA_SOURCE,
-    actualProvider: TYPEC_COLLECTION_DATA_SOURCE === 'cache' ? 'cache' : 'db',
-    cacheFallbackToDb: TYPEC_COLLECTION_CACHE_FALLBACK_TO_DB,
-  });
-
-  const collectionConfigsAll = await collectionReadProvider.getCollections(channelId);
-  const collectionEpisodesAll = await collectionReadProvider.getCollectionEpisodes(channelId);
-
-  const collectionGroups = new Map<string, CollectionCatalogEpisode[]>();
-  for (const episode of collectionEpisodesAll) {
-    const group = collectionGroups.get(episode.collectionName) ?? [];
-    group.push(episode);
-    collectionGroups.set(episode.collectionName, group);
-  }
-
-  const collectionNameMapByNormalized = new Map<string, string>();
-  for (const name of collectionGroups.keys()) {
-    const normalizedName = normalizeCollectionKey(name);
-    if (!collectionNameMapByNormalized.has(normalizedName)) {
-      collectionNameMapByNormalized.set(normalizedName, name);
-    }
-  }
-
-  const enabledCollectionConfigs = collectionConfigsAll.filter((item) => item.navEnabled);
-
-  const collectionIndexShowEmpty = TYPEC_COLLECTION_INDEX_SHOW_EMPTY;
-
-  const filteredCollections = collectionConfigsAll
-    .map((item) => {
-      if (!item.navEnabled) {
-        return { name: item.name, reason: 'not_enabled' as const };
-      }
-      const normalizedName = normalizeCollectionKey(item.nameNormalized || item.name);
-      if (!collectionIndexShowEmpty && !collectionNameMapByNormalized.has(normalizedName)) {
-        return { name: item.name, reason: 'no_data' as const };
-      }
-      return null;
-    })
-    .filter((item): item is { name: string; reason: 'not_enabled' | 'no_data' } => Boolean(item));
-
-  const collectionConfigs = enabledCollectionConfigs.filter((item) => {
-    const normalizedName = normalizeCollectionKey(item.nameNormalized || item.name);
-    const hasEpisodes = collectionNameMapByNormalized.has(normalizedName);
-    return collectionIndexShowEmpty || hasEpisodes;
-  });
-
-  logger.info('[q_catalog] 合集读模型统计', {
-    channelId: channelIdRaw,
-    dataSource: 'full',
-    collection_config_total: collectionConfigsAll.length,
-    collection_config_enabled_total: enabledCollectionConfigs.length,
-    collection_episode_total: collectionEpisodesAll.length,
-    collection_index_show_empty: collectionIndexShowEmpty,
-    collection_index_rendered_total: collectionConfigs.length,
-    empty_collections: collectionConfigs
-      .filter((item) => !collectionNameMapByNormalized.has(normalizeCollectionKey(item.nameNormalized || item.name)))
-      .map((item) => item.name),
-    filtered_collections: filteredCollections,
-  });
-
-  const navPageSize = Math.max(1, Math.min(100, (channel as any).navPageSize ?? 10));
-  const navPagingEnabled = typeof (channel as any).navPagingEnabled === 'boolean'
-    ? (channel as any).navPagingEnabled
-    : false;
-  logger.info('[q_catalog] 主目录分页参数', {
-    channelId: channelIdRaw,
-    navPagingEnabled,
-    channelNavPageSize: navPageSize,
-    regularVideoCount: videos.length,
-  });
-  const videoPages = navPagingEnabled ? chunkVideos(videos, navPageSize) : [videos];
-  const pageContents = videoPages.map((pageVideos, index) =>
-    renderCatalogPageContent({
-      navTemplateText: channel.navTemplateText!,
-      channelName: channel.name,
-      videos: pageVideos,
-      pageNo: index + 1,
-      totalPages: videoPages.length,
-    }),
-  );
-
-  const botToken = bot.tokenEncrypted;
-  let finalMessageId: number | null = null;
-  const selfHealEnabledOnRun = TYPEC_SELF_HEAL_ON_RUN;
-  let selfHealFixedCount = 0;
-  let selfHealFallbackCount = 0;
-  let selfHealOrphanCleanedCount = 0;
-
-  const collectionSections: string[] = [];
-  let collectionIndexLinkInMainCatalog: string | null = null;
-  let nextCollectionNavState: CollectionNavState | null = null;
-  const existingNavState = parseCollectionNavState(channel.navReplyMarkup);
-  if (collectionConfigs.length === 0) {
-    await deleteCollectionNavStateMessages({
-      botToken,
-      chatId: channel.tgChatId,
-      channelIdRaw,
-      state: existingNavState,
-    });
-  }
-  if (collectionConfigs.length > 0) {
-    const names = collectionConfigs.map((item) => item.name);
-    const detailMessageIds: Record<string, number> = {};
-    const detailPageMessageIds: Record<string, number[]> = {};
-
-    const collectionIndexPageSize = Math.max(1, Math.min(50, Number(channelAny.collection_index_page_size ?? 20)));
-
-    const collectionNameToNormalized = new Map(
-      collectionConfigs.map((item) => [item.name, normalizeCollectionKey(item.nameNormalized || item.name)]),
-    );
-    const normalizedNames = [...new Set(collectionNameToNormalized.values())];
-
-    logger.info('[q_catalog] 合集配置原始读取结果(按频道)', {
-      channelId: channelIdRaw,
-      fetchedCount: collectionConfigsAll.length,
-      fetchedNames: collectionConfigsAll.map((item) => item.name),
-    });
-
-    const collectionNavPageSizeMap = new Map<string, number>();
-    for (const item of collectionConfigs) {
-      const pageSize = Math.max(1, Math.min(100, Number(item.navPageSize ?? navPageSize)));
-      collectionNavPageSizeMap.set(item.name, pageSize);
-      collectionNavPageSizeMap.set(normalizeCollectionKey(item.name), pageSize);
-    }
-
-    logger.info('[q_catalog] 合集分页配置命中情况', {
-      channelId: channelIdRaw,
-      collectionCount: names.length,
-      matchedConfigCount: collectionConfigs.length,
-      channelFallbackPageSize: navPageSize,
-      requestedNames: names,
-      normalizedNames,
-      collectionConfigs,
-      querySummary: {
-        model: 'collection',
-        where: {
-          channelId,
-          mode: 'findMany(channelId)->memory_match(name|normalizedName)',
-          namesCount: names.length,
-          normalizedNamesCount: normalizedNames.length,
-        },
-      },
-    });
-
-    const collectionIndexItems: Array<{ text: string; url: string }> = [];
-
-    for (let idx = 0; idx < names.length; idx += 1) {
-      const name = names[idx];
-      const normalizedName = collectionNameToNormalized.get(name) ?? normalizeCollectionKey(name);
-      const matchedGroupName = collectionNameMapByNormalized.get(normalizedName);
-      const episodes = (matchedGroupName ? collectionGroups.get(matchedGroupName) ?? [] : []).sort(
-        (a, b) => a.episodeNo - b.episodeNo,
-      );
-      const hasCollectionSpecificPageSize =
-        collectionNavPageSizeMap.has(name) || collectionNavPageSizeMap.has(normalizedName);
-      const collectionDetailPageSize =
-        collectionNavPageSizeMap.get(name) ??
-        collectionNavPageSizeMap.get(normalizedName) ??
-        Math.max(1, Math.min(100, navPageSize));
-      logger.info('[q_catalog] 合集详情分页参数', {
+    if (videos.length === 0) {
+      catalogMetrics.publishRunSkippedTotal += 1;
+      catalogMetrics.publishEmptyRunTotal += 1;
+      catalogMetrics.publishEmptyRunConsecutive += 1;
+      logger.info('[q_catalog] 跳过执行：无可用目录记录', {
+        runId,
         channelId: channelIdRaw,
-        collectionName: name,
-        episodeCount: episodes.length,
-        collectionDetailPageSize,
-        source: hasCollectionSpecificPageSize ? 'collection.navPageSize' : 'channel.navPageSize_fallback',
+        triggerType,
+        reason: 'no_catalog_records',
+        dataSource: TYPEC_READ_FROM_CATALOG_SOURCE ? 'catalog_source_item' : 'dispatch_task',
       });
-      const episodePages =
-        episodes.length > 0
-          ? chunkVideos(episodes, collectionDetailPageSize)
-          : [[] as CollectionCatalogEpisode[]];
-      const existingDetailPages = existingNavState.detailPageMessageIds[name] ?? [];
-      const publishedDetailPages: number[] = [];
-      const detailOrphanCandidateIds = new Set<number>();
+      return { ok: true, skipped: true, reason: '没有可用的目录记录' };
+    }
 
-      const detailTexts: string[] = [];
+    catalogMetrics.publishEmptyRunConsecutive = 0;
 
-      for (let pageIndex = 0; pageIndex < episodePages.length; pageIndex += 1) {
-        const pageLines = episodePages[pageIndex].map((ep) => {
-          const displayTitle = ep.title.trim();
-          const safeTitle = escapeHtml(displayTitle || `第${ep.episodeNo}集`);
+    const dbCollectionReadProvider: CollectionCatalogReadProvider = new DbCollectionCatalogReadProvider();
+    const collectionReadProvider: CollectionCatalogReadProvider =
+      TYPEC_COLLECTION_DATA_SOURCE === 'cache'
+        ? new CachedCollectionCatalogReadProvider(dbCollectionReadProvider)
+        : dbCollectionReadProvider;
 
-          if (ep.isMissingPlaceholder || !ep.messageUrl) {
-            return safeTitle;
-          }
+    logger.info('[q_catalog] 合集数据源选择', {
+      channelId: channelIdRaw,
+      requestedDataSource: TYPEC_COLLECTION_DATA_SOURCE,
+      actualProvider: TYPEC_COLLECTION_DATA_SOURCE === 'cache' ? 'cache' : 'db',
+      cacheFallbackToDb: TYPEC_COLLECTION_CACHE_FALLBACK_TO_DB,
+    });
 
-          const safeUrl = escapeHtml(ep.messageUrl);
-          return `<a href="${safeUrl}">${safeTitle}</a>`;
-        });
-        const detailBodyLines =
-          pageLines.length > 0 ? pageLines : ['该合集暂无内容，后续更新后将自动补充。'];
+    const collectionConfigsAll = await collectionReadProvider.getCollections(channelId);
+    const collectionEpisodesAll = await collectionReadProvider.getCollectionEpisodes(channelId);
 
-        const detailText = [
-          `📺 ${escapeHtml(name)}`,
-          ...detailBodyLines,
-          ...(episodePages.length > 1 ? [`—— 第${pageIndex + 1}/${episodePages.length}页 ——`] : []),
-        ].join('\n');
+    const collectionGroups = new Map<string, CollectionCatalogEpisode[]>();
+    for (const episode of collectionEpisodesAll) {
+      const group = collectionGroups.get(episode.collectionName) ?? [];
+      group.push(episode);
+      collectionGroups.set(episode.collectionName, group);
+    }
 
-        detailTexts.push(detailText);
-
-        const detailPublishResult = await publishCatalogMessage({
-          botToken,
-          chatId: channel.tgChatId,
-          text: detailText,
-          existingMessageId: existingDetailPages[pageIndex] ?? null,
-        });
-
-        if (selfHealEnabledOnRun && detailPublishResult.notModified) selfHealFixedCount += 1;
-        if (selfHealEnabledOnRun && detailPublishResult.fallbackSent) selfHealFallbackCount += 1;
-
-        publishedDetailPages.push(detailPublishResult.messageId);
-      }
-
-      if (episodePages.length > 1) {
-        for (let pageIndex = 0; pageIndex < episodePages.length; pageIndex += 1) {
-          const currentMessageId = publishedDetailPages[pageIndex] ?? null;
-          if (!currentMessageId) continue;
-
-          const detailRepublishResult = await publishCatalogMessage({
-            botToken,
-            chatId: channel.tgChatId,
-            text: detailTexts[pageIndex],
-            existingMessageId: currentMessageId,
-            replyMarkup: buildCollectionDetailReplyMarkup({
-              chatId: channel.tgChatId,
-              currentPage: pageIndex + 1,
-              totalPages: episodePages.length,
-              detailPageMessageIds: publishedDetailPages,
-            }) ?? undefined,
-          });
-
-          if (selfHealEnabledOnRun && detailRepublishResult.notModified) selfHealFixedCount += 1;
-          if (selfHealEnabledOnRun && detailRepublishResult.fallbackSent) selfHealFallbackCount += 1;
-
-          applyPublishResultAndRewriteId({
-            pageIds: publishedDetailPages,
-            pageIndex,
-            resultMessageId: detailRepublishResult.messageId,
-            orphanCandidateIds: detailOrphanCandidateIds,
-            scope: 'collection_detail',
-            channelIdRaw,
-          });
-        }
-      }
-
-      const reconciledDetailPageIds = reconcilePageMessageIds({
-        ids: publishedDetailPages,
-        expectedCount: episodePages.length,
-        scope: `collection_detail:${name}`,
-        channelIdRaw,
-      });
-      publishedDetailPages.length = 0;
-      publishedDetailPages.push(...reconciledDetailPageIds);
-
-      const staleDetailPages = [
-        ...existingDetailPages.slice(publishedDetailPages.length),
-        ...[...detailOrphanCandidateIds].filter((id) => !publishedDetailPages.includes(id)),
-      ];
-      if (selfHealEnabledOnRun) selfHealOrphanCleanedCount += staleDetailPages.length;
-      await deleteTelegramMessages({
-        botToken,
-        chatId: channel.tgChatId,
-        messageIds: staleDetailPages,
-        onError: (messageId, error) => {
-          logError('[q_catalog] 删除旧合集详情分页消息失败', {
-            channelId: channelIdRaw,
-            collectionName: name,
-            staleMessageId: messageId,
-            error,
-          });
-        },
-      });
-
-      if (publishedDetailPages.length > 0) {
-        detailMessageIds[name] = publishedDetailPages[0];
-        detailPageMessageIds[name] = publishedDetailPages;
-      }
-
-      const detailLink = publishedDetailPages[0]
-        ? toTelegramMessageLink(channel.tgChatId, publishedDetailPages[0])
-        : null;
-      if (detailLink) {
-        collectionIndexItems.push({ text: `${idx + 1}: ${name}`, url: detailLink });
+    const collectionNameMapByNormalized = new Map<string, string>();
+    for (const name of collectionGroups.keys()) {
+      const normalizedName = normalizeCollectionKey(name);
+      if (!collectionNameMapByNormalized.has(normalizedName)) {
+        collectionNameMapByNormalized.set(normalizedName, name);
       }
     }
 
-    const indexPages = chunkVideos(collectionIndexItems, collectionIndexPageSize);
-    if (indexPages.length === 0) {
+    const enabledCollectionConfigs = collectionConfigsAll.filter((item) => item.navEnabled);
+
+    const collectionIndexShowEmpty = TYPEC_COLLECTION_INDEX_SHOW_EMPTY;
+
+    const filteredCollections = collectionConfigsAll
+      .map((item) => {
+        if (!item.navEnabled) {
+          return { name: item.name, reason: 'not_enabled' as const };
+        }
+        const normalizedName = normalizeCollectionKey(item.nameNormalized || item.name);
+        if (!collectionIndexShowEmpty && !collectionNameMapByNormalized.has(normalizedName)) {
+          return { name: item.name, reason: 'no_data' as const };
+        }
+        return null;
+      })
+      .filter((item): item is { name: string; reason: 'not_enabled' | 'no_data' } => Boolean(item));
+
+    const collectionConfigs = enabledCollectionConfigs.filter((item) => {
+      const normalizedName = normalizeCollectionKey(item.nameNormalized || item.name);
+      const hasEpisodes = collectionNameMapByNormalized.has(normalizedName);
+      return collectionIndexShowEmpty || hasEpisodes;
+    });
+
+    logger.info('[q_catalog] 合集读模型统计', {
+      channelId: channelIdRaw,
+      dataSource: 'full',
+      collection_config_total: collectionConfigsAll.length,
+      collection_config_enabled_total: enabledCollectionConfigs.length,
+      collection_episode_total: collectionEpisodesAll.length,
+      collection_index_show_empty: collectionIndexShowEmpty,
+      collection_index_rendered_total: collectionConfigs.length,
+      empty_collections: collectionConfigs
+        .filter((item) => !collectionNameMapByNormalized.has(normalizeCollectionKey(item.nameNormalized || item.name)))
+        .map((item) => item.name),
+      filtered_collections: filteredCollections,
+    });
+
+    const navPageSize = Math.max(1, Math.min(100, (channel as any).navPageSize ?? 10));
+    const navPagingEnabled = typeof (channel as any).navPagingEnabled === 'boolean'
+      ? (channel as any).navPagingEnabled
+      : false;
+    logger.info('[q_catalog] 主目录分页参数', {
+      channelId: channelIdRaw,
+      navPagingEnabled,
+      channelNavPageSize: navPageSize,
+      regularVideoCount: videos.length,
+    });
+    const videoPages = navPagingEnabled ? chunkVideos(videos, navPageSize) : [videos];
+    const pageContents = videoPages.map((pageVideos, index) =>
+      renderCatalogPageContent({
+        navTemplateText: channel.navTemplateText!,
+        channelName: channel.name,
+        videos: pageVideos,
+        pageNo: index + 1,
+        totalPages: videoPages.length,
+      }),
+    );
+
+    const botToken = bot.tokenEncrypted;
+    let finalMessageId: number | null = null;
+    const selfHealEnabledOnRun = TYPEC_SELF_HEAL_ON_RUN;
+    let selfHealFixedCount = 0;
+    let selfHealFallbackCount = 0;
+    let selfHealOrphanCleanedCount = 0;
+
+    const collectionSections: string[] = [];
+    let collectionIndexLinkInMainCatalog: string | null = null;
+    let nextCollectionNavState: CollectionNavState | null = null;
+    const existingNavState = parseCollectionNavState(channel.navReplyMarkup);
+    if (collectionConfigs.length === 0) {
       await deleteCollectionNavStateMessages({
         botToken,
         chatId: channel.tgChatId,
         channelIdRaw,
         state: existingNavState,
       });
-    } else {
-      const existingIndexPages = existingNavState.indexPageMessageIds;
-      const publishedIndexPages: number[] = [];
-      const indexOrphanCandidateIds = new Set<number>();
+    }
+    if (collectionConfigs.length > 0) {
+      const names = collectionConfigs.map((item) => item.name);
+      const detailMessageIds: Record<string, number> = {};
+      const detailPageMessageIds: Record<string, number[]> = {};
 
-      for (let pageIndex = 0; pageIndex < indexPages.length; pageIndex += 1) {
-        const text = [
-          '📚 合集索引',
-          '请选择合集：',
-          ...(indexPages.length > 1 ? [`—— 第${pageIndex + 1}/${indexPages.length}页 ——`] : []),
-        ].join('\n');
+      const collectionIndexPageSize = Math.max(1, Math.min(50, Number(channelAny.collection_index_page_size ?? 20)));
 
-        const firstPassReplyMarkup = {
-          inline_keyboard: indexPages[pageIndex].map((item) => [{ text: item.text, url: item.url }]),
-        };
+      const collectionNameToNormalized = new Map(
+        collectionConfigs.map((item) => [item.name, normalizeCollectionKey(item.nameNormalized || item.name)]),
+      );
+      const normalizedNames = [...new Set(collectionNameToNormalized.values())];
 
-        const indexPublishResult = await publishCatalogMessage({
-          botToken,
-          chatId: channel.tgChatId,
-          text,
-          existingMessageId: existingIndexPages[pageIndex] ?? null,
-          replyMarkup: firstPassReplyMarkup,
-        });
-
-        if (selfHealEnabledOnRun && indexPublishResult.notModified) selfHealFixedCount += 1;
-        if (selfHealEnabledOnRun && indexPublishResult.fallbackSent) selfHealFallbackCount += 1;
-
-        publishedIndexPages.push(indexPublishResult.messageId);
-      }
-
-      for (let pageIndex = 0; pageIndex < indexPages.length; pageIndex += 1) {
-        const currentMessageId = publishedIndexPages[pageIndex] ?? null;
-        if (!currentMessageId) continue;
-
-        const text = [
-          '📚 合集索引',
-          '请选择合集：',
-          ...(indexPages.length > 1 ? [`—— 第${pageIndex + 1}/${indexPages.length}页 ——`] : []),
-        ].join('\n');
-
-        const replyMarkup = buildCollectionIndexReplyMarkup({
-          chatId: channel.tgChatId,
-          pageItems: indexPages[pageIndex],
-          currentPage: pageIndex + 1,
-          totalPages: indexPages.length,
-          indexPageMessageIds: publishedIndexPages,
-        });
-
-        const indexRepublishResult = await publishCatalogMessage({
-          botToken,
-          chatId: channel.tgChatId,
-          text,
-          existingMessageId: currentMessageId,
-          replyMarkup,
-        });
-
-        if (selfHealEnabledOnRun && indexRepublishResult.notModified) selfHealFixedCount += 1;
-        if (selfHealEnabledOnRun && indexRepublishResult.fallbackSent) selfHealFallbackCount += 1;
-
-        applyPublishResultAndRewriteId({
-          pageIds: publishedIndexPages,
-          pageIndex,
-          resultMessageId: indexRepublishResult.messageId,
-          orphanCandidateIds: indexOrphanCandidateIds,
-          scope: 'collection_index',
-          channelIdRaw,
-        });
-      }
-
-      const reconciledIndexPageIds = reconcilePageMessageIds({
-        ids: publishedIndexPages,
-        expectedCount: indexPages.length,
-        scope: 'collection_index',
-        channelIdRaw,
+      logger.info('[q_catalog] 合集配置原始读取结果(按频道)', {
+        channelId: channelIdRaw,
+        fetchedCount: collectionConfigsAll.length,
+        fetchedNames: collectionConfigsAll.map((item) => item.name),
       });
-      publishedIndexPages.length = 0;
-      publishedIndexPages.push(...reconciledIndexPageIds);
 
-      const staleIndexPages = [
-        ...existingIndexPages.slice(publishedIndexPages.length),
-        ...[...indexOrphanCandidateIds].filter((id) => !publishedIndexPages.includes(id)),
-      ];
-      if (selfHealEnabledOnRun) selfHealOrphanCleanedCount += staleIndexPages.length;
-      await deleteTelegramMessages({
-        botToken,
-        chatId: channel.tgChatId,
-        messageIds: staleIndexPages,
-        onError: (messageId, error) => {
-          logError('[q_catalog] 删除旧合集索引分页消息失败', {
-            channelId: channelIdRaw,
-            staleMessageId: messageId,
-            error,
-          });
+      const collectionNavPageSizeMap = new Map<string, number>();
+      for (const item of collectionConfigs) {
+        const pageSize = Math.max(1, Math.min(100, Number(item.navPageSize ?? navPageSize)));
+        collectionNavPageSizeMap.set(item.name, pageSize);
+        collectionNavPageSizeMap.set(normalizeCollectionKey(item.name), pageSize);
+      }
+
+      logger.info('[q_catalog] 合集分页配置命中情况', {
+        channelId: channelIdRaw,
+        collectionCount: names.length,
+        matchedConfigCount: collectionConfigs.length,
+        channelFallbackPageSize: navPageSize,
+        requestedNames: names,
+        normalizedNames,
+        collectionConfigs,
+        querySummary: {
+          model: 'collection',
+          where: {
+            channelId,
+            mode: 'findMany(channelId)->memory_match(name|normalizedName)',
+            namesCount: names.length,
+            normalizedNamesCount: normalizedNames.length,
+          },
         },
       });
 
-      const indexMessageId = publishedIndexPages[0] ?? null;
-      collectionIndexLinkInMainCatalog = indexMessageId
-        ? toTelegramMessageLink(channel.tgChatId, indexMessageId)
-        : null;
+      const collectionIndexItems: Array<{ text: string; url: string }> = [];
 
-      const staleCollectionNames = Object.keys(existingNavState.detailPageMessageIds).filter(
-        (name) => !Object.prototype.hasOwnProperty.call(detailPageMessageIds, name),
-      );
-      for (const staleName of staleCollectionNames) {
-        const stalePages = existingNavState.detailPageMessageIds[staleName] ?? [];
-        if (selfHealEnabledOnRun) selfHealOrphanCleanedCount += stalePages.length;
+      for (let idx = 0; idx < names.length; idx += 1) {
+        const name = names[idx];
+        const normalizedName = collectionNameToNormalized.get(name) ?? normalizeCollectionKey(name);
+        const matchedGroupName = collectionNameMapByNormalized.get(normalizedName);
+        const episodes = (matchedGroupName ? collectionGroups.get(matchedGroupName) ?? [] : []).sort(
+          (a, b) => a.episodeNo - b.episodeNo,
+        );
+        const hasCollectionSpecificPageSize =
+          collectionNavPageSizeMap.has(name) || collectionNavPageSizeMap.has(normalizedName);
+        const collectionDetailPageSize =
+          collectionNavPageSizeMap.get(name) ??
+          collectionNavPageSizeMap.get(normalizedName) ??
+          Math.max(1, Math.min(100, navPageSize));
+        logger.info('[q_catalog] 合集详情分页参数', {
+          channelId: channelIdRaw,
+          collectionName: name,
+          episodeCount: episodes.length,
+          collectionDetailPageSize,
+          source: hasCollectionSpecificPageSize ? 'collection.navPageSize' : 'channel.navPageSize_fallback',
+        });
+        const episodePages =
+          episodes.length > 0
+            ? chunkVideos(episodes, collectionDetailPageSize)
+            : [[] as CollectionCatalogEpisode[]];
+        const existingDetailPages = existingNavState.detailPageMessageIds[name] ?? [];
+        const publishedDetailPages: number[] = [];
+        const detailOrphanCandidateIds = new Set<number>();
+
+        const detailTexts: string[] = [];
+
+        for (let pageIndex = 0; pageIndex < episodePages.length; pageIndex += 1) {
+          const pageLines = episodePages[pageIndex].map((ep) => {
+            const displayTitle = ep.title.trim();
+            const safeTitle = escapeHtml(displayTitle || `第${ep.episodeNo}集`);
+
+            if (ep.isMissingPlaceholder || !ep.messageUrl) {
+              return safeTitle;
+            }
+
+            const safeUrl = escapeHtml(ep.messageUrl);
+            return `<a href="${safeUrl}">${safeTitle}</a>`;
+          });
+          const detailBodyLines =
+            pageLines.length > 0 ? pageLines : ['该合集暂无内容，后续更新后将自动补充。'];
+
+          const detailText = [
+            `📺 ${escapeHtml(name)}`,
+            ...detailBodyLines,
+            ...(episodePages.length > 1 ? [`—— 第${pageIndex + 1}/${episodePages.length}页 ——`] : []),
+          ].join('\n');
+
+          detailTexts.push(detailText);
+
+          const detailPublishResult = await publishCatalogMessage({
+            botToken,
+            chatId: channel.tgChatId,
+            text: detailText,
+            existingMessageId: existingDetailPages[pageIndex] ?? null,
+          });
+
+          if (selfHealEnabledOnRun && detailPublishResult.notModified) selfHealFixedCount += 1;
+          if (selfHealEnabledOnRun && detailPublishResult.fallbackSent) selfHealFallbackCount += 1;
+
+          publishedDetailPages.push(detailPublishResult.messageId);
+        }
+
+        if (episodePages.length > 1) {
+          for (let pageIndex = 0; pageIndex < episodePages.length; pageIndex += 1) {
+            const currentMessageId = publishedDetailPages[pageIndex] ?? null;
+            if (!currentMessageId) continue;
+
+            const detailRepublishResult = await publishCatalogMessage({
+              botToken,
+              chatId: channel.tgChatId,
+              text: detailTexts[pageIndex],
+              existingMessageId: currentMessageId,
+              replyMarkup: buildCollectionDetailReplyMarkup({
+                chatId: channel.tgChatId,
+                currentPage: pageIndex + 1,
+                totalPages: episodePages.length,
+                detailPageMessageIds: publishedDetailPages,
+              }) ?? undefined,
+            });
+
+            if (selfHealEnabledOnRun && detailRepublishResult.notModified) selfHealFixedCount += 1;
+            if (selfHealEnabledOnRun && detailRepublishResult.fallbackSent) selfHealFallbackCount += 1;
+
+            applyPublishResultAndRewriteId({
+              pageIds: publishedDetailPages,
+              pageIndex,
+              resultMessageId: detailRepublishResult.messageId,
+              orphanCandidateIds: detailOrphanCandidateIds,
+              scope: 'collection_detail',
+              channelIdRaw,
+            });
+          }
+        }
+
+        const reconciledDetailPageIds = reconcilePageMessageIds({
+          ids: publishedDetailPages,
+          expectedCount: episodePages.length,
+          scope: `collection_detail:${name}`,
+          channelIdRaw,
+        });
+        publishedDetailPages.length = 0;
+        publishedDetailPages.push(...reconciledDetailPageIds);
+
+        const staleDetailPages = [
+          ...existingDetailPages.slice(publishedDetailPages.length),
+          ...[...detailOrphanCandidateIds].filter((id) => !publishedDetailPages.includes(id)),
+        ];
+        if (selfHealEnabledOnRun) selfHealOrphanCleanedCount += staleDetailPages.length;
         await deleteTelegramMessages({
           botToken,
           chatId: channel.tgChatId,
-          messageIds: stalePages,
+          messageIds: staleDetailPages,
           onError: (messageId, error) => {
-            logError('[q_catalog] 删除旧合集详情消息失败', {
+            logError('[q_catalog] 删除旧合集详情分页消息失败', {
               channelId: channelIdRaw,
-              collectionName: staleName,
+              collectionName: name,
               staleMessageId: messageId,
               error,
             });
           },
         });
+
+        if (publishedDetailPages.length > 0) {
+          detailMessageIds[name] = publishedDetailPages[0];
+          detailPageMessageIds[name] = publishedDetailPages;
+        }
+
+        const detailLink = publishedDetailPages[0]
+          ? toTelegramMessageLink(channel.tgChatId, publishedDetailPages[0])
+          : null;
+        if (detailLink) {
+          collectionIndexItems.push({ text: `${idx + 1}: ${name}`, url: detailLink });
+        }
       }
 
-      nextCollectionNavState = {
-        indexMessageId,
-        indexPageMessageIds: publishedIndexPages,
-        detailMessageIds,
-        detailPageMessageIds,
-      };
+      const indexPages = chunkVideos(collectionIndexItems, collectionIndexPageSize);
+      if (indexPages.length === 0) {
+        await deleteCollectionNavStateMessages({
+          botToken,
+          chatId: channel.tgChatId,
+          channelIdRaw,
+          state: existingNavState,
+        });
+      } else {
+        const existingIndexPages = existingNavState.indexPageMessageIds;
+        const publishedIndexPages: number[] = [];
+        const indexOrphanCandidateIds = new Set<number>();
+
+        for (let pageIndex = 0; pageIndex < indexPages.length; pageIndex += 1) {
+          const text = [
+            '📚 合集索引',
+            '请选择合集：',
+            ...(indexPages.length > 1 ? [`—— 第${pageIndex + 1}/${indexPages.length}页 ——`] : []),
+          ].join('\n');
+
+          const firstPassReplyMarkup = {
+            inline_keyboard: indexPages[pageIndex].map((item) => [{ text: item.text, url: item.url }]),
+          };
+
+          const indexPublishResult = await publishCatalogMessage({
+            botToken,
+            chatId: channel.tgChatId,
+            text,
+            existingMessageId: existingIndexPages[pageIndex] ?? null,
+            replyMarkup: firstPassReplyMarkup,
+          });
+
+          if (selfHealEnabledOnRun && indexPublishResult.notModified) selfHealFixedCount += 1;
+          if (selfHealEnabledOnRun && indexPublishResult.fallbackSent) selfHealFallbackCount += 1;
+
+          publishedIndexPages.push(indexPublishResult.messageId);
+        }
+
+        for (let pageIndex = 0; pageIndex < indexPages.length; pageIndex += 1) {
+          const currentMessageId = publishedIndexPages[pageIndex] ?? null;
+          if (!currentMessageId) continue;
+
+          const text = [
+            '📚 合集索引',
+            '请选择合集：',
+            ...(indexPages.length > 1 ? [`—— 第${pageIndex + 1}/${indexPages.length}页 ——`] : []),
+          ].join('\n');
+
+          const replyMarkup = buildCollectionIndexReplyMarkup({
+            chatId: channel.tgChatId,
+            pageItems: indexPages[pageIndex],
+            currentPage: pageIndex + 1,
+            totalPages: indexPages.length,
+            indexPageMessageIds: publishedIndexPages,
+          });
+
+          const indexRepublishResult = await publishCatalogMessage({
+            botToken,
+            chatId: channel.tgChatId,
+            text,
+            existingMessageId: currentMessageId,
+            replyMarkup,
+          });
+
+          if (selfHealEnabledOnRun && indexRepublishResult.notModified) selfHealFixedCount += 1;
+          if (selfHealEnabledOnRun && indexRepublishResult.fallbackSent) selfHealFallbackCount += 1;
+
+          applyPublishResultAndRewriteId({
+            pageIds: publishedIndexPages,
+            pageIndex,
+            resultMessageId: indexRepublishResult.messageId,
+            orphanCandidateIds: indexOrphanCandidateIds,
+            scope: 'collection_index',
+            channelIdRaw,
+          });
+        }
+
+        const reconciledIndexPageIds = reconcilePageMessageIds({
+          ids: publishedIndexPages,
+          expectedCount: indexPages.length,
+          scope: 'collection_index',
+          channelIdRaw,
+        });
+        publishedIndexPages.length = 0;
+        publishedIndexPages.push(...reconciledIndexPageIds);
+
+        const staleIndexPages = [
+          ...existingIndexPages.slice(publishedIndexPages.length),
+          ...[...indexOrphanCandidateIds].filter((id) => !publishedIndexPages.includes(id)),
+        ];
+        if (selfHealEnabledOnRun) selfHealOrphanCleanedCount += staleIndexPages.length;
+        await deleteTelegramMessages({
+          botToken,
+          chatId: channel.tgChatId,
+          messageIds: staleIndexPages,
+          onError: (messageId, error) => {
+            logError('[q_catalog] 删除旧合集索引分页消息失败', {
+              channelId: channelIdRaw,
+              staleMessageId: messageId,
+              error,
+            });
+          },
+        });
+
+        const indexMessageId = publishedIndexPages[0] ?? null;
+        collectionIndexLinkInMainCatalog = indexMessageId
+          ? toTelegramMessageLink(channel.tgChatId, indexMessageId)
+          : null;
+
+        const staleCollectionNames = Object.keys(existingNavState.detailPageMessageIds).filter(
+          (name) => !Object.prototype.hasOwnProperty.call(detailPageMessageIds, name),
+        );
+        for (const staleName of staleCollectionNames) {
+          const stalePages = existingNavState.detailPageMessageIds[staleName] ?? [];
+          if (selfHealEnabledOnRun) selfHealOrphanCleanedCount += stalePages.length;
+          await deleteTelegramMessages({
+            botToken,
+            chatId: channel.tgChatId,
+            messageIds: stalePages,
+            onError: (messageId, error) => {
+              logError('[q_catalog] 删除旧合集详情消息失败', {
+                channelId: channelIdRaw,
+                collectionName: staleName,
+                staleMessageId: messageId,
+                error,
+              });
+            },
+          });
+        }
+
+        nextCollectionNavState = {
+          indexMessageId,
+          indexPageMessageIds: publishedIndexPages,
+          detailMessageIds,
+          detailPageMessageIds,
+        };
+      }
     }
-  }
 
-  const mainCatalogContent = (() => {
-    const base = pageContents.join('\n\n');
-    if (!collectionNavEnabled || !collectionIndexLinkInMainCatalog) return base;
-    const safeLink = escapeHtml(collectionIndexLinkInMainCatalog);
-    return `${base}\n\n<a href="${safeLink}">📚 合集索引</a>`;
-  })();
+    const mainCatalogContent = (() => {
+      const base = pageContents.join('\n\n');
+      if (!collectionNavEnabled || !collectionIndexLinkInMainCatalog) return base;
+      const safeLink = escapeHtml(collectionIndexLinkInMainCatalog);
+      return `${base}\n\n<a href="${safeLink}">📚 合集索引</a>`;
+    })();
 
-  const content = [mainCatalogContent, ...collectionSections].filter(Boolean).join('\n\n');
-  const contentPreview = content.slice(0, 4000);
-  const hasMainCatalogContent = mainCatalogContent.trim().length > 0;
-  let pinAttempted = false;
-  let pinSuccess: boolean | null = null;
-  let pinErrorMessage: string | null = null;
+    const content = [mainCatalogContent, ...collectionSections].filter(Boolean).join('\n\n');
+    const contentPreview = content.slice(0, 4000);
+    const hasMainCatalogContent = mainCatalogContent.trim().length > 0;
+    let pinAttempted = false;
+    let pinSuccess: boolean | null = null;
+    let pinErrorMessage: string | null = null;
 
-  try {
-    const channelAny = channel as any;
-    const storedPageMessageIds = parseStoredPageMessageIds(channelAny.navPageMessageIds);
-    const publishedPageMessageIds: number[] = [];
-    const mainPageOrphanCandidateIds = new Set<number>();
-    const existingMainNavMessageId = channel.navMessageId ? Number(channel.navMessageId) : null;
+    try {
+      const channelAny = channel as any;
+      const storedPageMessageIds = parseStoredPageMessageIds(channelAny.navPageMessageIds);
+      const publishedPageMessageIds: number[] = [];
+      const mainPageOrphanCandidateIds = new Set<number>();
+      const existingMainNavMessageId = channel.navMessageId ? Number(channel.navMessageId) : null;
 
-    if (!hasMainCatalogContent) {
+      if (!hasMainCatalogContent) {
+        await deleteTelegramMessages({
+          botToken,
+          chatId: channel.tgChatId,
+          messageIds: [
+            ...(existingMainNavMessageId ? [existingMainNavMessageId] : []),
+            ...storedPageMessageIds,
+          ],
+          onError: (messageId, error) => {
+            logError('[q_catalog] 删除旧频道导航消息失败', {
+              channelId: channelIdRaw,
+              staleMessageId: messageId,
+              error,
+            });
+          },
+        });
+      } else if (pageContents.length <= 1) {
+        const publishResult = await publishCatalogMessage({
+          botToken,
+          chatId: channel.tgChatId,
+          text: mainCatalogContent,
+          existingMessageId: existingMainNavMessageId,
+          clearReplyMarkup: true,
+        });
+
+        if (selfHealEnabledOnRun && publishResult.notModified) selfHealFixedCount += 1;
+        if (selfHealEnabledOnRun && publishResult.fallbackSent) selfHealFallbackCount += 1;
+
+        finalMessageId = publishResult.messageId;
+
+        if (publishResult.isNewMessage) {
+          pinAttempted = true;
+          try {
+            await pinMessageByTelegram({
+              botToken,
+              chatId: channel.tgChatId,
+              messageId: finalMessageId,
+            });
+            pinSuccess = true;
+          } catch (pinErr) {
+            pinSuccess = false;
+            pinErrorMessage = pinErr instanceof Error ? pinErr.message : '置顶失败';
+          }
+        }
+      } else {
+        for (let pageIndex = 0; pageIndex < pageContents.length; pageIndex += 1) {
+          const pageText = pageIndex === 0 ? mainCatalogContent : pageContents[pageIndex];
+          const publishResult = await publishCatalogMessage({
+            botToken,
+            chatId: channel.tgChatId,
+            text: pageText,
+            existingMessageId: storedPageMessageIds[pageIndex] ?? null,
+          });
+          if (selfHealEnabledOnRun && publishResult.notModified) selfHealFixedCount += 1;
+          if (selfHealEnabledOnRun && publishResult.fallbackSent) selfHealFallbackCount += 1;
+          publishedPageMessageIds.push(publishResult.messageId);
+        }
+
+        for (let pageIndex = 0; pageIndex < pageContents.length; pageIndex += 1) {
+          const pageText = pageIndex === 0 ? mainCatalogContent : pageContents[pageIndex];
+          const republishResult = await publishCatalogMessage({
+            botToken,
+            chatId: channel.tgChatId,
+            text: pageText,
+            existingMessageId: publishedPageMessageIds[pageIndex],
+            replyMarkup: buildCatalogContentPageReplyMarkup({
+              chatId: channel.tgChatId,
+              currentPage: pageIndex + 1,
+              totalPages: pageContents.length,
+              pageMessageIds: publishedPageMessageIds,
+            }) ?? undefined,
+          });
+
+          if (selfHealEnabledOnRun && republishResult.notModified) selfHealFixedCount += 1;
+          if (selfHealEnabledOnRun && republishResult.fallbackSent) selfHealFallbackCount += 1;
+
+          applyPublishResultAndRewriteId({
+            pageIds: publishedPageMessageIds,
+            pageIndex,
+            resultMessageId: republishResult.messageId,
+            orphanCandidateIds: mainPageOrphanCandidateIds,
+            scope: 'main_catalog',
+            channelIdRaw,
+          });
+        }
+
+        const reconciledMainPageIds = reconcilePageMessageIds({
+          ids: publishedPageMessageIds,
+          expectedCount: pageContents.length,
+          scope: 'main_catalog',
+          channelIdRaw,
+        });
+        publishedPageMessageIds.length = 0;
+        publishedPageMessageIds.push(...reconciledMainPageIds);
+
+        const indexReplyMarkup = buildCatalogPageButtons({
+          chatId: channel.tgChatId,
+          pageMessageIds: publishedPageMessageIds,
+        });
+
+        const indexPublishResult = await publishCatalogMessage({
+          botToken,
+          chatId: channel.tgChatId,
+          text: buildCatalogIndexContent({
+            channelName: channel.name,
+            totalPages: pageContents.length,
+            collectionIndexLink: collectionIndexLinkInMainCatalog,
+          }),
+          existingMessageId: existingMainNavMessageId,
+          replyMarkup: indexReplyMarkup,
+        });
+
+        if (selfHealEnabledOnRun && indexPublishResult.notModified) selfHealFixedCount += 1;
+        if (selfHealEnabledOnRun && indexPublishResult.fallbackSent) selfHealFallbackCount += 1;
+
+        finalMessageId = indexPublishResult.messageId;
+
+        if (indexPublishResult.isNewMessage) {
+          pinAttempted = true;
+          try {
+            await pinMessageByTelegram({
+              botToken,
+              chatId: channel.tgChatId,
+              messageId: finalMessageId,
+            });
+            pinSuccess = true;
+          } catch (pinErr) {
+            pinSuccess = false;
+            pinErrorMessage = pinErr instanceof Error ? pinErr.message : '置顶失败';
+          }
+        }
+      }
+
+      const stalePageMessageIds = hasMainCatalogContent
+        ? [
+          ...storedPageMessageIds.slice(publishedPageMessageIds.length),
+          ...[...mainPageOrphanCandidateIds].filter((id) => !publishedPageMessageIds.includes(id)),
+        ]
+        : [];
+      if (selfHealEnabledOnRun) selfHealOrphanCleanedCount += stalePageMessageIds.length;
       await deleteTelegramMessages({
         botToken,
         chatId: channel.tgChatId,
-        messageIds: [
-          ...(existingMainNavMessageId ? [existingMainNavMessageId] : []),
-          ...storedPageMessageIds,
-        ],
+        messageIds: stalePageMessageIds,
         onError: (messageId, error) => {
-          logError('[q_catalog] 删除旧频道导航消息失败', {
+          logError('[q_catalog] 删除旧目录分页消息失败', {
             channelId: channelIdRaw,
             staleMessageId: messageId,
             error,
           });
         },
       });
-    } else if (pageContents.length <= 1) {
-      const publishResult = await publishCatalogMessage({
-        botToken,
-        chatId: channel.tgChatId,
-        text: mainCatalogContent,
-        existingMessageId: existingMainNavMessageId,
-        clearReplyMarkup: true,
-      });
 
-      if (selfHealEnabledOnRun && publishResult.notModified) selfHealFixedCount += 1;
-      if (selfHealEnabledOnRun && publishResult.fallbackSent) selfHealFallbackCount += 1;
-
-      finalMessageId = publishResult.messageId;
-
-      if (publishResult.isNewMessage) {
-        pinAttempted = true;
-        try {
-          await pinMessageByTelegram({
-            botToken,
-            chatId: channel.tgChatId,
-            messageId: finalMessageId,
-          });
-          pinSuccess = true;
-        } catch (pinErr) {
-          pinSuccess = false;
-          pinErrorMessage = pinErr instanceof Error ? pinErr.message : '置顶失败';
-        }
-      }
-    } else {
-      for (let pageIndex = 0; pageIndex < pageContents.length; pageIndex += 1) {
-        const pageText = pageIndex === 0 ? mainCatalogContent : pageContents[pageIndex];
-        const publishResult = await publishCatalogMessage({
-          botToken,
-          chatId: channel.tgChatId,
-          text: pageText,
-          existingMessageId: storedPageMessageIds[pageIndex] ?? null,
-        });
-        if (selfHealEnabledOnRun && publishResult.notModified) selfHealFixedCount += 1;
-        if (selfHealEnabledOnRun && publishResult.fallbackSent) selfHealFallbackCount += 1;
-        publishedPageMessageIds.push(publishResult.messageId);
-      }
-
-      for (let pageIndex = 0; pageIndex < pageContents.length; pageIndex += 1) {
-        const pageText = pageIndex === 0 ? mainCatalogContent : pageContents[pageIndex];
-        const republishResult = await publishCatalogMessage({
-          botToken,
-          chatId: channel.tgChatId,
-          text: pageText,
-          existingMessageId: publishedPageMessageIds[pageIndex],
-          replyMarkup: buildCatalogContentPageReplyMarkup({
-            chatId: channel.tgChatId,
-            currentPage: pageIndex + 1,
-            totalPages: pageContents.length,
-            pageMessageIds: publishedPageMessageIds,
-          }) ?? undefined,
-        });
-
-        if (selfHealEnabledOnRun && republishResult.notModified) selfHealFixedCount += 1;
-        if (selfHealEnabledOnRun && republishResult.fallbackSent) selfHealFallbackCount += 1;
-
-        applyPublishResultAndRewriteId({
-          pageIds: publishedPageMessageIds,
-          pageIndex,
-          resultMessageId: republishResult.messageId,
-          orphanCandidateIds: mainPageOrphanCandidateIds,
-          scope: 'main_catalog',
-          channelIdRaw,
-        });
-      }
-
-      const reconciledMainPageIds = reconcilePageMessageIds({
-        ids: publishedPageMessageIds,
-        expectedCount: pageContents.length,
-        scope: 'main_catalog',
-        channelIdRaw,
-      });
-      publishedPageMessageIds.length = 0;
-      publishedPageMessageIds.push(...reconciledMainPageIds);
-
-      const indexReplyMarkup = buildCatalogPageButtons({
-        chatId: channel.tgChatId,
-        pageMessageIds: publishedPageMessageIds,
-      });
-
-      const indexPublishResult = await publishCatalogMessage({
-        botToken,
-        chatId: channel.tgChatId,
-        text: buildCatalogIndexContent({
-          channelName: channel.name,
-          totalPages: pageContents.length,
-          collectionIndexLink: collectionIndexLinkInMainCatalog,
-        }),
-        existingMessageId: existingMainNavMessageId,
-        replyMarkup: indexReplyMarkup,
-      });
-
-      if (selfHealEnabledOnRun && indexPublishResult.notModified) selfHealFixedCount += 1;
-      if (selfHealEnabledOnRun && indexPublishResult.fallbackSent) selfHealFallbackCount += 1;
-
-      finalMessageId = indexPublishResult.messageId;
-
-      if (indexPublishResult.isNewMessage) {
-        pinAttempted = true;
-        try {
-          await pinMessageByTelegram({
-            botToken,
-            chatId: channel.tgChatId,
-            messageId: finalMessageId,
-          });
-          pinSuccess = true;
-        } catch (pinErr) {
-          pinSuccess = false;
-          pinErrorMessage = pinErr instanceof Error ? pinErr.message : '置顶失败';
-        }
-      }
-    }
-
-    const stalePageMessageIds = hasMainCatalogContent
-      ? [
-          ...storedPageMessageIds.slice(publishedPageMessageIds.length),
-          ...[...mainPageOrphanCandidateIds].filter((id) => !publishedPageMessageIds.includes(id)),
-        ]
-      : [];
-    if (selfHealEnabledOnRun) selfHealOrphanCleanedCount += stalePageMessageIds.length;
-    await deleteTelegramMessages({
-      botToken,
-      chatId: channel.tgChatId,
-      messageIds: stalePageMessageIds,
-      onError: (messageId, error) => {
-        logError('[q_catalog] 删除旧目录分页消息失败', {
-          channelId: channelIdRaw,
-          staleMessageId: messageId,
-          error,
-        });
-      },
-    });
-
-    try {
-      await prisma.channel.update({
-        where: { id: channelId },
-        data: {
-          navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
-          lastNavUpdateAt: new Date(),
-          navReplyMarkup: mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState),
-          ...({ navPageMessageIds: publishedPageMessageIds } as any),
-        } as any,
-      });
-    } catch (updateError) {
-      const updateMessage = updateError instanceof Error ? updateError.message : '';
-      if (updateMessage.includes('Unknown argument `navPageMessageIds`')) {
+      try {
         await prisma.channel.update({
           where: { id: channelId },
           data: {
             navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
             lastNavUpdateAt: new Date(),
-            navReplyMarkup: mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState) as any,
+            navReplyMarkup: mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState),
+            ...({ navPageMessageIds: publishedPageMessageIds } as any),
+          } as any,
+        });
+      } catch (updateError) {
+        const updateMessage = updateError instanceof Error ? updateError.message : '';
+        if (updateMessage.includes('Unknown argument `navPageMessageIds`')) {
+          await prisma.channel.update({
+            where: { id: channelId },
+            data: {
+              navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
+              lastNavUpdateAt: new Date(),
+              navReplyMarkup: mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState) as any,
+            },
+          });
+        } else {
+          throw updateError;
+        }
+      }
+
+      await prisma.catalogHistory.create({
+        data: {
+          channelId,
+          catalogTemplateId: catalogTemplate.id,
+          content,
+          renderedCount: videos.length,
+          publishedAt: new Date(),
+        },
+      });
+
+      logger.info('[q_catalog] TypeC自愈修复统计', {
+        runId,
+        channelId: channelIdRaw,
+        triggerType,
+        selfHealEnabledOnRun,
+        self_heal_fixed_count: selfHealFixedCount,
+        self_heal_fallback_count: selfHealFallbackCount,
+        self_heal_orphan_cleaned_count: selfHealOrphanCleanedCount,
+      });
+
+      const groupRenderedCount = TYPEC_READ_FROM_CATALOG_SOURCE
+        ? await (prisma as any).catalogSourceItem.count({ where: { channelId, sourceType: 'group' } })
+        : 0;
+      const collectionRenderedCount = collectionEpisodesAll.length;
+
+      catalogMetrics.publishItemsRenderedTotal += videos.length;
+      catalogMetrics.publishGroupItemsRenderedTotal += Number(groupRenderedCount || 0);
+      catalogMetrics.publishCollectionItemsRenderedTotal += Number(collectionRenderedCount || 0);
+      catalogMetrics.publishRunSuccessTotal += 1;
+
+      if (catalogTaskId) {
+        await prisma.catalogTask.update({
+          where: { id: catalogTaskId },
+          data: {
+            status: CatalogTaskStatus.success,
+            finishedAt: new Date(),
+            telegramMessageId: finalMessageId ? BigInt(finalMessageId) : null,
+            contentPreview,
+            errorMessage: null,
+            pinAfterPublish: pinAttempted,
+            pinSuccess,
+            pinErrorMessage,
           },
         });
-      } else {
-        throw updateError;
       }
-    }
 
-    await prisma.catalogHistory.create({
-      data: {
-        channelId,
-        catalogTemplateId: catalogTemplate.id,
-        content,
+      const runDurationMs = Date.now() - runStartedAt;
+      catalogMetrics.publishDurationMsTotal += runDurationMs;
+
+      logger.info('[q_catalog] 目录发布完成', {
+        runId,
+        channelId: channelIdRaw,
+        triggerType,
+        result: 'success',
+        dataSource: TYPEC_READ_FROM_CATALOG_SOURCE ? 'catalog_source_item' : 'dispatch_task',
         renderedCount: videos.length,
-        publishedAt: new Date(),
-      },
-    });
-
-    logger.info('[q_catalog] TypeC自愈修复统计', {
-      runId,
-      channelId: channelIdRaw,
-      triggerType,
-      selfHealEnabledOnRun,
-      self_heal_fixed_count: selfHealFixedCount,
-      self_heal_fallback_count: selfHealFallbackCount,
-      self_heal_orphan_cleaned_count: selfHealOrphanCleanedCount,
-    });
-
-    const groupRenderedCount = TYPEC_READ_FROM_CATALOG_SOURCE
-      ? await (prisma as any).catalogSourceItem.count({ where: { channelId, sourceType: 'group' } })
-      : 0;
-    const collectionRenderedCount = collectionEpisodesAll.length;
-
-    catalogMetrics.publishItemsRenderedTotal += videos.length;
-    catalogMetrics.publishGroupItemsRenderedTotal += Number(groupRenderedCount || 0);
-    catalogMetrics.publishCollectionItemsRenderedTotal += Number(collectionRenderedCount || 0);
-    catalogMetrics.publishRunSuccessTotal += 1;
-
-    if (catalogTaskId) {
-      await prisma.catalogTask.update({
-        where: { id: catalogTaskId },
-        data: {
-          status: CatalogTaskStatus.success,
-          finishedAt: new Date(),
-          telegramMessageId: finalMessageId ? BigInt(finalMessageId) : null,
-          contentPreview,
-          errorMessage: null,
-          pinAfterPublish: pinAttempted,
-          pinSuccess,
-          pinErrorMessage,
-        },
+        groupItemCount: Number(groupRenderedCount || 0),
+        collectionItemCount: Number(collectionRenderedCount || 0),
+        pageCount: pageContents.length,
+        durationMs: runDurationMs,
       });
-    }
 
-    const runDurationMs = Date.now() - runStartedAt;
-    catalogMetrics.publishDurationMsTotal += runDurationMs;
+      return {
+        ok: true,
+        channelId: channelIdRaw,
+        messageId: finalMessageId,
+        pageCount: pageContents.length,
+        navPageSize,
+        runId,
+        triggerType,
+        durationMs: runDurationMs,
+      };
+    } catch (error) {
+      catalogMetrics.publishRunFailedTotal += 1;
+      const runDurationMs = Date.now() - runStartedAt;
+      catalogMetrics.publishDurationMsTotal += runDurationMs;
 
-    logger.info('[q_catalog] 目录发布完成', {
-      runId,
-      channelId: channelIdRaw,
-      triggerType,
-      result: 'success',
-      dataSource: TYPEC_READ_FROM_CATALOG_SOURCE ? 'catalog_source_item' : 'dispatch_task',
-      renderedCount: videos.length,
-      groupItemCount: Number(groupRenderedCount || 0),
-      collectionItemCount: Number(collectionRenderedCount || 0),
-      pageCount: pageContents.length,
-      durationMs: runDurationMs,
-    });
+      if (catalogTaskId) {
+        await prisma.catalogTask.update({
+          where: { id: catalogTaskId },
+          data: {
+            status: CatalogTaskStatus.failed,
+            finishedAt: new Date(),
+            contentPreview,
+            errorMessage: error instanceof Error ? error.message : '频道导航发布失败',
+            pinAfterPublish: pinAttempted,
+            pinSuccess,
+            pinErrorMessage:
+              pinErrorMessage ?? (error instanceof Error ? error.message : '频道导航发布失败'),
+          },
+        });
+      }
 
-    return {
-      ok: true,
-      channelId: channelIdRaw,
-      messageId: finalMessageId,
-      pageCount: pageContents.length,
-      navPageSize,
-      runId,
-      triggerType,
-      durationMs: runDurationMs,
-    };
-  } catch (error) {
-    catalogMetrics.publishRunFailedTotal += 1;
-    const runDurationMs = Date.now() - runStartedAt;
-    catalogMetrics.publishDurationMsTotal += runDurationMs;
-
-    if (catalogTaskId) {
-      await prisma.catalogTask.update({
-        where: { id: catalogTaskId },
-        data: {
-          status: CatalogTaskStatus.failed,
-          finishedAt: new Date(),
-          contentPreview,
-          errorMessage: error instanceof Error ? error.message : '频道导航发布失败',
-          pinAfterPublish: pinAttempted,
-          pinSuccess,
-          pinErrorMessage:
-            pinErrorMessage ?? (error instanceof Error ? error.message : '频道导航发布失败'),
-        },
+      logError('[q_catalog] 发布频道导航失败', {
+        runId,
+        channelId: channelIdRaw,
+        triggerType,
+        result: 'failed',
+        dataSource: TYPEC_READ_FROM_CATALOG_SOURCE ? 'catalog_source_item' : 'dispatch_task',
+        durationMs: runDurationMs,
+        errorName: error instanceof Error ? error.name : 'UnknownError',
+        errorMessage: error instanceof Error ? error.message : String(error),
+        errorStack: error instanceof Error ? error.stack : null,
+        error,
       });
+      throw error;
     }
-
-    logError('[q_catalog] 发布频道导航失败', {
-      runId,
-      channelId: channelIdRaw,
-      triggerType,
-      result: 'failed',
-      dataSource: TYPEC_READ_FROM_CATALOG_SOURCE ? 'catalog_source_item' : 'dispatch_task',
-      durationMs: runDurationMs,
-      errorName: error instanceof Error ? error.name : 'UnknownError',
-      errorMessage: error instanceof Error ? error.message : String(error),
-      errorStack: error instanceof Error ? error.stack : null,
-      error,
-    });
-    throw error;
-  }
   } finally {
     await releaseChannelLock({
       lockKey: channelLock.lockKey,

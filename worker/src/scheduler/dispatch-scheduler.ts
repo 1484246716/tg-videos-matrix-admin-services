@@ -515,6 +515,29 @@ export async function scheduleDueDispatchTasks() {
       continue;
     }
 
+    // 【乐观锁防重】避免多个并发调度 tick 同时捞到同一条任务，导致门禁判定被狂暴重复执行
+    // 原理：先把 nextRunAt 向后推 30 秒"占住"这条任务，防止其他 tick 同时拿到它
+    // 注意：这 30 秒只是碰撞保护兜底，后续各个门禁分支（合集闸门/频道窗口等）
+    //       都会用自己的正确延迟值覆写 nextRunAt（如 60s），不会真的等 30 秒
+    //       只有进程在判定中途崩溃时，才会触发这 30 秒的兜底恢复
+    const claimRes = await withPrismaRetry(
+      () =>
+        prisma.dispatchTask.updateMany({
+          where: {
+            id: task.id,
+            nextRunAt: { lte: now },
+          },
+          data: {
+            nextRunAt: new Date(Date.now() + 30 * 1000),
+          },
+        }),
+      { label: 'dispatch.scheduleDueDispatchTasks.claimLock' },
+    );
+
+    if (claimRes.count === 0) {
+      continue;
+    }
+
     // 合集元信息用于顺序闸门；非合集则为 null。
     let collectionMeta = parseCollectionMeta(task.mediaAsset.sourceMeta);
     const collectionCfg = parseCollectionSchedulerConfig(task.channel.navReplyMarkup);
@@ -729,6 +752,16 @@ export async function scheduleDueDispatchTasks() {
 
     // 同频道同一时间只入队一个，避免并发派发造成频道频控/顺序混乱。
     if (!lock.acquired) {
+      // 未抢到频道并发锁，将之前上的 5 分钟排他锁恢复为较短的回退时间 (10秒)，让其稍后再试
+      await withPrismaRetry(
+        () =>
+          prisma.dispatchTask.update({
+            where: { id: task.id },
+            data: { nextRunAt: new Date(Date.now() + 10 * 1000) },
+          }),
+        { label: 'dispatch.scheduleDueDispatchTasks.channelLockRetry' },
+      );
+
       logger.info('[scheduler] 分发任务跳过（频道锁未获取）', {
         taskId: task.id.toString(),
         channelId: channelIdStr,

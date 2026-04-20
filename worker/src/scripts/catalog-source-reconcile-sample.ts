@@ -1,16 +1,24 @@
+import '../config/env';
 import { prisma } from '../infra/prisma';
 import { logger } from '../logger';
 
 function parseArg(name: string, defaultValue: string) {
   const hit = process.argv.find((item) => item.startsWith(`--${name}=`));
   if (!hit) return defaultValue;
-  return hit.slice(name.length + 3).trim() || defaultValue;
+  const eqIndex = hit.indexOf('=');
+  if (eqIndex < 0) return defaultValue;
+  return hit.slice(eqIndex + 1).trim() || defaultValue;
 }
 
 function toInt(value: string, fallback: number, min: number, max: number) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function isCollectionSourceMeta(sourceMeta: unknown) {
+  if (!sourceMeta || typeof sourceMeta !== 'object') return false;
+  return (sourceMeta as Record<string, unknown>).isCollection === true;
 }
 
 async function main() {
@@ -31,14 +39,19 @@ async function main() {
     },
     orderBy: { id: 'desc' },
     take: sampleSize,
-    select: {
-      id: true,
-      telegramMessageId: true,
-      telegramMessageLink: true,
-      groupKey: true,
-      finishedAt: true,
-    },
-  });
+      select: {
+        id: true,
+        telegramMessageId: true,
+        telegramMessageLink: true,
+        groupKey: true,
+        finishedAt: true,
+        mediaAsset: {
+          select: {
+            sourceMeta: true,
+          },
+        },
+      },
+    });
 
   const sourceRows = await (prisma as any).catalogSourceItem.findMany({
     where: { channelId },
@@ -54,60 +67,150 @@ async function main() {
     },
   });
 
+  const sourceDispatchIds = [...new Set(
+    sourceRows
+      .map((row: any) => row.sourceDispatchTaskId)
+      .filter((id: unknown) => typeof id === 'bigint'),
+  )];
+  const sourceDispatchMetaRows = sourceDispatchIds.length > 0
+    ? await prisma.dispatchTask.findMany({
+        where: { id: { in: sourceDispatchIds as bigint[] } },
+        select: {
+          id: true,
+          mediaAsset: {
+            select: {
+              sourceMeta: true,
+            },
+          },
+        },
+      })
+    : [];
+  const sourceDispatchMetaMap = new Map(
+    sourceDispatchMetaRows.map((row) => [row.id.toString(), row.mediaAsset?.sourceMeta]),
+  );
+
+  let collectionRowsInCatalogSource = 0;
+  const eligibleSourceRows = sourceRows.filter((row: any) => {
+    const sourceMeta =
+      row.sourceDispatchTaskId !== null && row.sourceDispatchTaskId !== undefined
+        ? sourceDispatchMetaMap.get(String(row.sourceDispatchTaskId))
+        : undefined;
+    const isCollection = isCollectionSourceMeta(sourceMeta);
+    if (isCollection) {
+      collectionRowsInCatalogSource += 1;
+      return false;
+    }
+    return true;
+  });
+
   const sourceByMessageId = new Map<string, any>();
-  for (const row of sourceRows) {
+  for (const row of eligibleSourceRows) {
     sourceByMessageId.set(String(row.telegramMessageId), row);
+  }
+
+  const sourceByGroupKey = new Map<string, any>();
+  for (const row of eligibleSourceRows) {
+    if (row.groupKey) {
+      sourceByGroupKey.set(row.groupKey, row);
+    }
   }
 
   let matched = 0;
   let missing = 0;
   let linkMismatch = 0;
   let typeMismatch = 0;
+  let groupSkipped = 0;
+  let collectionDispatchSkipped = 0;
 
   const mismatchSamples: Array<Record<string, unknown>> = [];
 
+  const seenGroupKeys = new Set<string>();
+
   for (const row of dispatchRows) {
-    const key = String(row.telegramMessageId);
-    const mapped = sourceByMessageId.get(key);
-    if (!mapped) {
-      missing += 1;
-      if (mismatchSamples.length < 20) {
-        mismatchSamples.push({
-          type: 'missing',
-          dispatchTaskId: row.id.toString(),
-          telegramMessageId: key,
-          expectedSourceType: row.groupKey ? 'group' : 'single',
-        });
-      }
+    if (isCollectionSourceMeta(row.mediaAsset?.sourceMeta)) {
+      collectionDispatchSkipped += 1;
       continue;
     }
 
-    matched += 1;
-
     const expectedType = row.groupKey ? 'group' : 'single';
-    if (mapped.sourceType !== expectedType) {
-      typeMismatch += 1;
-      if (mismatchSamples.length < 20) {
-        mismatchSamples.push({
-          type: 'source_type_mismatch',
-          dispatchTaskId: row.id.toString(),
-          telegramMessageId: key,
-          expected: expectedType,
-          actual: mapped.sourceType,
-        });
-      }
-    }
 
-    if ((row.telegramMessageLink || '') !== (mapped.telegramMessageLink || '')) {
-      linkMismatch += 1;
-      if (mismatchSamples.length < 20) {
-        mismatchSamples.push({
-          type: 'link_mismatch',
-          dispatchTaskId: row.id.toString(),
-          telegramMessageId: key,
-          dispatchLink: row.telegramMessageLink,
-          sourceLink: mapped.telegramMessageLink,
-        });
+    if (row.groupKey) {
+      if (seenGroupKeys.has(row.groupKey)) {
+        groupSkipped += 1;
+        continue;
+      }
+      seenGroupKeys.add(row.groupKey);
+
+      const mapped = sourceByGroupKey.get(row.groupKey);
+      if (!mapped) {
+        missing += 1;
+        if (mismatchSamples.length < 20) {
+          mismatchSamples.push({
+            type: 'missing_group',
+            dispatchTaskId: row.id.toString(),
+            groupKey: row.groupKey,
+            expectedSourceType: 'group',
+          });
+        }
+        continue;
+      }
+
+      matched += 1;
+
+      if (mapped.sourceType !== 'group') {
+        typeMismatch += 1;
+        if (mismatchSamples.length < 20) {
+          mismatchSamples.push({
+            type: 'source_type_mismatch',
+            dispatchTaskId: row.id.toString(),
+            groupKey: row.groupKey,
+            expected: 'group',
+            actual: mapped.sourceType,
+          });
+        }
+      }
+    } else {
+      const key = String(row.telegramMessageId);
+      const mapped = sourceByMessageId.get(key);
+      if (!mapped) {
+        missing += 1;
+        if (mismatchSamples.length < 20) {
+          mismatchSamples.push({
+            type: 'missing_single',
+            dispatchTaskId: row.id.toString(),
+            telegramMessageId: key,
+            expectedSourceType: 'single',
+          });
+        }
+        continue;
+      }
+
+      matched += 1;
+
+      if (mapped.sourceType !== 'single') {
+        typeMismatch += 1;
+        if (mismatchSamples.length < 20) {
+          mismatchSamples.push({
+            type: 'source_type_mismatch',
+            dispatchTaskId: row.id.toString(),
+            telegramMessageId: key,
+            expected: 'single',
+            actual: mapped.sourceType,
+          });
+        }
+      }
+
+      if ((row.telegramMessageLink || '') !== (mapped.telegramMessageLink || '')) {
+        linkMismatch += 1;
+        if (mismatchSamples.length < 20) {
+          mismatchSamples.push({
+            type: 'link_mismatch',
+            dispatchTaskId: row.id.toString(),
+            telegramMessageId: key,
+            dispatchLink: row.telegramMessageLink,
+            sourceLink: mapped.telegramMessageLink,
+          });
+        }
       }
     }
   }
@@ -117,10 +220,14 @@ async function main() {
     sampleSize,
     dispatchSampleRows: dispatchRows.length,
     sourceSampleRows: sourceRows.length,
+    eligibleSourceSampleRows: eligibleSourceRows.length,
     matched,
     missing,
     linkMismatch,
     typeMismatch,
+    groupSkipped,
+    collectionDispatchSkipped,
+    collectionRowsInCatalogSource,
     mismatchSamples,
   });
 }
