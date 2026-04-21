@@ -4,6 +4,12 @@ import {
   TYPEC_CATALOG_SOURCE_BACKFILL_BATCH_SIZE,
   TYPEC_CATALOG_SOURCE_BACKFILL_SLEEP_MS,
 } from '../config/env';
+import '../config/env';
+import { prisma } from '../infra/prisma';
+import {
+  TYPEC_CATALOG_SOURCE_BACKFILL_BATCH_SIZE,
+  TYPEC_CATALOG_SOURCE_BACKFILL_SLEEP_MS,
+} from '../config/env';
 import { logger } from '../logger';
 
 function sleep(ms: number) {
@@ -15,6 +21,14 @@ function getCheckpointFromArg() {
   if (!arg) return BigInt(0);
   const value = arg.slice('--from-id='.length).trim();
   if (!/^\d+$/.test(value)) return BigInt(0);
+  return BigInt(value);
+}
+
+function getChannelIdFromArg() {
+  const arg = process.argv.find((item) => item.startsWith('--channel-id='));
+  if (!arg) return null;
+  const value = arg.slice('--channel-id='.length).trim();
+  if (!/^\d+$/.test(value)) return null;
   return BigInt(value);
 }
 
@@ -31,12 +45,12 @@ function truncateCatalogTitle(text: string, maxChars = 15) {
 
 function normalizeTitleFallback(raw: string, fallback: string) {
   const candidate = raw
-    .replace(/[《》#]/g, '')
+    .replace(/[#]/g, '') // 不再删除《》
     .replace(/未知/g, '')
     .trim();
   if (candidate) return candidate;
 
-  const cleanFallback = fallback.replace(/[《》#]/g, '').trim();
+  const cleanFallback = fallback.replace(/[#]/g, '').trim();
   return cleanFallback || '精彩视频';
 }
 
@@ -44,26 +58,30 @@ function extractCatalogShortTitle(raw?: string | null) {
   const caption = normalizeCaptionText(raw);
   if (!caption) return null;
 
-  const matchedTitle = caption.match(/(?:^|\n)\s*📺?\s*片名\s*[：:]\s*(.+)/);
-  const candidateSource =
-    matchedTitle?.[1]?.trim() ||
-    caption
-      .split('\n')
-      .map((line) => line.trim())
-      .find(Boolean) ||
-    '';
+  const lines = caption.split('\n').map((l) => l.trim()).filter(Boolean);
+  
+  // 1. 优先寻找包含 "片名" 的行
+  const titleLineIndex = lines.findIndex((l) => l.includes('片名') || l.startsWith('📺'));
+  
+  if (titleLineIndex !== -1) {
+    let combinedTitle = lines[titleLineIndex];
+    
+    // 如果下一行包含 "主演"，先合并进来
+    const nextLine = lines[titleLineIndex + 1];
+    if (nextLine && (nextLine.includes('主演') || nextLine.includes('👤'))) {
+      combinedTitle += ' ' + nextLine;
+    }
 
-  const normalized = normalizeTitleFallback(
-    candidateSource
-      .replace(/^#+\s*/, '')
-      .replace(/^[-*]+\s*/, '')
-      .replace(/^📺\s*/, '')
-      .replace(/^片名\s*[：:]\s*/, '')
-      .trim(),
-    '精彩视频',
-  );
+    // 增强判断：剔除无用的主演信息
+    // 匹配 "主演：未知"、"主演：不适用" 以及前面的表情符号
+    combinedTitle = combinedTitle.replace(/[\s👤👥]*主演\s*[：:]\s*(?:未知|不适用)/g, '').trim();
 
-  return truncateCatalogTitle(normalized, 15);
+    return truncateCatalogTitle(combinedTitle, 60);
+  }
+
+  // 2. 回退逻辑：取第一行内容
+  const firstLine = lines[0] || '';
+  return truncateCatalogTitle(firstLine, 40);
 }
 
 function buildGroupMessageLink(tgChatId: string | null, messageId: bigint | null): string | null {
@@ -221,11 +239,13 @@ async function main() {
   const batchSize = TYPEC_CATALOG_SOURCE_BACKFILL_BATCH_SIZE;
   const sleepMs = TYPEC_CATALOG_SOURCE_BACKFILL_SLEEP_MS;
   let cursor = getCheckpointFromArg();
+  const filterChannelId = getChannelIdFromArg();
 
   logger.info('[catalog_source_backfill] started', {
     batchSize,
     sleepMs,
     fromId: cursor.toString(),
+    filterChannelId: filterChannelId?.toString() ?? null,
   });
 
   let totalProcessed = 0;
@@ -239,6 +259,7 @@ async function main() {
         id: { gt: cursor },
         status: 'success',
         telegramMessageId: { not: null },
+        ...(filterChannelId ? { channelId: filterChannelId } : {}),
       },
       orderBy: { id: 'asc' },
       take: batchSize,

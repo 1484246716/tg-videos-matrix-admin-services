@@ -1061,6 +1061,45 @@ export async function handleCatalogJob(
           nextAllowedAt: nextAllowedAt.toISOString(),
         };
       }
+
+      // 当过了间隔检查期后，进一步判断距离上次有效更新是否有产生新的视频记录
+      if (channel.lastNavUpdateAt && triggerType !== 'manual_repair') {
+        const hasNewItem = TYPEC_READ_FROM_CATALOG_SOURCE
+          ? await (prisma as any).catalogSourceItem.findFirst({
+              where: {
+                channelId,
+                publishedAt: { gt: channel.lastNavUpdateAt },
+              },
+              select: { id: true },
+            })
+          : await prisma.dispatchTask.findFirst({
+              where: {
+                channelId,
+                status: TaskStatus.success,
+                telegramMessageId: { not: null },
+                finishedAt: { gt: channel.lastNavUpdateAt },
+              },
+              select: { id: true },
+            });
+
+        if (!hasNewItem) {
+          catalogMetrics.publishRunSkippedTotal += 1;
+          logger.info('[q_catalog] 跳过执行：距离上次更新没有产生新视频记录', {
+            runId,
+            channelId: channelIdRaw,
+            triggerType,
+            reason: 'no_new_records_since_last_update',
+          });
+
+          // 更新 lastNavUpdateAt，让频道重新进入下一个间隔等待，防止在接下来的几十分钟内每秒查一遍库
+          await prisma.channel.update({
+            where: { id: channelId },
+            data: { lastNavUpdateAt: guardNow },
+          });
+
+          return { ok: true, skipped: true, reason: '没有新视频产生，跳过更新' };
+        }
+      }
     }
 
     const bot = channel.defaultBot;
