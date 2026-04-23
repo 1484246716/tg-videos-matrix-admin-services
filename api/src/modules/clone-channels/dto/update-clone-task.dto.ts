@@ -1,4 +1,5 @@
 import {
+  IsBoolean,
   IsArray,
   IsIn,
   IsInt,
@@ -55,6 +56,14 @@ export class UpdateCloneTaskDto {
   @Min(1)
   @Max(5000)
   recentLimit?: number;
+
+  @IsOptional()
+  @IsBoolean()
+  singleMessageEnabled?: boolean;
+
+  @IsOptional()
+  @IsString()
+  singleMessageLink?: string;
 
   @IsOptional()
   @IsIn(CRAWL_MODES)

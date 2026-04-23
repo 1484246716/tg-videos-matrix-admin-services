@@ -357,6 +357,78 @@ function getSourceMetaObject(sourceMeta: unknown) {
   return sourceMeta && typeof sourceMeta === 'object' ? (sourceMeta as Record<string, unknown>) : null;
 }
 
+function parseSourceExpectedCountFromMeta(sourceMeta: unknown) {
+  const meta = getSourceMetaObject(sourceMeta);
+  const parsed = toFiniteNumber(meta?.sourceExpectedCount);
+  if (!parsed || parsed <= 0) return null;
+  return Math.floor(parsed);
+}
+
+function parseSourceMessageIdFromMeta(sourceMeta: unknown) {
+  const meta = getSourceMetaObject(sourceMeta);
+  const raw = meta?.sourceMessageId;
+  if (typeof raw === 'string' && /^\d+$/.test(raw.trim())) return raw.trim();
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return String(Math.floor(raw));
+  if (typeof raw === 'bigint' && raw > 0n) return raw.toString();
+  return null;
+}
+
+function dedupeGroupTasksBySourceId<T extends {
+  id: bigint;
+  mediaAsset: {
+    id: bigint;
+    status: MediaStatus;
+    telegramFileId: string | null;
+    dispatchMediaType: DispatchMediaType | null;
+    sourceMeta: unknown;
+  };
+}>(tasks: T[]) {
+  const keyOf = (task: T) => {
+    const sourceMessageId = parseSourceMessageIdFromMeta(task.mediaAsset.sourceMeta);
+    // 方案4：业务兜底去重键优先使用 sourceMessageId（即 source_id）；缺失时退化到 mediaAssetId。
+    return sourceMessageId ? `src:${sourceMessageId}` : `asset:${task.mediaAsset.id.toString()}`;
+  };
+
+  const scoreOf = (task: T) => {
+    const uploadedReady =
+      task.mediaAsset.status === MediaStatus.relay_uploaded &&
+      Boolean(task.mediaAsset.telegramFileId) &&
+      Boolean(task.mediaAsset.dispatchMediaType);
+    if (uploadedReady) return 3;
+    if (task.mediaAsset.telegramFileId) return 2;
+    return 1;
+  };
+
+  const picked = new Map<string, T>();
+  const dropped: Array<{ key: string; taskId: string; mediaAssetId: string }> = [];
+
+  for (const task of tasks) {
+    const key = keyOf(task);
+    const current = picked.get(key);
+    if (!current) {
+      picked.set(key, task);
+      continue;
+    }
+
+    const scoreA = scoreOf(current);
+    const scoreB = scoreOf(task);
+    const shouldReplace = scoreB > scoreA || (scoreB === scoreA && task.id > current.id);
+
+    if (shouldReplace) {
+      dropped.push({ key, taskId: current.id.toString(), mediaAssetId: current.mediaAsset.id.toString() });
+      picked.set(key, task);
+    } else {
+      dropped.push({ key, taskId: task.id.toString(), mediaAssetId: task.mediaAsset.id.toString() });
+    }
+  }
+
+  return {
+    deduped: Array.from(picked.values()),
+    dropped,
+    uniqueCount: picked.size,
+  };
+}
+
 function parseCollectionSourceMeta(sourceMeta: unknown) {
   const meta = getSourceMetaObject(sourceMeta);
   if (meta?.isCollection !== true) {
@@ -641,7 +713,7 @@ export async function handleDispatchGroupJob(
     { label: 'dispatch.handleDispatchGroupJob.findGroupTasks' },
   );
 
-  const groupTaskState = await withPrismaRetry(
+  let groupTaskState = await withPrismaRetry(
     () =>
       (prisma as any).dispatchGroupTask.findFirst({
         where: {
@@ -710,22 +782,93 @@ export async function handleDispatchGroupJob(
       : t,
   );
 
-  const alreadySuccess = normalizedGroupTasks.filter((t) => t.status === TaskStatus.success);
-  const pendingGroupTasks = normalizedGroupTasks.filter((t) => readyStatuses.has(t.status));
-  const excludedGroupTasks = normalizedGroupTasks.filter(
+  // 方案4：组消息组装前做业务层去重聚合，避免重复 source_id 被重复发送。
+  const dedupeSnapshot = dedupeGroupTasksBySourceId(normalizedGroupTasks as any);
+  const groupedTasksDeduped = dedupeSnapshot.deduped as typeof normalizedGroupTasks;
+
+  const alreadySuccess = groupedTasksDeduped.filter((t) => t.status === TaskStatus.success);
+  const pendingGroupTasks = groupedTasksDeduped.filter((t) => readyStatuses.has(t.status));
+  const excludedGroupTasks = groupedTasksDeduped.filter(
     (t) => !readyStatuses.has(t.status) && t.status !== TaskStatus.success,
   );
-  const uploadedReadyTasks = normalizedGroupTasks.filter(
+  const uploadedReadyTasks = groupedTasksDeduped.filter(
     (t) =>
       t.mediaAsset.status === MediaStatus.relay_uploaded &&
       Boolean(t.mediaAsset.telegramFileId) &&
       Boolean(t.mediaAsset.dispatchMediaType),
   );
-  const sourceExpectedCount = Number(groupTaskState?.sourceExpectedCount ?? 0);
+  // 修复点：为避免“sourceExpectedCount 缺失导致永久阻塞”，
+  // 在 worker 预检阶段再从组内 mediaAsset.sourceMeta 聚合一次候选值。
+  const sourceExpectedCountFromAssets = normalizedGroupTasks
+    .map((t) => parseSourceExpectedCountFromMeta(t.mediaAsset?.sourceMeta))
+    .filter((n): n is number => typeof n === 'number' && n > 0);
+  const computedSourceExpectedCount =
+    sourceExpectedCountFromAssets.length > 0 ? Math.max(...sourceExpectedCountFromAssets) : 0;
+
+  // 仅当 dispatchGroupTask 当前值缺失(<=0)时才补写，避免覆盖已有正确值。
+  // 这里使用 updateMany + 条件 where，确保并发场景下是幂等/保守补写。
+  if (groupTaskState?.id && Number(groupTaskState.sourceExpectedCount ?? 0) <= 0 && computedSourceExpectedCount > 0) {
+    await withPrismaRetry(
+      () =>
+        (prisma as any).dispatchGroupTask.updateMany({
+          where: {
+            id: groupTaskState.id,
+            OR: [{ sourceExpectedCount: null }, { sourceExpectedCount: { lte: 0 } }],
+          },
+          data: {
+            sourceExpectedCount: computedSourceExpectedCount,
+          },
+        }),
+      { label: 'dispatch.handleDispatchGroupJob.backfillSourceExpectedCount' },
+    );
+
+    logger.info('[typeb_group][verify] sourceExpectedCount backfilled from grouped assets', {
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: seedTask.groupKey,
+      dispatchGroupTaskId: groupTaskState.id.toString(),
+      computedSourceExpectedCount,
+      sourceFrom: 'grouped_media_asset_source_meta',
+    });
+
+    groupTaskState = await withPrismaRetry(
+      () =>
+        (prisma as any).dispatchGroupTask.findFirst({
+          where: {
+            channelId: seedTask.channelId,
+            groupKey: seedTask.groupKey,
+          },
+          orderBy: [{ updatedAt: 'desc' }],
+          select: {
+            id: true,
+            status: true,
+            expectedMediaCount: true,
+            sourceExpectedCount: true,
+            actualReadyCount: true,
+            actualUploadedCount: true,
+            lastArrivalAt: true,
+            sealedAt: true,
+            sealReason: true,
+          },
+        }),
+      { label: 'dispatch.handleDispatchGroupJob.refetchDispatchGroupTaskStateAfterBackfill' },
+    );
+  }
+
+  // 最终读取采用 max(db值, 本轮聚合值)：
+  // - 不放宽分组闸门规则（仍要求 sourceExpectedCount>0）
+  // - 但可消除“db暂未补写完成”带来的短暂读空窗。
+  const sourceExpectedCount = Math.max(
+    Number(groupTaskState?.sourceExpectedCount ?? 0),
+    computedSourceExpectedCount,
+  );
   const expectedTotalSource = sourceExpectedCount > 0
-    ? 'source_expected_count'
+    ? Number(groupTaskState?.sourceExpectedCount ?? 0) > 0
+      ? 'source_expected_count'
+      : 'source_expected_count_backfilled_from_assets'
     : 'fallback_missing_source_expected_count';
   const expectedCount = sourceExpectedCount;
+  const expectedUniqueCount = expectedCount;
+  const actualUniqueCount = dedupeSnapshot.uniqueCount;
   const lastArrivalAt = groupTaskState?.lastArrivalAt ? new Date(groupTaskState.lastArrivalAt) : null;
   const quietReached =
     Boolean(lastArrivalAt) &&
@@ -780,13 +923,16 @@ export async function handleDispatchGroupJob(
     channelId: seedTask.channelId.toString(),
     dispatchGroupTaskId: groupTaskState?.id?.toString?.() ?? null,
     expectedCount,
+    expectedUniqueCount,
+    actualUniqueCount,
     readyCount: pendingGroupTasks.length,
     uploadedCount: uploadedReadyTasks.length,
     successCount: alreadySuccess.length,
     recoveredDeadTaskIds: recoverableDeadTasks.map((t) => t.id.toString()),
-    taskIds: normalizedGroupTasks.map((t) => t.id.toString()),
-    assetIds: normalizedGroupTasks.map((t) => t.mediaAsset.id.toString()),
-    statuses: normalizedGroupTasks.map((t) => ({
+    taskIds: groupedTasksDeduped.map((t) => t.id.toString()),
+    assetIds: groupedTasksDeduped.map((t) => t.mediaAsset.id.toString()),
+    dedupeDropped: dedupeSnapshot.dropped,
+    statuses: groupedTasksDeduped.map((t) => ({
       taskId: t.id.toString(),
       status: t.status,
       retryCount: t.retryCount,
@@ -803,7 +949,7 @@ export async function handleDispatchGroupJob(
       telegramErrorCode: t.telegramErrorCode ?? null,
       telegramErrorMessage: t.telegramErrorMessage ?? null,
     })),
-    mediaSources: normalizedGroupTasks.map((t) => {
+    mediaSources: groupedTasksDeduped.map((t) => {
       const meta = t.mediaAsset.sourceMeta && typeof t.mediaAsset.sourceMeta === 'object'
         ? (t.mediaAsset.sourceMeta as Record<string, unknown>)
         : null;
@@ -867,7 +1013,23 @@ export async function handleDispatchGroupJob(
     });
   }
 
-  if (!sealedEnough || !readyEnough || !uploadedEnough || !hasSourceExpectedCount) {
+  const uniqueCountMatched = expectedUniqueCount > 0 && actualUniqueCount === expectedUniqueCount;
+
+  if (!uniqueCountMatched) {
+    logger.error('[typeb_group][assert] unique count mismatch, block send and alert', {
+      dispatchTaskId: dispatchTaskIdRaw,
+      groupKey: seedTask.groupKey,
+      channelId: seedTask.channelId.toString(),
+      expectedUniqueCount,
+      actualUniqueCount,
+      dedupeDropped: dedupeSnapshot.dropped,
+      blockedReason: 'expected_unique_count_not_equal_actual_unique_count',
+      action: 'reschedule_without_failure',
+      retryAfterMs: TYPEB_GROUP_RETRY_CHECK_MS,
+    });
+  }
+
+  if (!sealedEnough || !readyEnough || !uploadedEnough || !hasSourceExpectedCount || !uniqueCountMatched) {
     logger.warn('[typeb_group][diag] preflight blocked snapshot', {
       dispatchTaskId: dispatchTaskIdRaw,
       groupKey: seedTask.groupKey,
@@ -1079,10 +1241,11 @@ export async function handleDispatchGroupJob(
     }))
     .filter((x) => Boolean(x.telegramFileId));
 
-  if (media.length < 2) {
+  if (media.length < 1) {
     throw new Error(`group_not_ready_media: mediaCount=${media.length}`);
   }
 
+  const fallbackSingleMode = media.length === 1;
   const { caption, captionSource } = buildGroupCaptionFromTasks(sortedGroupTasks as any);
 
   const buildInputMedia = (overrideTypeByTaskId?: Map<string, 'photo' | 'video'>) =>
@@ -1097,6 +1260,7 @@ export async function handleDispatchGroupJob(
     dispatchTaskId: dispatchTaskIdRaw,
     groupKey: seedTask.groupKey,
     mediaCount: media.length,
+    fallbackSingleMode,
     captionSource,
     unresolvedTypeCount,
     mediaTypeMappingAssert: 'meta_or_mime_or_ext_single_resolver',
@@ -1115,63 +1279,127 @@ export async function handleDispatchGroupJob(
     let sendResult;
     let correctedByRetry = false;
 
-    try {
-      sendResult = await sendTelegramRequest({
-        botToken: bot.tokenEncrypted,
-        method: 'sendMediaGroup',
-        payload: {
-          chat_id: seedTask.channel.tgChatId,
-          media: JSON.stringify(buildInputMedia()),
-        },
-      });
-    } catch (sendError) {
-      const errorObj = sendError as TelegramError;
-      if (isVideoAsPhotoError({ code: errorObj.code, message: errorObj.message })) {
-        const retryTypes = new Map<string, 'photo' | 'video'>();
-        const correctedTaskIds: string[] = [];
-
-        for (const item of sortedMedia) {
-          const taskId = item.task.id.toString();
-          const persisted = item.task.mediaAsset.dispatchMediaType;
-          if (persisted === DispatchMediaType.video && item.mediaType !== 'video') {
-            retryTypes.set(taskId, 'video');
-            correctedTaskIds.push(taskId);
-          }
+    if (fallbackSingleMode) {
+      const only = media[0];
+      const sendSingle = async (method: 'sendPhoto' | 'sendVideo', parseMode: string | null | undefined) => {
+        if (method === 'sendPhoto') {
+          return sendPhotoByTelegram({
+            botToken: bot.tokenEncrypted,
+            chatId: seedTask.channel.tgChatId,
+            fileId: only.telegramFileId as string,
+            caption,
+            parseMode,
+            replyMarkup: seedTask.replyMarkup ?? seedTask.channel.aiReplyMarkup ?? undefined,
+          });
         }
 
-        if (correctedTaskIds.length === 0) {
-          logger.warn('[typeb_metrics] group type mismatch detected but no targeted correction candidate', {
-            typeb_group_type_mismatch_total: 1,
+        return sendVideoByTelegram({
+          botToken: bot.tokenEncrypted,
+          chatId: seedTask.channel.tgChatId,
+          fileId: only.telegramFileId as string,
+          caption,
+          parseMode,
+          replyMarkup: seedTask.replyMarkup ?? seedTask.channel.aiReplyMarkup ?? undefined,
+        });
+      };
+
+      const singleMethod = only.type === 'photo' ? 'sendPhoto' : 'sendVideo';
+      logger.info('[typeb_group] fallback to single send for one-item grouped task', {
+        typeb_group_send_fallback_single_total: 1,
+        dispatchTaskId: dispatchTaskIdRaw,
+        groupKey: seedTask.groupKey,
+        mediaCount: media.length,
+        singleMethod,
+      });
+
+      try {
+        sendResult = await sendSingle(singleMethod, seedTask.parseMode);
+      } catch (sendError) {
+        const errorObj = sendError as TelegramError;
+
+        if (singleMethod === 'sendVideo' && isPhotoAsVideoError({ code: errorObj.code, message: errorObj.message })) {
+          logger.warn('[typeb_group] single fallback sendVideo failed by photo type, retry with sendPhoto', {
             dispatchTaskId: dispatchTaskIdRaw,
             groupKey: seedTask.groupKey,
             errorCode: errorObj.code,
             errorMessage: errorObj.message,
           });
+          sendResult = await sendSingle('sendPhoto', seedTask.parseMode);
+        } else if (
+          seedTask.parseMode?.toUpperCase() === 'HTML' &&
+          isParseEntitiesError({ code: errorObj.code, message: errorObj.message })
+        ) {
+          logger.warn('[typeb_group] single fallback parse entities failed, retry with plain text', {
+            dispatchTaskId: dispatchTaskIdRaw,
+            groupKey: seedTask.groupKey,
+            singleMethod,
+            errorCode: errorObj.code,
+            errorMessage: errorObj.message,
+          });
+          sendResult = await sendSingle(singleMethod, null);
+        } else {
           throw sendError;
         }
-
-        logger.warn('[typeb_group] sendMediaGroup 检测到 Video 被当作 Photo，执行定向纠错重试', {
-          typeb_group_retry_corrected_total: 1,
-          dispatchTaskId: dispatchTaskIdRaw,
-          groupKey: seedTask.groupKey,
-          mediaCount: media.length,
-          correctedTaskIds,
-          retryMode: 'targeted_by_persisted_dispatch_media_type',
-          errorCode: errorObj.code,
-          errorMessage: errorObj.message,
-        });
-
-        correctedByRetry = true;
+      }
+    } else {
+      try {
         sendResult = await sendTelegramRequest({
           botToken: bot.tokenEncrypted,
           method: 'sendMediaGroup',
           payload: {
             chat_id: seedTask.channel.tgChatId,
-            media: JSON.stringify(buildInputMedia(retryTypes)),
+            media: JSON.stringify(buildInputMedia()),
           },
         });
-      } else {
-        throw sendError;
+      } catch (sendError) {
+        const errorObj = sendError as TelegramError;
+        if (isVideoAsPhotoError({ code: errorObj.code, message: errorObj.message })) {
+          const retryTypes = new Map<string, 'photo' | 'video'>();
+          const correctedTaskIds: string[] = [];
+
+          for (const item of sortedMedia) {
+            const taskId = item.task.id.toString();
+            const persisted = item.task.mediaAsset.dispatchMediaType;
+            if (persisted === DispatchMediaType.video && item.mediaType !== 'video') {
+              retryTypes.set(taskId, 'video');
+              correctedTaskIds.push(taskId);
+            }
+          }
+
+          if (correctedTaskIds.length === 0) {
+            logger.warn('[typeb_metrics] group type mismatch detected but no targeted correction candidate', {
+              typeb_group_type_mismatch_total: 1,
+              dispatchTaskId: dispatchTaskIdRaw,
+              groupKey: seedTask.groupKey,
+              errorCode: errorObj.code,
+              errorMessage: errorObj.message,
+            });
+            throw sendError;
+          }
+
+          logger.warn('[typeb_group] sendMediaGroup 检测到 Video 被当作 Photo，执行定向纠错重试', {
+            typeb_group_retry_corrected_total: 1,
+            dispatchTaskId: dispatchTaskIdRaw,
+            groupKey: seedTask.groupKey,
+            mediaCount: media.length,
+            correctedTaskIds,
+            retryMode: 'targeted_by_persisted_dispatch_media_type',
+            errorCode: errorObj.code,
+            errorMessage: errorObj.message,
+          });
+
+          correctedByRetry = true;
+          sendResult = await sendTelegramRequest({
+            botToken: bot.tokenEncrypted,
+            method: 'sendMediaGroup',
+            payload: {
+              chat_id: seedTask.channel.tgChatId,
+              media: JSON.stringify(buildInputMedia(retryTypes)),
+            },
+          });
+        } else {
+          throw sendError;
+        }
       }
     }
 
@@ -1353,6 +1581,7 @@ export async function handleDispatchJob(
               defaultBotId: true,
               aiModelProfileId: true,
               aiSystemPromptTemplate: true,
+              cloneUseAiPromptTemplate: true,
               aiReplyMarkup: true,
               postIntervalSec: true,
               lastPostAt: true,
@@ -1505,7 +1734,7 @@ export async function handleDispatchJob(
       finalCaption = originalNameStem;
     }
 
-    if (task.channel.aiSystemPromptTemplate) {
+    if (task.channel.aiSystemPromptTemplate && task.channel.cloneUseAiPromptTemplate) {
       let profile = task.channel.aiModelProfileId
         ? await prisma.aiModelProfile.findUnique({
             where: { id: task.channel.aiModelProfileId },

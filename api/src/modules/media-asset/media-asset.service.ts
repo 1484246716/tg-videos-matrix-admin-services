@@ -3,11 +3,14 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { Queue } from 'bullmq';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import { basename, extname, resolve } from 'node:path';
+import IORedis from 'ioredis';
 import { MediaStatus, Prisma } from '@prisma/client';
+import { ContentTaxonomyService } from '../content-taxonomy/content-taxonomy.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateMediaAssetDto } from './dto/create-media-asset.dto';
 import { UpdateMediaAssetStatusDto } from './dto/update-media-asset-status.dto';
@@ -23,9 +26,25 @@ const SUPPORTED_VIDEO_EXT = new Set([
   '.webm',
 ]);
 
+let searchIndexQueue: Queue | null = null;
+
+function getSearchIndexQueue() {
+  if (searchIndexQueue) return searchIndexQueue;
+
+  const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+  const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+  searchIndexQueue = new Queue('q_search_index', {
+    connection: connection as any,
+  });
+  return searchIndexQueue;
+}
+
 @Injectable()
 export class MediaAssetService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly contentTaxonomyService: ContentTaxonomyService,
+  ) {}
 
   async list(params: {
     channelId?: string;
@@ -74,6 +93,20 @@ export class MediaAssetService {
               tgChatId: true,
             },
           },
+          categories: {
+            include: {
+              level2: {
+                include: {
+                  level1: true,
+                },
+              },
+            },
+          },
+          tags: {
+            include: {
+              tag: true,
+            },
+          },
         },
       }),
     ]);
@@ -93,6 +126,20 @@ export class MediaAssetService {
             id: item.channel.id.toString(),
           }
         : null,
+      categories: item.categories.map((category) => ({
+        id: category.level2.id.toString(),
+        name: category.level2.name,
+        slug: category.level2.slug,
+        level1Id: category.level2.level1Id.toString(),
+        level1Name: category.level2.level1.name,
+        level1Slug: category.level2.level1.slug,
+      })),
+      tags: item.tags.map((tag) => ({
+        id: tag.tag.id.toString(),
+        name: tag.tag.name,
+        slug: tag.tag.slug,
+        scope: tag.tag.scope,
+      })),
     }));
 
     if (!usePagination) {
@@ -154,6 +201,47 @@ export class MediaAssetService {
         ingestError: null,
       },
     });
+  }
+
+  async updateTaxonomy(
+    id: string,
+    dto: { level2Ids?: string[]; tagIds?: string[] },
+    userId?: string,
+    role?: string,
+  ) {
+    const asset = await this.prisma.mediaAsset.findFirst({
+      where: {
+        id: BigInt(id),
+        channel:
+          role === 'admin'
+            ? undefined
+            : {
+                createdBy: userId ? BigInt(userId) : undefined,
+              },
+      },
+      select: {
+        id: true,
+        collectionEpisode: {
+          select: { id: true },
+        },
+      },
+    });
+
+    if (!asset) {
+      throw new NotFoundException('media asset not found');
+    }
+
+    const taxonomy = await this.contentTaxonomyService.replaceMediaAssetTaxonomy(asset.id, dto);
+    await this.enqueueSearchIndexJob({
+      sourceType: asset.collectionEpisode ? 'collection_episode' : 'media_asset',
+      sourceId: asset.collectionEpisode ? asset.collectionEpisode.id.toString() : asset.id.toString(),
+      mediaAssetId: asset.id.toString(),
+    });
+
+    return {
+      mediaAssetId: asset.id.toString(),
+      ...taxonomy,
+    };
   }
 
   private async hashFile(filePath: string): Promise<string> {
@@ -269,5 +357,26 @@ export class MediaAssetService {
       enqueuedTasks,
       message: 'Type A 扫描并入队完成（当前入 dispatch_tasks 队列）',
     };
+  }
+
+  private async enqueueSearchIndexJob(payload: {
+    sourceType: 'media_asset' | 'collection_episode';
+    sourceId: string;
+    mediaAssetId: string;
+  }) {
+    const queue = getSearchIndexQueue();
+    await queue.add(
+      'upsert',
+      {
+        sourceType: payload.sourceType,
+        sourceId: payload.sourceId,
+        mediaAssetId: payload.mediaAssetId,
+      },
+      {
+        jobId: `search-index-${payload.sourceType}-${payload.sourceId}`,
+        removeOnComplete: true,
+        removeOnFail: 200,
+      },
+    );
   }
 }

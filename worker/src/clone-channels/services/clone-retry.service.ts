@@ -120,7 +120,16 @@ export async function processCloneRetry(job: CloneRetryJob) {
   }
 
   if (job.queue === 'download') {
+    const payload = job.payload as { itemId?: string | number | bigint };
+    const rawItemId = payload?.itemId;
+    const itemId =
+      typeof rawItemId === 'string' || typeof rawItemId === 'number' || typeof rawItemId === 'bigint'
+        ? String(rawItemId)
+        : '';
+
     await cloneMediaDownloadQueue.add('clone-media-download-retry', job.payload, {
+      // 方案2：retry 回流也使用同一 item 级 jobId，跨入口统一去重键。
+      jobId: itemId ? `clone-download-item-${itemId}` : undefined,
       delay: delayMs,
       removeOnComplete: true,
       removeOnFail: 100,

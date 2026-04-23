@@ -13,7 +13,7 @@
  * - 建议低峰执行：避免与 catalog_publish 等定时任务冲突
  */
 import 'dotenv/config';
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { SearchDocumentBuilder } from '../src/services/search-document-builder';
 import type { CollectionInput, EpisodeInput, MediaAssetInput } from '../src/services/search-document-builder';
 import { buildSearchText } from '../src/services/search-text-normalizer';
@@ -75,7 +75,10 @@ async function upsertDoc(doc: ReturnType<typeof SearchDocumentBuilder.fromCollec
     visibility: doc.visibility,
     isActive: doc.isActive,
     isDeleted: doc.isDeleted,
-    ext: doc.ext ?? undefined,
+    ext:
+      doc.ext == null
+        ? Prisma.JsonNull
+        : (doc.ext as unknown as Prisma.InputJsonValue),
     sourceUpdatedAt: doc.sourceUpdatedAt,
     indexedAt: doc.indexedAt,
   };

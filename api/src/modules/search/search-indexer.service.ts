@@ -16,25 +16,26 @@ export class SearchIndexerService {
     private readonly prisma: PrismaService,
     private readonly outboxService: SearchIndexOutboxService,
   ) {
-    const node = process.env.OPENSEARCH_NODE?.trim();
-    this.openSearchEnabled = Boolean(node);
-    this.openSearchIndex = (process.env.OPENSEARCH_INDEX || 'search_documents_v1').trim();
-    this.openSearchReadAlias = (process.env.OPENSEARCH_INDEX_READ || 'search_documents_read').trim();
-    this.openSearchWriteAlias = (process.env.OPENSEARCH_INDEX_WRITE || 'search_documents_write').trim();
+    const node = this.readString('OPENSEARCH_NODE', 'http://localhost:9200');
+    this.openSearchEnabled = this.readBoolean('OPENSEARCH_ENABLED', true);
+    this.openSearchIndex = this.readString('OPENSEARCH_INDEX', 'search_documents_v2');
+    this.openSearchReadAlias = this.readString('OPENSEARCH_INDEX_READ', 'search_documents_read');
+    this.openSearchWriteAlias = this.readString('OPENSEARCH_INDEX_WRITE', 'search_documents_write');
 
-    if (!node) {
+    if (!this.openSearchEnabled) {
       this.client = null;
-      this.logger.warn('[search-indexer] OPENSEARCH_NODE 未配置，索引同步将仅记录日志');
+      this.logger.warn('[search-indexer] OPENSEARCH_ENABLED=false，索引同步已禁用');
       return;
     }
 
-    const username = process.env.OPENSEARCH_USERNAME?.trim();
-    const password = process.env.OPENSEARCH_PASSWORD?.trim();
+    const username = this.readOptionalString('OPENSEARCH_USERNAME');
+    const password = this.readOptionalString('OPENSEARCH_PASSWORD');
+    const allowSelfSigned = this.readBoolean('OPENSEARCH_ALLOW_SELF_SIGNED', false);
 
     this.client = new OpenSearchClient({
       node,
       auth: username && password ? { username, password } : undefined,
-      ssl: process.env.OPENSEARCH_ALLOW_SELF_SIGNED === 'true' ? { rejectUnauthorized: false } : undefined,
+      ssl: allowSelfSigned ? { rejectUnauthorized: false } : undefined,
     });
   }
 
@@ -89,6 +90,35 @@ export class SearchIndexerService {
       return;
     }
 
+    const [categories, tags] = await Promise.all([
+      this.prisma.$queryRaw<Array<{ level1_id: bigint; level1_name: string; level2_id: bigint; level2_name: string }>>`
+        SELECT
+          l1.id AS level1_id,
+          l1.name AS level1_name,
+          l2.id AS level2_id,
+          l2.name AS level2_name
+        FROM search_document_categories sdc
+        INNER JOIN category_level2 l2 ON l2.id = sdc.level2_id
+        INNER JOIN category_level1 l1 ON l1.id = l2.level1_id
+        WHERE sdc.search_document_id = ${doc.id}
+      `,
+      this.prisma.$queryRaw<Array<{ tag_id: bigint; tag_name: string }>>`
+        SELECT
+          ct.id AS tag_id,
+          ct.name AS tag_name
+        FROM search_document_tags sdt
+        INNER JOIN content_tags ct ON ct.id = sdt.tag_id
+        WHERE sdt.search_document_id = ${doc.id}
+      `,
+    ]);
+
+    const categoryLevel1Ids = Array.from(new Set(categories.map((row) => Number(row.level1_id))));
+    const categoryLevel1Names = Array.from(new Set(categories.map((row) => row.level1_name)));
+    const categoryLevel2Ids = Array.from(new Set(categories.map((row) => Number(row.level2_id))));
+    const categoryLevel2Names = Array.from(new Set(categories.map((row) => row.level2_name)));
+    const tagIds = Array.from(new Set(tags.map((row) => Number(row.tag_id))));
+    const tagNames = Array.from(new Set(tags.map((row) => row.tag_name)));
+
     const body = {
       doc_id: doc.docId,
       doc_type: doc.docType,
@@ -116,6 +146,12 @@ export class SearchIndexerService {
       popularity_score: Number(doc.popularityScore),
       manual_weight: Number(doc.manualWeight),
       visibility: doc.visibility,
+      category_level1_ids: categoryLevel1Ids,
+      category_level1_names: categoryLevel1Names,
+      category_level2_ids: categoryLevel2Ids,
+      category_level2_names: categoryLevel2Names,
+      tag_ids: tagIds,
+      tag_names: tagNames,
       is_active: doc.isActive,
       is_deleted: doc.isDeleted,
       ext: doc.ext,
@@ -140,6 +176,8 @@ export class SearchIndexerService {
     channelIds: bigint[];
     limit: number;
     offset: number;
+    docTypes: string[];
+    visibilityValues: string[];
   }) {
     if (!this.openSearchEnabled || !this.client) {
       return { enabled: false as const, results: [], total: 0 };
@@ -165,6 +203,8 @@ export class SearchIndexerService {
               { term: { is_active: true } },
               { term: { is_deleted: false } },
               { terms: { channel_id: args.channelIds.map((id) => Number(id)) } },
+              { terms: { doc_type: args.docTypes } },
+              { terms: { visibility: args.visibilityValues } },
             ],
           },
         },
@@ -194,6 +234,8 @@ export class SearchIndexerService {
     limit: number;
     offset: number;
     periodDays: number;
+    docTypes: string[];
+    visibilityValues: string[];
   }) {
     if (!this.openSearchEnabled || !this.client) {
       return { enabled: false as const, results: [], total: 0 };
@@ -210,6 +252,8 @@ export class SearchIndexerService {
               { term: { is_active: true } },
               { term: { is_deleted: false } },
               { terms: { channel_id: args.channelIds.map((id) => Number(id)) } },
+              { terms: { doc_type: args.docTypes } },
+              { terms: { visibility: args.visibilityValues } },
               {
                 range: {
                   published_at: {
@@ -246,10 +290,38 @@ export class SearchIndexerService {
     channelIds: bigint[];
     limit: number;
     offset: number;
+    tagId?: number;
     tagName?: string;
+    level1Id?: number;
+    docTypes: string[];
+    visibilityValues: string[];
   }) {
-    if (!this.openSearchEnabled || !this.client || !args.tagName) {
+    if (!this.openSearchEnabled || !this.client) {
       return { enabled: false as const, results: [], total: 0 };
+    }
+
+    const hasTagId = typeof args.tagId === 'number' && Number.isFinite(args.tagId) && args.tagId > 0;
+    const normalizedTagName = String(args.tagName || '').trim();
+    if (!hasTagId && !normalizedTagName) {
+      return { enabled: false as const, results: [], total: 0 };
+    }
+
+    const filter: Array<Record<string, unknown>> = [
+      { term: { is_active: true } },
+      { term: { is_deleted: false } },
+      { terms: { channel_id: args.channelIds.map((id) => Number(id)) } },
+      { terms: { doc_type: args.docTypes } },
+      { terms: { visibility: args.visibilityValues } },
+    ];
+
+    if (hasTagId) {
+      filter.push({ term: { tag_ids: Number(args.tagId) } });
+    } else {
+      filter.push({ term: { 'tag_names.keyword': normalizedTagName } });
+    }
+
+    if (typeof args.level1Id === 'number' && Number.isFinite(args.level1Id) && args.level1Id > 0) {
+      filter.push({ term: { category_level1_ids: Number(args.level1Id) } });
     }
 
     const result = await this.client.search({
@@ -259,26 +331,13 @@ export class SearchIndexerService {
         size: args.limit,
         query: {
           bool: {
-            must: [
-              {
-                multi_match: {
-                  query: args.tagName,
-                  type: 'best_fields',
-                  fields: ['genres^4', 'keywords^3', 'title^1.5', 'description'],
-                },
-              },
-            ],
-            filter: [
-              { term: { is_active: true } },
-              { term: { is_deleted: false } },
-              { terms: { channel_id: args.channelIds.map((id) => Number(id)) } },
-            ],
+            filter,
           },
         },
         sort: [
-          { _score: { order: 'desc' } },
           { popularity_score: { order: 'desc', unmapped_type: 'float' } },
           { published_at: { order: 'desc', unmapped_type: 'date' } },
+          { quality_score: { order: 'desc', unmapped_type: 'float' } },
         ],
       },
     });
@@ -370,12 +429,12 @@ export class SearchIndexerService {
               analyzer: {
                 default: {
                   type: 'custom',
-                  tokenizer: 'ik_max_word',
+                  tokenizer: 'standard',
                   filter: ['lowercase'],
                 },
                 search_analyzer: {
                   type: 'custom',
-                  tokenizer: 'ik_smart',
+                  tokenizer: 'standard',
                   filter: ['lowercase'],
                 },
               },
@@ -395,41 +454,41 @@ export class SearchIndexerService {
               episode_id: { type: 'long' },
               title: {
                 type: 'text',
-                analyzer: 'ik_max_word',
-                search_analyzer: 'ik_smart',
+                analyzer: 'standard',
+                search_analyzer: 'standard',
                 fields: {
                   keyword: { type: 'keyword', ignore_above: 256 },
                 },
               },
               original_title: {
                 type: 'text',
-                analyzer: 'ik_max_word',
-                search_analyzer: 'ik_smart',
+                analyzer: 'standard',
+                search_analyzer: 'standard',
               },
               aliases: {
                 type: 'text',
-                analyzer: 'ik_max_word',
-                search_analyzer: 'ik_smart',
+                analyzer: 'standard',
+                search_analyzer: 'standard',
                 fields: {
                   keyword: { type: 'keyword', ignore_above: 256 },
                 },
               },
               actors: {
                 type: 'text',
-                analyzer: 'ik_max_word',
-                search_analyzer: 'ik_smart',
+                analyzer: 'standard',
+                search_analyzer: 'standard',
                 fields: {
                   keyword: { type: 'keyword', ignore_above: 256 },
                 },
               },
-              directors: { type: 'text', analyzer: 'ik_max_word', search_analyzer: 'ik_smart' },
+              directors: { type: 'text', analyzer: 'standard', search_analyzer: 'standard' },
               genres: { type: 'keyword' },
-              keywords: { type: 'text', analyzer: 'ik_max_word', search_analyzer: 'ik_smart' },
+              keywords: { type: 'text', analyzer: 'standard', search_analyzer: 'standard' },
               year: { type: 'integer' },
               region: { type: 'keyword' },
               language: { type: 'keyword' },
-              description: { type: 'text', analyzer: 'ik_max_word', search_analyzer: 'ik_smart' },
-              search_text: { type: 'text', analyzer: 'ik_max_word', search_analyzer: 'ik_smart' },
+              description: { type: 'text', analyzer: 'standard', search_analyzer: 'standard' },
+              search_text: { type: 'text', analyzer: 'standard', search_analyzer: 'standard' },
               telegram_message_link: { type: 'keyword', index: false },
               telegram_message_id: { type: 'keyword' },
               published_at: { type: 'date' },
@@ -437,6 +496,19 @@ export class SearchIndexerService {
               popularity_score: { type: 'float' },
               manual_weight: { type: 'float' },
               visibility: { type: 'keyword' },
+              category_level1_ids: { type: 'long' },
+              category_level1_names: { type: 'keyword' },
+              category_level2_ids: { type: 'long' },
+              category_level2_names: { type: 'keyword' },
+              tag_ids: { type: 'long' },
+              tag_names: {
+                type: 'text',
+                analyzer: 'standard',
+                search_analyzer: 'standard',
+                fields: {
+                  keyword: { type: 'keyword', ignore_above: 256 },
+                },
+              },
               is_active: { type: 'boolean' },
               is_deleted: { type: 'boolean' },
               ext: { type: 'object', enabled: false },
@@ -480,5 +552,26 @@ export class SearchIndexerService {
       if (statusCode === 404) return [];
       throw error;
     }
+  }
+
+  private readString(key: string, fallback: string): string {
+    const raw = process.env[key];
+    const normalized = typeof raw === 'string' ? raw.trim() : '';
+    return normalized || fallback;
+  }
+
+  private readOptionalString(key: string): string | undefined {
+    const raw = process.env[key];
+    const normalized = typeof raw === 'string' ? raw.trim() : '';
+    return normalized || undefined;
+  }
+
+  private readBoolean(key: string, fallback: boolean): boolean {
+    const raw = process.env[key];
+    if (raw == null) return fallback;
+    const normalized = raw.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
   }
 }

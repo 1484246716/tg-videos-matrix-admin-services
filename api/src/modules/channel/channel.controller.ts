@@ -17,6 +17,7 @@ import { ChannelService } from './channel.service';
 import { CreateChannelDto } from './dto/create-channel.dto';
 import { UpdateChannelDto } from './dto/update-channel.dto';
 import { UpdateChannelStatusDto } from './dto/update-channel-status.dto';
+import { UpdateChannelDefaultTaxonomyDto } from './dto/update-channel-default-taxonomy.dto';
 import { Prisma } from '@prisma/client';
 
 interface AuthRequest {
@@ -67,6 +68,7 @@ export class ChannelController {
         navEnabled?: boolean;
         defaultBotId?: string | null;
         aiSystemPromptTemplate?: string;
+        cloneUseAiPromptTemplate?: boolean;
         navTemplateText?: string;
         aiReplyMarkup?: Prisma.InputJsonValue;
         navReplyMarkup?: Prisma.InputJsonValue;
@@ -100,6 +102,22 @@ export class ChannelController {
     @Request() req: AuthRequest,
   ) {
     return this.channelService.updateCatalogTitle(id, body, req.user.userId, req.user.role);
+  }
+
+  @Permissions('channels:view')
+  @Get(':id/default-taxonomy')
+  getDefaultTaxonomy(@Param('id') id: string, @Request() req: AuthRequest) {
+    return this.channelService.getDefaultTaxonomy(id, req.user.userId, req.user.role);
+  }
+
+  @Permissions('channels:update')
+  @Patch(':id/default-taxonomy')
+  updateDefaultTaxonomy(
+    @Param('id') id: string,
+    @Body() dto: UpdateChannelDefaultTaxonomyDto,
+    @Request() req: AuthRequest,
+  ) {
+    return this.channelService.updateDefaultTaxonomy(id, dto, req.user.userId, req.user.role);
   }
 
   @Permissions('channels:update')

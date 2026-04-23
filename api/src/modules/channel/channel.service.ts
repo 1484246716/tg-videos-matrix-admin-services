@@ -11,6 +11,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 import { access, mkdir, rename, rm } from 'node:fs/promises';
 import { dirname, normalize, resolve } from 'node:path';
+import { ContentTaxonomyService } from '../content-taxonomy/content-taxonomy.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateChannelDto } from './dto/create-channel.dto';
 import { UpdateChannelDto } from './dto/update-channel.dto';
@@ -23,7 +24,10 @@ export class ChannelService {
   private catalogQueue: Queue | null = null;
   private redisConnection: IORedis | null = null;
 
-  constructor(private readonly prisma: PrismaService) { }
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly contentTaxonomyService: ContentTaxonomyService,
+  ) { }
 
   private getCatalogQueue() {
     if (!this.catalogQueue) {
@@ -301,6 +305,7 @@ export class ChannelService {
         folderPath: dto.folderPath,
         postIntervalSec: dto.postIntervalSec ?? 120,
         defaultBotId: dto.defaultBotId ? BigInt(dto.defaultBotId) : undefined,
+        cloneUseAiPromptTemplate: dto.cloneUseAiPromptTemplate ?? false,
         navEnabled: dto.navEnabled ?? false,
         navPagingEnabled: dto.navPagingEnabled ?? true,
         navIntervalSec: dto.navIntervalSec ?? 604800,
@@ -382,6 +387,7 @@ export class ChannelService {
       navEnabled?: boolean;
       defaultBotId?: string | null;
       aiSystemPromptTemplate?: string;
+      cloneUseAiPromptTemplate?: boolean;
       navTemplateText?: string;
       aiReplyMarkup?: Prisma.InputJsonValue;
       navReplyMarkup?: Prisma.InputJsonValue;
@@ -426,6 +432,7 @@ export class ChannelService {
               ? BigInt(data.defaultBotId)
               : undefined,
         aiSystemPromptTemplate: data.aiSystemPromptTemplate,
+        cloneUseAiPromptTemplate: data.cloneUseAiPromptTemplate,
         navTemplateText: data.navTemplateText,
         aiReplyMarkup: data.aiReplyMarkup,
         navReplyMarkup: data.navReplyMarkup,
@@ -705,6 +712,49 @@ export class ChannelService {
     });
   }
 
+  async getDefaultTaxonomy(id: string, userId?: string, role?: string) {
+    const channel = await this.prisma.channel.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
+      select: { id: true },
+    });
+
+    if (!channel) {
+      throw new NotFoundException('channel not found');
+    }
+
+    return {
+      channelId: channel.id.toString(),
+      ...(await this.contentTaxonomyService.getChannelDefaultTaxonomy(channel.id)),
+    };
+  }
+
+  async updateDefaultTaxonomy(
+    id: string,
+    dto: { level2Ids?: string[]; tagIds?: string[] },
+    userId?: string,
+    role?: string,
+  ) {
+    const channel = await this.prisma.channel.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
+      select: { id: true },
+    });
+
+    if (!channel) {
+      throw new NotFoundException('channel not found');
+    }
+
+    return {
+      channelId: channel.id.toString(),
+      ...(await this.contentTaxonomyService.replaceChannelDefaultTaxonomy(channel.id, dto)),
+    };
+  }
+
   async update(id: string, dto: UpdateChannelDto, userId?: string, role?: string) {
     const existing = await this.prisma.channel.findFirst({
       where:
@@ -758,6 +808,7 @@ export class ChannelService {
         ? BigInt(dto.catalogTemplateId)
         : undefined,
       aiSystemPromptTemplate: dto.aiSystemPromptTemplate,
+      cloneUseAiPromptTemplate: dto.cloneUseAiPromptTemplate,
       navTemplateText: dto.navTemplateText,
       aiReplyMarkup: dto.aiReplyMarkup as Prisma.InputJsonValue,
       navReplyMarkup: dto.navReplyMarkup as Prisma.InputJsonValue,

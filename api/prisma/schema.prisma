@@ -99,6 +99,7 @@ model Channel {
   aiModelProfileId                  BigInt?          @map("ai_model_profile_id")
   catalogTemplateId                 BigInt?          @map("catalog_template_id")
   aiSystemPromptTemplate            String?          @map("ai_system_prompt_template")
+  cloneUseAiPromptTemplate          Boolean          @default(false) @map("clone_use_ai_prompt_template")
   navTemplateText                   String?          @map("nav_template_text")
   aiReplyMarkup                     Json?            @map("ai_reply_markup")
   navReplyMarkup                    Json?            @map("nav_reply_markup")
@@ -142,6 +143,8 @@ model Channel {
   dispatchTasks                     DispatchTask[]
   dispatchGroupTasks                DispatchGroupTask[]
   mediaAssets                       MediaAsset[]
+  defaultCategories                 ChannelDefaultCategory[]
+  defaultTags                       ChannelDefaultTag[]
 
   @@index([status])
   @@index([defaultBotId, status])
@@ -259,6 +262,7 @@ model MediaAsset {
   collectionEpisode    CollectionEpisode?
   dispatchTasks        DispatchTask[]
   categories           MediaAssetCategory[]
+  tags                 MediaAssetTag[]
   channel              Channel              @relation(fields: [channelId], references: [id])
 
   @@unique([fileHash, fileSize])
@@ -288,6 +292,8 @@ model Collection {
   createdAt           DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt           DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
   episodes            CollectionEpisode[]
+  categories          CollectionCategory[]
+  tags                CollectionTag[]
   channel             Channel             @relation(fields: [channelId], references: [id], onDelete: Cascade)
   createdByUser       User?               @relation(fields: [createdBy], references: [id])
 
@@ -737,6 +743,7 @@ model SearchDocument {
 
   ext             Json?
   categories      SearchDocumentCategory[]
+  tags            SearchDocumentTag[]
 
   sourceUpdatedAt DateTime                 @map("source_updated_at") @db.Timestamptz(6)
   indexedAt       DateTime                 @default(now()) @map("indexed_at") @db.Timestamptz(6)
@@ -772,7 +779,9 @@ model CategoryLevel2 {
   updatedAt       DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(6)
   level1          CategoryLevel1           @relation(fields: [level1Id], references: [id], onDelete: Restrict)
   mediaAssets     MediaAssetCategory[]
+  collections     CollectionCategory[]
   searchDocuments SearchDocumentCategory[]
+  channelDefaults ChannelDefaultCategory[]
 
   @@unique([level1Id, name])
   @@index([level1Id, status, sort])
@@ -792,6 +801,63 @@ model MediaAssetCategory {
   @@map("media_asset_categories")
 }
 
+model ContentTag {
+  id              BigInt              @id @default(autoincrement())
+  name            String              @unique @db.VarChar(64)
+  slug            String              @unique @db.VarChar(64)
+  sort            Int                 @default(0)
+  status          String              @default("active") @db.VarChar(16)
+  scope           String              @default("adult_18") @db.VarChar(16)
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime            @updatedAt @map("updated_at") @db.Timestamptz(6)
+  mediaAssets     MediaAssetTag[]
+  collections     CollectionTag[]
+  searchDocuments SearchDocumentTag[]
+  channelDefaults ChannelDefaultTag[]
+
+  @@index([status, scope, sort])
+  @@map("content_tags")
+}
+
+model MediaAssetTag {
+  id          BigInt     @id @default(autoincrement())
+  mediaAssetId BigInt    @map("media_asset_id")
+  tagId       BigInt     @map("tag_id")
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  mediaAsset  MediaAsset @relation(fields: [mediaAssetId], references: [id], onDelete: Cascade)
+  tag         ContentTag @relation(fields: [tagId], references: [id], onDelete: Restrict)
+
+  @@unique([mediaAssetId, tagId])
+  @@index([tagId, mediaAssetId])
+  @@map("media_asset_tags")
+}
+
+model CollectionCategory {
+  id           BigInt         @id @default(autoincrement())
+  collectionId BigInt         @map("collection_id")
+  level2Id     BigInt         @map("level2_id")
+  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  collection   Collection     @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  level2       CategoryLevel2 @relation(fields: [level2Id], references: [id], onDelete: Restrict)
+
+  @@unique([collectionId, level2Id])
+  @@index([level2Id, collectionId])
+  @@map("collection_categories")
+}
+
+model CollectionTag {
+  id           BigInt     @id @default(autoincrement())
+  collectionId BigInt     @map("collection_id")
+  tagId        BigInt     @map("tag_id")
+  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  collection   Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  tag          ContentTag @relation(fields: [tagId], references: [id], onDelete: Restrict)
+
+  @@unique([collectionId, tagId])
+  @@index([tagId, collectionId])
+  @@map("collection_tags")
+}
+
 model SearchDocumentCategory {
   id               BigInt          @id @default(autoincrement())
   searchDocumentId BigInt          @map("search_document_id")
@@ -803,6 +869,45 @@ model SearchDocumentCategory {
   @@unique([searchDocumentId, level2Id])
   @@index([level2Id, searchDocumentId])
   @@map("search_document_categories")
+}
+
+model SearchDocumentTag {
+  id               BigInt         @id @default(autoincrement())
+  searchDocumentId BigInt         @map("search_document_id")
+  tagId            BigInt         @map("tag_id")
+  createdAt        DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  searchDocument   SearchDocument @relation(fields: [searchDocumentId], references: [id], onDelete: Cascade)
+  tag              ContentTag     @relation(fields: [tagId], references: [id], onDelete: Restrict)
+
+  @@unique([searchDocumentId, tagId])
+  @@index([tagId, searchDocumentId])
+  @@map("search_document_tags")
+}
+
+model ChannelDefaultCategory {
+  id        BigInt         @id @default(autoincrement())
+  channelId BigInt         @map("channel_id")
+  level2Id  BigInt         @map("level2_id")
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  channel   Channel        @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  level2    CategoryLevel2 @relation(fields: [level2Id], references: [id], onDelete: Restrict)
+
+  @@unique([channelId, level2Id])
+  @@index([level2Id, channelId])
+  @@map("channel_default_categories")
+}
+
+model ChannelDefaultTag {
+  id        BigInt     @id @default(autoincrement())
+  channelId BigInt     @map("channel_id")
+  tagId     BigInt     @map("tag_id")
+  createdAt DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  channel   Channel    @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  tag       ContentTag @relation(fields: [tagId], references: [id], onDelete: Restrict)
+
+  @@unique([channelId, tagId])
+  @@index([tagId, channelId])
+  @@map("channel_default_tags")
 }
 
 model SearchIndexOutbox {
@@ -851,6 +956,8 @@ model CloneCrawlTask {
   crawlMode                 CloneCrawlMode         @default(index_only) @map("crawl_mode")
   contentTypes              String[]               @default([]) @map("content_types")
   recentLimit               Int                    @default(100) @map("recent_limit")
+  singleMessageEnabled      Boolean                @default(false) @map("single_message_enabled")
+  singleMessageLink         String?                @map("single_message_link") @db.VarChar(512)
   downloadMaxFileMb         Int?                   @map("download_max_file_mb")
   globalDownloadConcurrency Int                    @default(4) @map("global_download_concurrency")
   retryMax                  Int                    @default(5) @map("retry_max")

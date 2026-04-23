@@ -112,6 +112,33 @@ export class CloneChannelsService {
     return Array.from(new Set(normalized));
   }
 
+  private parseSingleMessageLink(raw?: string | null) {
+    const value = String(raw ?? '').trim();
+    if (!value) return null;
+
+    const matched = value.match(
+      /^(?:https?:\/\/)?(?:www\.)?t\.me\/([a-zA-Z0-9_]{5,})\/(\d+)(?:[/?#].*)?$/i,
+    );
+
+    if (!matched) {
+      throw new BadRequestException(
+        'singleMessageLink must be a Telegram message link like https://t.me/channel/123',
+      );
+    }
+
+    const channelUsername = `@${matched[1].toLowerCase()}`;
+    const messageId = BigInt(matched[2]);
+    if (messageId <= 0n) {
+      throw new BadRequestException('singleMessageLink message id must be greater than 0');
+    }
+
+    return {
+      normalizedLink: `https://t.me/${matched[1]}/${matched[2]}`,
+      channelUsername,
+      messageId,
+    };
+  }
+
   private assertTaskId(id: string) {
     if (!/^\d+$/.test(id)) {
       throw new BadRequestException('invalid task id');
@@ -135,6 +162,23 @@ export class CloneChannelsService {
       throw new BadRequestException('channels must contain at least one valid item');
     }
 
+    const singleMessageEnabled = dto.singleMessageEnabled ?? false;
+    const parsedSingleMessage = singleMessageEnabled
+      ? this.parseSingleMessageLink(dto.singleMessageLink)
+      : null;
+
+    if (singleMessageEnabled && !parsedSingleMessage) {
+      throw new BadRequestException('singleMessageLink is required when singleMessageEnabled=true');
+    }
+
+    if (singleMessageEnabled && channels.length !== 1) {
+      throw new BadRequestException('single-message clone task must contain exactly one channel');
+    }
+
+    if (singleMessageEnabled && channels[0] !== parsedSingleMessage.channelUsername) {
+      throw new BadRequestException('singleMessageLink must match the selected channel');
+    }
+
     const scheduleType = dto.scheduleType ?? 'once';
 
     const created = await this.taskModel.create({
@@ -147,7 +191,9 @@ export class CloneChannelsService {
         nextRunAt: this.computeInitialNextRunAt(scheduleType),
         crawlMode: dto.crawlMode ?? 'index_only',
         contentTypes: dto.contentTypes ?? ['text', 'image', 'video'],
-        recentLimit: dto.recentLimit ?? 100,
+        recentLimit: singleMessageEnabled ? 1 : dto.recentLimit ?? 100,
+        singleMessageEnabled,
+        singleMessageLink: singleMessageEnabled ? parsedSingleMessage.normalizedLink : null,
         downloadMaxFileMb: dto.downloadMaxFileMb,
         globalDownloadConcurrency: dto.globalDownloadConcurrency ?? 4,
         retryMax: dto.retryMax ?? 5,
@@ -207,11 +253,43 @@ export class CloneChannelsService {
 
   async updateTask(id: string, dto: UpdateCloneTaskDto) {
     const taskId = this.assertTaskId(id);
-    await this.getTask(id);
+    const existingTask = await this.taskModel.findUnique({
+      where: { id: taskId },
+      include: {
+        channels: {
+          select: { channelUsername: true },
+        },
+      },
+    });
+
+    if (!existingTask) {
+      throw new NotFoundException('clone task not found');
+    }
 
     const normalizedChannels = dto.channels ? this.normalizeChannels(dto.channels) : null;
     if (normalizedChannels && normalizedChannels.length === 0) {
       throw new BadRequestException('channels must contain at least one valid item');
+    }
+
+    const mergedChannels =
+      normalizedChannels ?? existingTask.channels.map((channel) => channel.channelUsername);
+    const singleMessageEnabled = true;
+    const parsedSingleMessage = this.parseSingleMessageLink(
+      dto.singleMessageLink !== undefined
+        ? dto.singleMessageLink
+        : existingTask.singleMessageLink,
+    );
+
+    if (!parsedSingleMessage) {
+      throw new BadRequestException('singleMessageLink is required for clone-channels task');
+    }
+
+    if (mergedChannels.length !== 1) {
+      throw new BadRequestException('clone-channels task must contain exactly one channel');
+    }
+
+    if (mergedChannels[0] !== parsedSingleMessage.channelUsername) {
+      throw new BadRequestException('singleMessageLink must match the selected channel');
     }
 
     const updated = await this.prisma.$transaction(async (tx) => {
@@ -225,7 +303,9 @@ export class CloneChannelsService {
           timezone: dto.timezone,
           dailyRunTime: dto.dailyRunTime,
           nextRunAt: dto.status === 'running' ? new Date() : undefined,
-          recentLimit: dto.recentLimit,
+          recentLimit: singleMessageEnabled ? 1 : dto.recentLimit,
+          singleMessageEnabled,
+          singleMessageLink: singleMessageEnabled ? parsedSingleMessage.normalizedLink : null,
           crawlMode: dto.crawlMode,
           contentTypes: dto.contentTypes,
           downloadMaxFileMb: dto.downloadMaxFileMb,
@@ -365,7 +445,28 @@ export class CloneChannelsService {
       take: 200,
     });
 
-    return this.serializeBigInt(rows);
+    const reasonCounter = new Map<string, number>();
+    const guardRows = rows.filter((row) => row.downloadStatus === 'paused_by_guard');
+
+    for (const row of guardRows) {
+      const key = (row.downloadErrorCode || 'unknown').trim() || 'unknown';
+      reasonCounter.set(key, (reasonCounter.get(key) || 0) + 1);
+    }
+
+    const guardTotal = guardRows.length;
+    const reasonStats = Array.from(reasonCounter.entries())
+      .map(([reasonCode, count]) => ({
+        reasonCode,
+        count,
+        ratio: guardTotal > 0 ? Number(((count / guardTotal) * 100).toFixed(2)) : 0,
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    return this.serializeBigInt({
+      items: rows,
+      reasonStats,
+      guardTotal,
+    });
   }
 
   async listTaskFailures(id: string) {

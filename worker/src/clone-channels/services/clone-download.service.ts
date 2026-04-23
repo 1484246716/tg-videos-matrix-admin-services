@@ -436,6 +436,42 @@ function toSafeBigInt(raw: string | undefined) {
   }
 }
 
+// 方案1：下载入口幂等短路。
+// 若 item 已是 downloaded 且落盘文件校验通过，则直接跳过，避免重复消费同一 itemId。
+async function canShortCircuitDownloadedItem(item: {
+  id: bigint;
+  downloadStatus: string;
+  localPath: string | null;
+  fileSize: bigint | null;
+  mimeType: string | null;
+}) {
+  if (item.downloadStatus !== 'downloaded') {
+    return { shouldSkip: false as const };
+  }
+
+  const localPath = item.localPath ?? '';
+  if (!localPath.trim()) {
+    return { shouldSkip: false as const };
+  }
+
+  const validateResult = await validateDownloadedFile({
+    filePath: localPath,
+    expectedSize: item.fileSize ?? undefined,
+    expectedMimeType: item.mimeType ?? undefined,
+  });
+
+  if (!validateResult.ok) {
+    logger.warn('[clone][下载/Download] 已下载项本地文件校验失败，继续执行下载 / downloaded item validation failed, continue downloading', {
+      itemId: item.id.toString(),
+      localPath,
+      reason: validateResult.reason,
+    });
+    return { shouldSkip: false as const };
+  }
+
+  return { shouldSkip: true as const, localPath };
+}
+
 export async function processCloneMediaDownload(job: CloneMediaDownloadJob, workerJobId?: string) {
   const itemId = BigInt(job.itemId);
   const runId = BigInt(job.runId);
@@ -464,6 +500,8 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
         retryCount: job.retryCount ?? 0,
       },
       {
+        // 方案2：统一幂等 jobId，防止同 item 在 waiting/delayed 队列重复堆积。
+        jobId: `clone-download-item-${itemId.toString()}`,
         delay: 10_000,
         removeOnComplete: true,
         removeOnFail: 100,
@@ -473,7 +511,7 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
     await recordGuardTriggered({
       itemId,
       reason: 'per_channel_concurrency_exceeded',
-      detail: 'channel_slot_busy, retry after 10000ms',
+      detail: '同频道并发上限，10秒后自动重试（channel_slot_busy）',
     });
 
     logger.warn('[clone][下载/Download] 频道槽位占用，已排队等待 / channel slot busy, delayed', {
@@ -497,6 +535,26 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
     const item = await prisma.cloneCrawlItem.findUnique({ where: { id: itemId } });
     if (!item) {
       logger.warn('[clone][下载/Download] 下载项不存在，跳过 / download item not found, skip', {
+        taskId: job.taskId,
+        runId: job.runId,
+        itemId: job.itemId,
+      });
+      return;
+    }
+
+    const downloadedGuard = await canShortCircuitDownloadedItem(item as any);
+    if (downloadedGuard.shouldSkip) {
+      logger.info('[clone][下载/Download] 幂等短路：已下载且文件有效，跳过重复任务 / idempotent short-circuit: already downloaded and file valid', {
+        taskId: job.taskId,
+        runId: job.runId,
+        itemId: job.itemId,
+        localPath: downloadedGuard.localPath,
+      });
+      return;
+    }
+
+    if (item.downloadStatus === 'failed_final') {
+      logger.warn('[clone][下载/Download] 终态保护：failed_final 跳过重复任务 / terminal-state guard: skip failed_final item', {
         taskId: job.taskId,
         runId: job.runId,
         itemId: job.itemId,
@@ -533,6 +591,7 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
           retryCount: job.retryCount ?? 0,
         },
         {
+          jobId: `clone-download-item-${itemId.toString()}`,
           delay: guard.retryDelayMs,
           removeOnComplete: true,
           removeOnFail: 100,
@@ -541,8 +600,15 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
       return;
     }
 
-    await prisma.cloneCrawlItem.update({
-      where: { id: itemId },
+    // 方案3：终态保护 + 合法状态白名单。
+    // 仅允许 queued/failed_retryable/none -> downloading，阻止 downloaded/failed_final 回退。
+    const promoted = await prisma.cloneCrawlItem.updateMany({
+      where: {
+        id: itemId,
+        downloadStatus: {
+          in: ['queued', 'failed_retryable', 'none'],
+        } as any,
+      },
       data: {
         downloadStatus: 'downloading',
         downloadLeaseUntil: new Date(Date.now() + CLONE_DOWNLOAD_LEASE_MS),
@@ -556,6 +622,22 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
         downloadError: null,
       } as any,
     });
+
+    if (promoted.count === 0) {
+      const latest = await prisma.cloneCrawlItem.findUnique({
+        where: { id: itemId },
+        select: { downloadStatus: true, localPath: true },
+      });
+
+      logger.info('[clone][下载/Download] 终态/并发保护：状态不允许进入 downloading，跳过 / transition guard blocked downloading promotion', {
+        taskId: job.taskId,
+        runId: job.runId,
+        itemId: job.itemId,
+        currentStatus: latest?.downloadStatus ?? null,
+        localPath: latest?.localPath ?? null,
+      });
+      return;
+    }
 
     const expectedSize = toSafeBigInt(job.expectedFileSize) ?? item.fileSize ?? undefined;
     const mediaRef = parseMediaRef(job.mediaRef, {

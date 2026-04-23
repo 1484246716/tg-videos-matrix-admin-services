@@ -107,6 +107,10 @@ export class UpdateChannelDto {
 
   @IsOptional()
   @IsBoolean()
+  cloneUseAiPromptTemplate?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
   navEnabled?: boolean;
 
   @IsOptional()

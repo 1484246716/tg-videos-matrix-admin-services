@@ -32,6 +32,30 @@ function toDbChannelUsername(normalized: string) {
   return `@${normalized}`;
 }
 
+function parseSingleMessageLink(raw?: string | null) {
+  const value = String(raw ?? '').trim();
+  if (!value) return null;
+
+  const matched = value.match(
+    /^(?:https?:\/\/)?(?:www\.)?t\.me\/([a-zA-Z0-9_]{5,})\/(\d+)(?:[/?#].*)?$/i,
+  );
+
+  if (!matched) {
+    throw new Error('invalid single message link, expected format like https://t.me/channel/123');
+  }
+
+  const messageId = BigInt(matched[2]);
+  if (messageId <= 0n) {
+    throw new Error('invalid single message link message id');
+  }
+
+  return {
+    channelUsername: normalizeChannelUsername(matched[1]),
+    messageId,
+    normalizedLink: `https://t.me/${matched[1]}/${matched[2]}`,
+  };
+}
+
 function parseContentTypes(raw: string[] | CloneContentType[] | undefined): CloneContentType[] {
   const allowed: CloneContentType[] = ['text', 'image', 'video'];
   if (!raw || raw.length === 0) return allowed;
@@ -307,8 +331,15 @@ async function fetchIncrementalMessages(params: {
   lastFetchedMessageId?: bigint | null;
   recentLimit: number;
   contentTypes: CloneContentType[];
+  specificMessageId?: bigint | null;
 }): Promise<IndexedMessageDTO[]> {
-  const { channelUsername, lastFetchedMessageId, recentLimit, contentTypes } = params;
+  const {
+    channelUsername,
+    lastFetchedMessageId,
+    recentLimit,
+    contentTypes,
+    specificMessageId,
+  } = params;
 
   // recentLimit 按“消息组”计数：有 groupedId 的按 groupedId 归组；无 groupedId 视作单条独立组
   const groupLimit = Math.max(1, Math.min(1000, recentLimit || 100));
@@ -464,6 +495,152 @@ async function fetchIncrementalMessages(params: {
   return picked;
 }
 
+async function fetchSingleMessage(params: {
+  channelUsername: string;
+  messageId: bigint;
+  contentTypes: CloneContentType[];
+}): Promise<IndexedMessageDTO[]> {
+  const { channelUsername, messageId, contentTypes } = params;
+
+  logger.info('[clone][single] start fetch single telegram message', {
+    channelUsername,
+    messageId: messageId.toString(),
+    contentTypes,
+  });
+
+  const { messages, targetGroupedId } = await withClient({ timeoutMs: 120_000, accountType: 'user' }, async (client) => {
+    const entity = await (client as any).getEntity(channelUsername);
+    const targetList = await (client as any).getMessages(entity, {
+      ids: [Number(messageId)],
+    });
+    const targetMessages = Array.isArray(targetList) ? targetList : targetList ? [targetList] : [];
+
+    const target = targetMessages.find((m: any) => Number.isFinite((m as any)?.id) && BigInt(Math.floor((m as any).id)) === messageId);
+    if (!target) {
+      return { messages: [] as any[], targetGroupedId: null as string | null };
+    }
+
+    const groupedIdRaw = (target as any)?.groupedId ?? (target as any)?.grouped_id;
+    const groupedId = groupedIdRaw != null ? String(groupedIdRaw) : null;
+
+    if (!groupedId) {
+      return { messages: [target], targetGroupedId: null as string | null };
+    }
+
+    const center = Number(messageId);
+    const range = 40;
+    const ids = Array.from({ length: range * 2 + 1 }, (_v, i) => center - range + i).filter((id) => id > 0);
+    const aroundList = await (client as any).getMessages(entity, { ids });
+    const aroundMessages = Array.isArray(aroundList) ? aroundList : aroundList ? [aroundList] : [];
+
+    const groupedMessages = aroundMessages.filter((m: any) => {
+      const mGroupedId = (m as any)?.groupedId ?? (m as any)?.grouped_id;
+      return mGroupedId != null && String(mGroupedId) === groupedId;
+    });
+
+    return {
+      messages: groupedMessages.length > 0 ? groupedMessages : [target],
+      targetGroupedId: groupedId,
+    };
+  });
+
+  const picked: IndexedMessageDTO[] = [];
+  let skippedByNoId = 0;
+  let skippedByType = 0;
+  let skippedByAd = 0;
+  const skippedByAdReasons: Record<AdFilterReason, number> = {
+    keyword: 0,
+    hashtag: 0,
+    link: 0,
+    button: 0,
+    pinned_service: 0,
+  };
+  let foundTargetMessage = false;
+
+  for (const msg of messages) {
+    const messageIdRaw = (msg as any)?.id;
+    if (!Number.isFinite(messageIdRaw)) {
+      skippedByNoId += 1;
+      continue;
+    }
+
+    if (BigInt(Math.floor(messageIdRaw)) === messageId) {
+      foundTargetMessage = true;
+    }
+
+    const messageText = ((msg as any)?.message ?? '') as string;
+    const media = (msg as any)?.media;
+    const document = (media as any)?.document;
+    const photo = (media as any)?.photo;
+
+    const docMimeType = typeof document?.mimeType === 'string' ? document.mimeType : undefined;
+    const maybeSize = Number(document?.size);
+    const fileSize = Number.isFinite(maybeSize) && maybeSize > 0 ? BigInt(Math.floor(maybeSize)) : undefined;
+
+    const hasVideo = Boolean(
+      docMimeType?.toLowerCase().startsWith('video/') ||
+      ((document?.attributes ?? []) as any[]).some((attr) => String(attr?.className ?? '').toLowerCase().includes('video')),
+    );
+
+    const hasImage = Boolean(docMimeType?.toLowerCase().startsWith('image/') || photo);
+    const hasText = Boolean(messageText && messageText.trim().length > 0);
+    const mimeType = hasVideo ? docMimeType : hasImage ? docMimeType ?? 'image/jpeg' : docMimeType;
+
+    let include = false;
+    if (hasVideo && contentTypes.includes('video')) include = true;
+    else if (hasImage && contentTypes.includes('image')) include = true;
+    else if (hasText && contentTypes.includes('text')) include = true;
+
+    if (!include) {
+      skippedByType += 1;
+      continue;
+    }
+
+    const adReasons = detectAdReasons(msg as any);
+    if (adReasons.length > 0) {
+      skippedByAd += 1;
+      for (const reason of adReasons) {
+        skippedByAdReasons[reason] += 1;
+      }
+      continue;
+    }
+
+    const groupedId = (msg as any)?.groupedId ?? (msg as any)?.grouped_id;
+    const groupedIdString = groupedId != null ? String(groupedId) : undefined;
+    const resolvedMessageId = BigInt(Math.floor(messageIdRaw));
+
+    picked.push({
+      messageId: resolvedMessageId,
+      groupedId: groupedIdString,
+      groupKey: groupedIdString ? `grouped-${groupedIdString}` : `single-${resolvedMessageId.toString()}`,
+      messageDate: (msg as any)?.date ? new Date((msg as any).date) : undefined,
+      messageText,
+      hasVideo,
+      fileSize,
+      mimeType,
+      mediaRef: `tg://message/${channelUsername}/${resolvedMessageId.toString()}`,
+    });
+  }
+
+  if (!foundTargetMessage) {
+    throw new Error(`channel_unreachable: message not found tg://${channelUsername}/${messageId.toString()}`);
+  }
+
+  logger.info('[clone][single] single message fetch done', {
+    channelUsername,
+    messageId: messageId.toString(),
+    groupedId: targetGroupedId,
+    fetchedRaw: messages.length,
+    picked: picked.length,
+    skippedByNoId,
+    skippedByType,
+    skippedByAd,
+    skippedByAdReasons,
+  });
+
+  return picked;
+}
+
 async function upsertIndexedItems(params: {
   taskId: bigint;
   runId: bigint;
@@ -607,7 +784,11 @@ async function upsertIndexedItems(params: {
         await cloneMediaDownloadQueue.add(
           'clone-media-download',
           downloadJob,
-          { removeOnComplete: true, removeOnFail: 100 },
+          {
+            jobId: `clone-download-item-${item.id.toString()}`,
+            removeOnComplete: true,
+            removeOnFail: 100,
+          },
         );
       }
 
@@ -805,6 +986,8 @@ export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
         crawlMode: true,
         targetPath: true,
         recentLimit: true,
+        singleMessageEnabled: true,
+        singleMessageLink: true,
         contentTypes: true,
         scheduleType: true,
         timezone: true,
@@ -846,13 +1029,29 @@ export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
     const lastFetchedMessageId = job.lastFetchedMessageId
       ? BigInt(job.lastFetchedMessageId)
       : channel?.lastFetchedMessageId ?? null;
+    const singleMessageTarget = task.singleMessageEnabled
+      ? parseSingleMessageLink(task.singleMessageLink)
+      : null;
 
-    const messages = await fetchIncrementalMessages({
-      channelUsername,
-      lastFetchedMessageId,
-      recentLimit: job.recentLimit ?? task.recentLimit,
-      contentTypes: parseContentTypes(job.contentTypes ?? (task.contentTypes as string[])),
-    });
+    if (singleMessageTarget && singleMessageTarget.channelUsername !== channelUsername) {
+      throw new Error(
+        `invalid single message link channel mismatch: task=${channelUsername} link=${singleMessageTarget.channelUsername}`,
+      );
+    }
+
+    const contentTypes = parseContentTypes(job.contentTypes ?? (task.contentTypes as string[]));
+    const messages = singleMessageTarget
+      ? await fetchSingleMessage({
+          channelUsername,
+          messageId: singleMessageTarget.messageId,
+          contentTypes,
+        })
+      : await fetchIncrementalMessages({
+          channelUsername,
+          lastFetchedMessageId,
+          recentLimit: job.recentLimit ?? task.recentLimit,
+          contentTypes,
+        });
 
     const { inserted, deduped, queuedDownloads, maxMessageId } = await upsertIndexedItems({
       taskId,

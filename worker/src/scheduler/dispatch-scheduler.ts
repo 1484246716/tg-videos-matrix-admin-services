@@ -809,6 +809,11 @@ export async function scheduleDueDispatchTasks() {
                 id: true,
                 mediaAssetId: true,
                 scheduleSlot: true,
+                mediaAsset: {
+                  select: {
+                    sourceMeta: true,
+                  },
+                },
               },
             }),
           { label: 'dispatch.scheduleDueDispatchTasks.findGroupedTasks' },
@@ -960,9 +965,22 @@ export async function scheduleDueDispatchTasks() {
               }),
             { label: 'dispatch.scheduleDueDispatchTasks.findExistingGroupTaskSnapshot' },
           );
+          // 修复点：sourceExpectedCount 可能在 dispatchGroupTask 初次创建时缺失，
+          // 若只读 existingGroupTaskSnapshot 会导致后续永远卡在 0。
+          // 这里从同组任务关联 mediaAsset.sourceMeta 再聚合一次，作为“回填来源”。
+          const groupedSourceExpectedCountCandidates = groupedTasks
+            .map((t) => parseSourceExpectedCount(t.mediaAsset?.sourceMeta))
+            .filter((n): n is number => typeof n === 'number' && n > 0);
+          const groupedSourceExpectedCount =
+            groupedSourceExpectedCountCandidates.length > 0
+              ? Math.max(...groupedSourceExpectedCountCandidates)
+              : 0;
+          // 保持“取最大值”的保守策略：不降低已有 sourceExpectedCount，
+          // 仅在缺失/偏小时做补写，避免分组闸门因 0 永久阻塞。
           const inheritedSourceExpectedCount = Math.max(
             0,
             Number(existingGroupTaskSnapshot?.sourceExpectedCount ?? 0),
+            groupedSourceExpectedCount,
           );
 
           const groupTask = await withPrismaRetry(

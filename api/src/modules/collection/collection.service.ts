@@ -4,6 +4,7 @@ import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
 import { mkdir, rm } from 'node:fs/promises';
 import { normalize, resolve } from 'node:path';
+import { ContentTaxonomyService } from '../content-taxonomy/content-taxonomy.service';
 import { PrismaService } from '../prisma/prisma.service';
 
 type SaveCollectionDto = {
@@ -16,6 +17,8 @@ type SaveCollectionDto = {
   navEnabled: boolean;
   navPageSize: number;
   templateText?: string;
+  level2Ids?: string[];
+  tagIds?: string[];
 };
 
 const DEFAULT_COLLECTION_STATUS = 'active' as const;
@@ -191,7 +194,10 @@ function getSearchIndexQueue() {
 
 @Injectable()
 export class CollectionService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly contentTaxonomyService: ContentTaxonomyService,
+  ) {}
 
   private getTelegramBotApiBase() {
     return (
@@ -434,6 +440,24 @@ export class CollectionService {
             id: row.channel.id.toString(),
           }
         : undefined,
+      categories: Array.isArray(row.categories)
+        ? row.categories.map((item: any) => ({
+            id: item.level2.id.toString(),
+            name: item.level2.name,
+            slug: item.level2.slug,
+            level1Id: item.level2.level1Id.toString(),
+            level1Name: item.level2.level1.name,
+            level1Slug: item.level2.level1.slug,
+          }))
+        : [],
+      tags: Array.isArray(row.tags)
+        ? row.tags.map((item: any) => ({
+            id: item.tag.id.toString(),
+            name: item.tag.name,
+            slug: item.tag.slug,
+            scope: item.tag.scope,
+          }))
+        : [],
       _count: row._count,
       blockState,
       blockReason: blockedEpisode ? `等待前序集 ${blockedEpisode.episodeNo}` : null,
@@ -519,6 +543,20 @@ export class CollectionService {
       include: {
         channel: { select: { id: true, name: true } },
         _count: { select: { episodes: true } },
+        categories: {
+          include: {
+            level2: {
+              include: {
+                level1: true,
+              },
+            },
+          },
+        },
+        tags: {
+          include: {
+            tag: true,
+          },
+        },
         episodes: {
           select: {
             episodeNo: true,
@@ -604,6 +642,47 @@ export class CollectionService {
       include: {
         channel: { select: { id: true, name: true } },
         _count: { select: { episodes: true } },
+        categories: {
+          include: {
+            level2: {
+              include: {
+                level1: true,
+              },
+            },
+          },
+        },
+        tags: {
+          include: {
+            tag: true,
+          },
+        },
+      },
+    });
+
+    await this.contentTaxonomyService.replaceCollectionTaxonomy(created.id, {
+      level2Ids: dto.level2Ids,
+      tagIds: dto.tagIds,
+    });
+
+    const hydrated = await this.prisma.collection.findUnique({
+      where: { id: created.id },
+      include: {
+        channel: { select: { id: true, name: true } },
+        _count: { select: { episodes: true } },
+        categories: {
+          include: {
+            level2: {
+              include: {
+                level1: true,
+              },
+            },
+          },
+        },
+        tags: {
+          include: {
+            tag: true,
+          },
+        },
       },
     });
 
@@ -614,7 +693,7 @@ export class CollectionService {
     });
     await this.enqueueCatalogRefresh(created.channelId.toString());
 
-    return this.toResponse(created);
+    return this.toResponse(hydrated ?? created);
   }
 
   async update(id: string, dto: Partial<SaveCollectionDto>, userId?: string, role?: string) {
@@ -714,6 +793,49 @@ export class CollectionService {
       include: {
         channel: { select: { id: true, name: true } },
         _count: { select: { episodes: true } },
+        categories: {
+          include: {
+            level2: {
+              include: {
+                level1: true,
+              },
+            },
+          },
+        },
+        tags: {
+          include: {
+            tag: true,
+          },
+        },
+      },
+    });
+
+    if (dto.level2Ids !== undefined || dto.tagIds !== undefined) {
+      await this.contentTaxonomyService.replaceCollectionTaxonomy(updated.id, {
+        level2Ids: dto.level2Ids,
+        tagIds: dto.tagIds,
+      });
+    }
+
+    const hydrated = await this.prisma.collection.findUnique({
+      where: { id: updated.id },
+      include: {
+        channel: { select: { id: true, name: true } },
+        _count: { select: { episodes: true } },
+        categories: {
+          include: {
+            level2: {
+              include: {
+                level1: true,
+              },
+            },
+          },
+        },
+        tags: {
+          include: {
+            tag: true,
+          },
+        },
       },
     });
 
@@ -724,7 +846,40 @@ export class CollectionService {
     });
     await this.enqueueCatalogRefresh(updated.channelId.toString());
 
-    return this.toResponse(updated);
+    return this.toResponse(hydrated ?? updated);
+  }
+
+  async updateTaxonomy(
+    id: string,
+    dto: { level2Ids?: string[]; tagIds?: string[] },
+    userId?: string,
+    role?: string,
+  ) {
+    const collection = await this.prisma.collection.findFirst({
+      where:
+        role === 'admin'
+          ? { id: BigInt(id) }
+          : { id: BigInt(id), createdBy: userId ? BigInt(userId) : undefined },
+      select: {
+        id: true,
+        channelId: true,
+      },
+    });
+
+    if (!collection) throw new NotFoundException('collection not found');
+
+    const taxonomy = await this.contentTaxonomyService.replaceCollectionTaxonomy(collection.id, dto);
+
+    await this.enqueueSearchIndexJob({
+      sourceType: 'collection',
+      sourceId: collection.id.toString(),
+      channelId: collection.channelId.toString(),
+    });
+
+    return {
+      collectionId: collection.id.toString(),
+      ...taxonomy,
+    };
   }
 
   private formatCollectionEpisodeTitle(args: {

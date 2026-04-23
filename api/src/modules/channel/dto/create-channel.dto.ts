@@ -46,6 +46,10 @@ export class CreateChannelDto {
 
   @IsOptional()
   @IsBoolean()
+  cloneUseAiPromptTemplate?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
   navEnabled?: boolean;
 
   @IsOptional()

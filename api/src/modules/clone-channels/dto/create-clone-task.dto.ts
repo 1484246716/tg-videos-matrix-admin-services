@@ -1,4 +1,5 @@
 import {
+  IsBoolean,
   IsArray,
   IsIn,
   IsInt,
@@ -50,6 +51,14 @@ export class CreateCloneTaskDto {
   @Min(1)
   @Max(5000)
   recentLimit?: number;
+
+  @IsOptional()
+  @IsBoolean()
+  singleMessageEnabled?: boolean;
+
+  @IsOptional()
+  @IsString()
+  singleMessageLink?: string;
 
   @IsOptional()
   @IsInt()

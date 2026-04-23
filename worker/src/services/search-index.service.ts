@@ -206,32 +206,10 @@ async function upsertSearchDocument(doc: SearchDocOutput): Promise<void> {
     where: { docId: doc.docId },
     create: { docId: doc.docId, ...data },
     update: data,
-    select: { id: true, mediaAssetId: true },
+    select: { id: true, docType: true, mediaAssetId: true, collectionId: true },
   });
 
-  if (upserted.mediaAssetId) {
-    const level2Rows = await prisma.$queryRawUnsafe<Array<{ level2_id: bigint }>>(
-      `SELECT level2_id FROM media_asset_categories WHERE media_asset_id = $1`,
-      upserted.mediaAssetId,
-    );
-
-    await prisma.$executeRawUnsafe(
-      `DELETE FROM search_document_categories WHERE search_document_id = $1`,
-      upserted.id,
-    );
-
-    for (const row of level2Rows) {
-      await prisma.$executeRawUnsafe(
-        `
-        INSERT INTO search_document_categories(search_document_id, level2_id, created_at)
-        VALUES ($1, $2, now())
-        ON CONFLICT (search_document_id, level2_id) DO NOTHING
-      `,
-        upserted.id,
-        row.level2_id,
-      );
-    }
-  }
+  await syncSearchDocumentTaxonomy(upserted);
 
   // 写 outbox（用于后续同步 OpenSearch）
   await prisma.searchIndexOutbox.create({
@@ -250,6 +228,73 @@ async function upsertSearchDocument(doc: SearchDocOutput): Promise<void> {
 }
 
 // ──────────────────────────── 删除/下线 ────────────────────────────
+
+async function syncSearchDocumentTaxonomy(searchDocument: {
+  id: bigint;
+  docType: string;
+  mediaAssetId: bigint | null;
+  collectionId: bigint | null;
+}) {
+  let level2Rows: Array<{ level2_id: bigint }> = [];
+  let tagRows: Array<{ tag_id: bigint }> = [];
+
+  if (searchDocument.docType === 'collection' && searchDocument.collectionId) {
+    [level2Rows, tagRows] = await Promise.all([
+      prisma.$queryRawUnsafe<Array<{ level2_id: bigint }>>(
+        `SELECT level2_id FROM collection_categories WHERE collection_id = $1`,
+        searchDocument.collectionId,
+      ),
+      prisma.$queryRawUnsafe<Array<{ tag_id: bigint }>>(
+        `SELECT tag_id FROM collection_tags WHERE collection_id = $1`,
+        searchDocument.collectionId,
+      ),
+    ]);
+  } else if (searchDocument.mediaAssetId) {
+    [level2Rows, tagRows] = await Promise.all([
+      prisma.$queryRawUnsafe<Array<{ level2_id: bigint }>>(
+        `SELECT level2_id FROM media_asset_categories WHERE media_asset_id = $1`,
+        searchDocument.mediaAssetId,
+      ),
+      prisma.$queryRawUnsafe<Array<{ tag_id: bigint }>>(
+        `SELECT tag_id FROM media_asset_tags WHERE media_asset_id = $1`,
+        searchDocument.mediaAssetId,
+      ),
+    ]);
+  }
+
+  await prisma.$executeRawUnsafe(
+    `DELETE FROM search_document_categories WHERE search_document_id = $1`,
+    searchDocument.id,
+  );
+  await prisma.$executeRawUnsafe(
+    `DELETE FROM search_document_tags WHERE search_document_id = $1`,
+    searchDocument.id,
+  );
+
+  for (const row of level2Rows) {
+    await prisma.$executeRawUnsafe(
+      `
+      INSERT INTO search_document_categories(search_document_id, level2_id, created_at)
+      VALUES ($1, $2, now())
+      ON CONFLICT (search_document_id, level2_id) DO NOTHING
+    `,
+      searchDocument.id,
+      row.level2_id,
+    );
+  }
+
+  for (const row of tagRows) {
+    await prisma.$executeRawUnsafe(
+      `
+      INSERT INTO search_document_tags(search_document_id, tag_id, created_at)
+      VALUES ($1, $2, now())
+      ON CONFLICT (search_document_id, tag_id) DO NOTHING
+    `,
+      searchDocument.id,
+      row.tag_id,
+    );
+  }
+}
 
 async function handleDelete(sourceType: string, sourceId: string): Promise<void> {
   let docId: string;

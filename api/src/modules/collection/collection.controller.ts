@@ -13,6 +13,7 @@ import {
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { Permissions } from '../auth/permissions.decorator';
 import { PermissionsGuard } from '../auth/permissions.guard';
+import { ReplaceTaxonomyDto } from '../content-taxonomy/dto/replace-taxonomy.dto';
 import { CollectionService } from './collection.service';
 
 interface AuthRequest {
@@ -58,6 +59,12 @@ export class CollectionController {
     @Request() req: AuthRequest,
   ) {
     return this.collectionService.updateCatalogTitle(id, body, req.user.userId, req.user.role);
+  }
+
+  @Permissions('collections:update')
+  @Patch(':id/taxonomy')
+  updateTaxonomy(@Param('id') id: string, @Body() dto: ReplaceTaxonomyDto, @Request() req: AuthRequest) {
+    return this.collectionService.updateTaxonomy(id, dto, req.user.userId, req.user.role);
   }
 
   @Permissions('collections:update')

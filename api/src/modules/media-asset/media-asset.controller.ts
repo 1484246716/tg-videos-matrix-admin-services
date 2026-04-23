@@ -8,6 +8,7 @@ import { CreateMediaAssetDto } from './dto/create-media-asset.dto';
 import { UpdateMediaAssetStatusDto } from './dto/update-media-asset-status.dto';
 import { MarkRelayUploadedDto } from './dto/mark-relay-uploaded.dto';
 import { BatchEnqueueRelayUploadDto } from './dto/batch-enqueue-relay-upload.dto';
+import { UpdateMediaAssetTaxonomyDto } from './dto/update-media-asset-taxonomy.dto';
 
 interface AuthRequest {
   user: { userId: string; username: string; role: string };
@@ -57,6 +58,12 @@ export class MediaAssetController {
   @Patch(':id/relay-uploaded')
   markRelayUploaded(@Param('id') id: string, @Body() dto: MarkRelayUploadedDto) {
     return this.mediaAssetService.markRelayUploaded(id, dto);
+  }
+
+  @Permissions('media:update')
+  @Patch(':id/taxonomy')
+  updateTaxonomy(@Param('id') id: string, @Body() dto: UpdateMediaAssetTaxonomyDto, @Request() req?: AuthRequest) {
+    return this.mediaAssetService.updateTaxonomy(id, dto, req?.user.userId, req?.user.role);
   }
 
   @Permissions('media:upload')

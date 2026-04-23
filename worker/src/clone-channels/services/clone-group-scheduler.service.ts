@@ -192,6 +192,8 @@ export async function dispatchCloneGroupOneRound() {
     'clone-group-l2-download',
     payload,
     {
+      // 方案2：L1/L2 分发链路统一 item 粒度 jobId，避免分组路径重复调度同一 item。
+      jobId: `clone-download-item-${payload.itemId}`,
       removeOnComplete: true,
       removeOnFail: 100,
       delay: Math.max(0, CLONE_GROUP_DISPATCH_TICK_MS),

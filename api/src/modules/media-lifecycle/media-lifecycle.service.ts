@@ -51,21 +51,20 @@ function resolveGroupLifecycleStatus(args: {
   taskStatus?: string | null;
   aggregate: GroupDispatchAggregate;
 }): GroupLifecycleStatus {
+  const { total, success, running, failed } = args.aggregate;
+
+  // 优先以子消息派发结果为准：只要子消息全成功，就应展示“组成功”
+  if (total > 0 && success >= total) return 'success';
+  if (success > 0 && failed > 0) return 'partial_failed';
+  if (failed > 0 && success === 0 && running === 0) return 'failed';
+  if (running > 0 || (success > 0 && success < total)) return 'running';
+
   const taskStatus = (args.taskStatus || '').toLowerCase();
   if (taskStatus === 'success') return 'success';
   if (taskStatus === 'failed' || taskStatus === 'dead' || taskStatus === 'cancelled') {
-    return args.aggregate.success > 0 ? 'partial_failed' : 'failed';
-  }
-  if (taskStatus === 'running' || taskStatus === 'pending' || taskStatus === 'scheduled') {
-    return 'running';
+    return success > 0 ? 'partial_failed' : 'failed';
   }
 
-  const { total, success, running, failed } = args.aggregate;
-  if (total > 0 && success === total) return 'success';
-  if (success > 0 && failed > 0) return 'partial_failed';
-  if (running > 0) return 'running';
-  if (failed > 0 && success === 0) return 'failed';
-  if (success > 0 && success < total) return 'running';
   return 'running';
 }
 
