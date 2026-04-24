@@ -1,6 +1,6 @@
 import { rm } from 'node:fs/promises';
 import path from 'node:path';
-import { DispatchMediaType, MediaStatus, TaskStatus } from '@prisma/client';
+import { AiModelProfile, DispatchMediaType, MediaStatus, TaskStatus } from '@prisma/client';
 import { generateTextWithAiProfile } from '../ai-provider';
 import {
   DISPATCH_CHANNEL_INTERVAL_GUARD_ENABLED,
@@ -14,6 +14,7 @@ import { getBackoffSeconds } from '../shared/dispatch-utils';
 import { catalogSourceWriteMetrics } from '../shared/metrics';
 import { sendPhotoByTelegram, sendTelegramRequest, sendVideoByTelegram, TelegramError } from '../shared/telegram';
 import { classifyAndAssignForTypeB } from './typeb-category.service';
+import { assignContentTagsForTypeB } from './typeb-content-tag.service';
 
 function isParseEntitiesError(error: { code?: string; message?: string } | null | undefined) {
   const message = (error?.message ?? '').toLowerCase();
@@ -76,6 +77,41 @@ function isAiFailureText(text?: string | null) {
   if (!normalized) return false;
 
   return /无法识别|抱歉|如果可以提供更多|视频的内容简介|主要角色|生成相关文案/.test(normalized);
+}
+
+async function resolveDispatchAiProfile(aiModelProfileId: bigint | null | undefined): Promise<AiModelProfile | null> {
+  const profile = aiModelProfileId
+    ? await prisma.aiModelProfile.findUnique({
+        where: { id: aiModelProfileId },
+      })
+    : null;
+
+  if (profile?.isActive) {
+    return profile;
+  }
+
+  if (!process.env.OPENAI_API_KEY) {
+    return null;
+  }
+
+  return {
+    id: BigInt(0),
+    name: 'ENV_FALLBACK',
+    provider: 'openai',
+    model: process.env.OPENAI_MODEL || 'gpt-3.5-turbo',
+    apiKeyEncrypted: process.env.OPENAI_API_KEY,
+    endpointUrl: process.env.OPENAI_BASE_URL || null,
+    systemPrompt: null,
+    captionPromptTemplate: null,
+    temperature: null,
+    topP: null,
+    maxTokens: null,
+    timeoutMs: 20000,
+    isActive: true,
+    fallbackProfileId: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
 }
 
 function getCollectionDisplayName(name: string) {
@@ -1734,69 +1770,33 @@ export async function handleDispatchJob(
       finalCaption = originalNameStem;
     }
 
-    if (task.channel.aiSystemPromptTemplate && task.channel.cloneUseAiPromptTemplate) {
-      let profile = task.channel.aiModelProfileId
-        ? await prisma.aiModelProfile.findUnique({
-            where: { id: task.channel.aiModelProfileId },
-          })
-        : null;
+    const aiProfile = await resolveDispatchAiProfile(task.channel.aiModelProfileId);
 
-      if (!profile && process.env.OPENAI_API_KEY) {
-        profile = {
-          id: BigInt(0),
-          name: 'ENV_FALLBACK',
-          provider: 'openai',
-          model: process.env.OPENAI_MODEL || 'gpt-3.5-turbo',
-          apiKeyEncrypted: process.env.OPENAI_API_KEY,
-          endpointUrl: process.env.OPENAI_BASE_URL || null,
-          systemPrompt: null,
-          captionPromptTemplate: null,
-          temperature: null,
-          topP: null,
-          maxTokens: null,
-          timeoutMs: 20000,
-          isActive: true,
-          fallbackProfileId: null,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        };
-      }
+    if (task.channel.aiSystemPromptTemplate && task.channel.cloneUseAiPromptTemplate && aiProfile) {
+      try {
+        finalCaption = await generateTextWithAiProfile(
+          aiProfile,
+          task.channel.aiSystemPromptTemplate,
+          aiUserPrompt,
+        );
 
-      if (profile && profile.isActive) {
-        try {
-          finalCaption = await generateTextWithAiProfile(
-            profile,
-            task.channel.aiSystemPromptTemplate,
-            aiUserPrompt,
-          );
-
-          if (isAiFailureText(finalCaption)) {
-            finalCaption = originalNameStem;
-          }
-
-          await prisma.dispatchTask.update({
-            where: { id: task.id },
-            data: { caption: finalCaption },
-          });
-          await prisma.mediaAsset.update({
-            where: { id: task.mediaAsset.id },
-            data: { aiGeneratedCaption: finalCaption },
-          });
-
-          await classifyAndAssignForTypeB({
-            mediaAssetId: task.mediaAsset.id,
-            originalName: aiSearchVideoName,
-            aiCaption: finalCaption,
-            profile,
-          });
-        } catch (aiErr) {
-          logError('[q_dispatch] AI 文案生成失败', {
-            dispatchTaskId: task.id.toString(),
-            error: aiErr,
-          });
-          finalCaption = finalCaption || originalNameStem;
+        if (isAiFailureText(finalCaption)) {
+          finalCaption = originalNameStem;
         }
-      } else {
+
+        await prisma.dispatchTask.update({
+          where: { id: task.id },
+          data: { caption: finalCaption },
+        });
+        await prisma.mediaAsset.update({
+          where: { id: task.mediaAsset.id },
+          data: { aiGeneratedCaption: finalCaption },
+        });
+      } catch (aiErr) {
+        logError('[q_dispatch] AI 文案生成失败', {
+          dispatchTaskId: task.id.toString(),
+          error: aiErr,
+        });
         finalCaption = finalCaption || originalNameStem;
       }
     } else if (!finalCaption) {
@@ -1822,6 +1822,44 @@ export async function handleDispatchJob(
         data: { aiGeneratedCaption: finalCaption },
       });
     }
+
+    if (aiProfile) {
+      try {
+        await classifyAndAssignForTypeB({
+          mediaAssetId: task.mediaAsset.id,
+          originalName: aiSearchVideoName,
+          aiCaption: finalCaption || '',
+          profile: aiProfile,
+        });
+      } catch (categoryErr) {
+        logError('[q_dispatch] 自动分类失败（不阻塞发送）', {
+          dispatchTaskId: task.id.toString(),
+          mediaAssetId: task.mediaAsset.id.toString(),
+          error: categoryErr,
+        });
+      }
+    }
+
+    try {
+      await assignContentTagsForTypeB({
+        mediaAssetId: task.mediaAsset.id,
+        channelId: task.channel.id,
+        originalName: aiSearchVideoName,
+        aiCaption: finalCaption || null,
+        sourceMeta: task.mediaAsset.sourceMeta,
+        profile: aiProfile,
+        triggerSource: 'dispatch_typeb',
+        enqueueSearchIndex: false,
+      });
+    } catch (tagErr) {
+      logError('[q_dispatch] 成人内容自动标签失败（不阻塞发送）', {
+        dispatchTaskId: task.id.toString(),
+        mediaAssetId: task.mediaAsset.id.toString(),
+        error: tagErr,
+      });
+    }
+
+    finalCaption = finalCaption || originalNameStem;
 
     const sourceRelayBotIdRaw = mediaSourceMeta?.relayBotId;
     const sourceRelayBotId =

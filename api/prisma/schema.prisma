@@ -145,6 +145,7 @@ model Channel {
   mediaAssets                       MediaAsset[]
   defaultCategories                 ChannelDefaultCategory[]
   defaultTags                       ChannelDefaultTag[]
+  taggingRuns                       MediaAssetTaggingRun[]
 
   @@index([status])
   @@index([defaultBotId, status])
@@ -263,6 +264,7 @@ model MediaAsset {
   dispatchTasks        DispatchTask[]
   categories           MediaAssetCategory[]
   tags                 MediaAssetTag[]
+  taggingRuns          MediaAssetTaggingRun[]
   channel              Channel              @relation(fields: [channelId], references: [id])
 
   @@unique([fileHash, fileSize])
@@ -830,6 +832,26 @@ model MediaAssetTag {
   @@unique([mediaAssetId, tagId])
   @@index([tagId, mediaAssetId])
   @@map("media_asset_tags")
+}
+
+model MediaAssetTaggingRun {
+  id             BigInt     @id @default(autoincrement())
+  mediaAssetId   BigInt     @map("media_asset_id")
+  channelId      BigInt     @map("channel_id")
+  triggerSource  String     @map("trigger_source") @db.VarChar(32)
+  candidateCount Int        @default(0) @map("candidate_count")
+  selectedCount  Int        @default(0) @map("selected_count")
+  confidence     Decimal?   @db.Decimal(5, 4)
+  status         String     @default("success") @db.VarChar(16)
+  reason         String?
+  payload        Json?
+  createdAt      DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  mediaAsset     MediaAsset @relation(fields: [mediaAssetId], references: [id], onDelete: Cascade)
+  channel        Channel    @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([mediaAssetId, createdAt(sort: Desc)])
+  @@index([channelId, createdAt(sort: Desc)])
+  @@map("media_asset_tagging_runs")
 }
 
 model CollectionCategory {
