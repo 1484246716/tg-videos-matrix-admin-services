@@ -1,4 +1,5 @@
 import { cloneMediaDownloadQueue } from '../../infra/redis';
+import { prisma } from '../../infra/prisma';
 import { logger } from '../../logger';
 import { CloneMediaDownloadJob } from '../types/clone-queue.types';
 import {
@@ -6,6 +7,7 @@ import {
   enqueueGuardWaitJobByChannel,
   getGuardWaitFairnessSnapshot,
 } from './clone-guard-wait-fairness.service';
+import { prepareCloneDownloadJobForEnqueue } from './clone-download-queue.service';
 
 let processedCount = 0;
 
@@ -56,22 +58,57 @@ export async function processCloneGuardWait(job: CloneMediaDownloadJob) {
     return;
   }
 
-  const jobId = `clone-download-item-${itemId}`;
-  const existing = await cloneMediaDownloadQueue.getJob(jobId);
-  if (existing) {
-    const state = await existing.getState();
-    if (state === 'waiting' || state === 'active' || state === 'delayed') {
-      logger.info('[clone][guard-wait] skip duplicate requeue due to existing active job', {
-        itemId,
-        jobId,
-        state,
-        pickedChannelUsername: next.channelUsername,
-      });
-      return;
-    }
-    if (state === 'failed') {
-      await existing.remove();
-    }
+  const prepared = await prepareCloneDownloadJobForEnqueue({
+    itemId,
+    source: 'guard-wait-round-robin',
+  });
+
+  if (!prepared.canEnqueue) {
+    logger.info('[clone][guard-wait] skip duplicate requeue due to existing job state', {
+      itemId,
+      jobId: prepared.jobId,
+      state: prepared.existingState,
+      reason: prepared.reason,
+      pickedChannelUsername: next.channelUsername,
+    });
+    return;
+  }
+
+  const itemIdBigInt = BigInt(itemId);
+  const transitioned = await prisma.cloneCrawlItem.updateMany({
+    where: {
+      id: itemIdBigInt,
+      downloadStatus: {
+        in: ['paused_by_guard', 'queued', 'failed_retryable', 'none'],
+      } as any,
+    },
+    data: {
+      downloadStatus: 'queued',
+      downloadLeaseUntil: null,
+      downloadHeartbeatAt: null,
+      downloadWorkerJobId: null,
+      downloadErrorCode: null,
+      downloadError: null,
+    } as any,
+  });
+
+  if (transitioned.count === 0) {
+    const latest = await prisma.cloneCrawlItem.findUnique({
+      where: { id: itemIdBigInt },
+      select: {
+        downloadStatus: true,
+        localPath: true,
+      },
+    });
+
+    logger.info('[clone][guard-wait] skip requeue due to state transition guard', {
+      itemId,
+      jobId: prepared.jobId,
+      pickedChannelUsername: next.channelUsername,
+      currentStatus: latest?.downloadStatus ?? null,
+      localPath: latest?.localPath ?? null,
+    });
+    return;
   }
 
   await cloneMediaDownloadQueue.add(
@@ -80,7 +117,7 @@ export async function processCloneGuardWait(job: CloneMediaDownloadJob) {
       ...next.payload,
       retryCount: Number((next.payload as { retryCount?: number }).retryCount ?? 0),
     },
-    { jobId, removeOnComplete: true, removeOnFail: 100 },
+    { jobId: prepared.jobId, removeOnComplete: true, removeOnFail: 100 },
   );
 
   processedCount += 1;
@@ -95,6 +132,8 @@ export async function processCloneGuardWait(job: CloneMediaDownloadJob) {
   }
 
   logger.info('[clone][guard-wait] requeued by round-robin', {
+    itemId,
+    jobId: prepared.jobId,
     pickedChannelUsername: next.channelUsername,
     remainingInPickedChannel: next.remaining,
     sourceItemId: job.itemId,

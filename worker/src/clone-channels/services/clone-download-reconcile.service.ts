@@ -5,16 +5,13 @@ import { logger } from '../../logger';
 import {
   CLONE_DOWNLOAD_RECOVER_MAX,
   CLONE_DOWNLOAD_RECONCILE_BATCH,
+  CLONE_GUARD_WAIT_STUCK_MS,
   CLONE_DOWNLOAD_STUCK_MS,
 } from '../../config/env';
-
-async function isActiveQueueStateByJobId(jobId: string | null | undefined) {
-  if (!jobId) return false;
-  const job = await cloneMediaDownloadQueue.getJob(jobId);
-  if (!job) return false;
-  const state = await job.getState();
-  return state === 'active' || state === 'waiting' || state === 'delayed';
-}
+import {
+  hasCloneDownloadJobInFlight,
+  prepareCloneDownloadJobForEnqueue,
+} from './clone-download-queue.service';
 
 async function isDownloadedFileReady(localPath: string | null | undefined) {
   if (!localPath) return false;
@@ -44,6 +41,7 @@ function buildRequeuePayload(item: any) {
 export async function reconcileCloneDownloadStuck() {
   const now = new Date();
   const staleBefore = new Date(Date.now() - CLONE_DOWNLOAD_STUCK_MS);
+  const guardWaitStaleBefore = new Date(Date.now() - CLONE_GUARD_WAIT_STUCK_MS);
 
   const items = await prisma.cloneCrawlItem.findMany({
     where: {
@@ -59,6 +57,10 @@ export async function reconcileCloneDownloadStuck() {
         {
           downloadStatus: 'failed_retryable',
           updatedAt: { lte: staleBefore },
+        },
+        {
+          downloadStatus: 'paused_by_guard',
+          updatedAt: { lte: guardWaitStaleBefore },
         },
       ],
     },
@@ -76,7 +78,7 @@ export async function reconcileCloneDownloadStuck() {
   for (const item of items as any[]) {
     detected += 1;
 
-    const queueActive = await isActiveQueueStateByJobId(item.downloadWorkerJobId ?? null);
+    const queueActive = await hasCloneDownloadJobInFlight(item.id);
     if (queueActive) {
       skippedActive += 1;
       continue;
@@ -117,9 +119,18 @@ export async function reconcileCloneDownloadStuck() {
     }
 
     const payload = buildRequeuePayload(item);
+    const prepared = await prepareCloneDownloadJobForEnqueue({
+      itemId: item.id,
+      source: 'reconcile',
+    });
+
+    if (!prepared.canEnqueue) {
+      skippedActive += 1;
+      continue;
+    }
 
     await cloneMediaDownloadQueue.add('clone-media-download-reconcile', payload, {
-      jobId: `clone-download-item-${item.id.toString()}`,
+      jobId: prepared.jobId,
       removeOnComplete: true,
       removeOnFail: 100,
     });

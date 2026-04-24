@@ -7,6 +7,7 @@ import {
   CLONE_RETRY_MAX_DELAY_MS,
 } from '../constants/clone-queue.constants';
 import { CloneRetryJob, CloneRetryReason } from '../types/clone-queue.types';
+import { prepareCloneDownloadJobForEnqueue } from './clone-download-queue.service';
 
 function isRetryable(reason: CloneRetryReason | string) {
   const nonRetryableReasons = new Set<string>([
@@ -127,9 +128,30 @@ export async function processCloneRetry(job: CloneRetryJob) {
         ? String(rawItemId)
         : '';
 
+    const prepared = itemId
+      ? await prepareCloneDownloadJobForEnqueue({
+          itemId,
+          source: 'retry',
+        })
+      : null;
+
+    if (prepared && !prepared.canEnqueue) {
+      logger.info('[clone] retry enqueue skipped due to existing download job state', {
+        queue: job.queue,
+        reason: job.reason,
+        itemId,
+        jobId: prepared.jobId,
+        existingState: prepared.existingState,
+        prepareReason: prepared.reason,
+        retryCount: nextRetryCount,
+        retryMax,
+        delayMs,
+      });
+      return;
+    }
+
     await cloneMediaDownloadQueue.add('clone-media-download-retry', job.payload, {
-      // 方案2：retry 回流也使用同一 item 级 jobId，跨入口统一去重键。
-      jobId: itemId ? `clone-download-item-${itemId}` : undefined,
+      jobId: prepared?.jobId,
       delay: delayMs,
       removeOnComplete: true,
       removeOnFail: 100,

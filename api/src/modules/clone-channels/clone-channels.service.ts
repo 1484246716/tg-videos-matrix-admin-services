@@ -273,22 +273,24 @@ export class CloneChannelsService {
 
     const mergedChannels =
       normalizedChannels ?? existingTask.channels.map((channel) => channel.channelUsername);
-    const singleMessageEnabled = true;
-    const parsedSingleMessage = this.parseSingleMessageLink(
-      dto.singleMessageLink !== undefined
-        ? dto.singleMessageLink
-        : existingTask.singleMessageLink,
-    );
+    const singleMessageEnabled = dto.singleMessageEnabled ?? existingTask.singleMessageEnabled;
+    const parsedSingleMessage = singleMessageEnabled
+      ? this.parseSingleMessageLink(
+          dto.singleMessageLink !== undefined
+            ? dto.singleMessageLink
+            : existingTask.singleMessageLink,
+        )
+      : null;
 
-    if (!parsedSingleMessage) {
-      throw new BadRequestException('singleMessageLink is required for clone-channels task');
+    if (singleMessageEnabled && !parsedSingleMessage) {
+      throw new BadRequestException('singleMessageLink is required when singleMessageEnabled=true');
     }
 
-    if (mergedChannels.length !== 1) {
-      throw new BadRequestException('clone-channels task must contain exactly one channel');
+    if (singleMessageEnabled && mergedChannels.length !== 1) {
+      throw new BadRequestException('single-message clone task must contain exactly one channel');
     }
 
-    if (mergedChannels[0] !== parsedSingleMessage.channelUsername) {
+    if (singleMessageEnabled && mergedChannels[0] !== parsedSingleMessage.channelUsername) {
       throw new BadRequestException('singleMessageLink must match the selected channel');
     }
 

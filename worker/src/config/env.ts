@@ -73,6 +73,12 @@ export const CLONE_DOWNLOAD_STUCK_MS = (() => {
   return Math.min(3600000, Math.floor(n));
 })();
 
+export const CLONE_GUARD_WAIT_STUCK_MS = (() => {
+  const n = Number(process.env.CLONE_GUARD_WAIT_STUCK_MS ?? '20000');
+  if (!Number.isFinite(n) || n < 10000) return 20000;
+  return Math.min(300000, Math.floor(n));
+})();
+
 /** Clone 下载卡住自愈每轮处理上限 */
 export const CLONE_DOWNLOAD_RECONCILE_BATCH = (() => {
   const n = Number(process.env.CLONE_DOWNLOAD_RECONCILE_BATCH ?? '200');

@@ -606,7 +606,7 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
       where: {
         id: itemId,
         downloadStatus: {
-          in: ['queued', 'failed_retryable', 'none'],
+          in: ['queued', 'failed_retryable', 'paused_by_guard', 'none'],
         } as any,
       },
       data: {
