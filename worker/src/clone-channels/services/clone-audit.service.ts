@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 健康审计服务：周期采集关键指标并触发阈值告警。
+ * 用于在 clone 调度/执行链路中识别重试激增、队列卡住、分组阻塞等异常。
+ */
+
 import { prisma } from '../../infra/prisma';
 import { cloneGuardWaitQueue, cloneMediaDownloadQueue, cloneRetryQueue } from '../../infra/redis';
 import { logger } from '../../logger';
@@ -34,6 +39,7 @@ let lastAlertState = {
   groupBlocked: false,
 };
 
+// 采集 clone 健康快照并在状态变化时输出告警/恢复日志。
 export async function auditCloneHealth() {
   const recentWindow = new Date(Date.now() - 10 * 60 * 1000);
   const staleBefore = new Date(Date.now() - CLONE_DOWNLOAD_STUCK_MS);

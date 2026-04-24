@@ -1,4 +1,4 @@
-import { access, copyFile, mkdir, open, rename, rm, stat, writeFile } from 'node:fs/promises';
+﻿import { access, copyFile, mkdir, open, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { constants as fsConstants } from 'node:fs';
 import { execFile } from 'node:child_process';
@@ -519,7 +519,7 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
       runId: job.runId,
       itemId: job.itemId,
       channelUsername: channelUsernameForSlot,
-      delayMs: 10_000,
+      delayMs: 30_000,
     });
     return;
   }

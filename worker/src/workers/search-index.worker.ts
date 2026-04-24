@@ -1,4 +1,9 @@
 /**
+ * Search Index Worker：消费搜索索引队列并执行文档构建/更新/删除。
+ * 在 bootstrap 注册后由 BullMQ 驱动，负责接收 job 并调用 search-index service。
+ */
+
+/**
  * search-index.worker.ts
  * ──────────────────────
  * BullMQ Worker：q_search_index 队列消费者

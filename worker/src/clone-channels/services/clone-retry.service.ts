@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 重试服务：统一处理重试策略、重试上限与回队列逻辑。
+ * 用于在 clone 调度/执行链路中，对可重试失败进行延迟重试并记录状态。
+ */
+
 import { cloneChannelIndexQueue, cloneMediaDownloadQueue } from '../../infra/redis';
 import { prisma } from '../../infra/prisma';
 import { logger } from '../../logger';
@@ -9,6 +14,7 @@ import {
 import { CloneRetryJob, CloneRetryReason } from '../types/clone-queue.types';
 import { prepareCloneDownloadJobForEnqueue } from './clone-download-queue.service';
 
+// 判断失败原因是否允许重试（不可重试错误直接跳过）。
 function isRetryable(reason: CloneRetryReason | string) {
   const nonRetryableReasons = new Set<string>([
     'auth_invalid',
@@ -18,6 +24,7 @@ function isRetryable(reason: CloneRetryReason | string) {
   return !nonRetryableReasons.has(reason);
 }
 
+// 计算重试延迟：优先使用上游 retry_after，其次使用指数退避并受最大值限制。
 function computeRetryDelayMs(params: {
   retryCount: number;
   retryAfterSec?: number;
@@ -34,6 +41,7 @@ function computeRetryDelayMs(params: {
   return Math.min(maxDelayMs, expDelay);
 }
 
+// 从重试任务 payload 中解析 taskId（统一转为 bigint，失败返回 null）。
 function getPayloadTaskId(job: CloneRetryJob): bigint | null {
   const raw = (job.payload as { taskId?: unknown })?.taskId;
   if (typeof raw !== 'string' && typeof raw !== 'number' && typeof raw !== 'bigint') return null;
@@ -44,6 +52,7 @@ function getPayloadTaskId(job: CloneRetryJob): bigint | null {
   }
 }
 
+// 解析本次任务的最大重试次数：优先读取任务配置，缺省回退全局默认值。
 async function resolveRetryMax(job: CloneRetryJob) {
   const taskId = getPayloadTaskId(job);
   if (!taskId) return CLONE_RETRY_MAX;
@@ -57,6 +66,7 @@ async function resolveRetryMax(job: CloneRetryJob) {
   return task.retryMax;
 }
 
+// 当下载重试耗尽时，将条目标记为最终失败并写入错误信息。
 async function markDownloadExhaustedIfPossible(job: CloneRetryJob, reason: string, retryCount: number) {
   if (job.queue !== 'download') return;
 
@@ -80,6 +90,7 @@ async function markDownloadExhaustedIfPossible(job: CloneRetryJob, reason: strin
   });
 }
 
+// Clone 重试主流程：校验可重试性、计算延迟并重新入队对应队列。
 export async function processCloneRetry(job: CloneRetryJob) {
   const retryCount = Math.max(0, job.retryCount ?? 0);
 

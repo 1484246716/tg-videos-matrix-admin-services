@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 索引服务：从 Telegram 拉取消息并写入 crawl item。
+ * 用于在 clone 调度/执行链路中完成增量索引、去重、过滤与下载任务派发。
+ */
+
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { prisma } from '../../infra/prisma';
@@ -14,6 +19,7 @@ import { CLONE_RETRY_MAX } from '../constants/clone-queue.constants';
 import { markCloneTaskRunFinished } from './clone-task.service';
 import { enqueueCloneGroupItem, shouldUseCloneL1L2 } from './clone-group-scheduler.service';
 
+// 将异常归类为可观测的重试原因码。
 function classifyRetryReason(err: unknown): CloneRetryReason {
   const message = err instanceof Error ? err.message.toLowerCase() : '';
   if (message.includes('floodwait') || message.includes('flood_wait')) return 'flood_wait';
@@ -24,14 +30,17 @@ function classifyRetryReason(err: unknown): CloneRetryReason {
   return 'index_unknown_error';
 }
 
+// 规范化频道用户名：去除 @ 前缀并统一小写。
 function normalizeChannelUsername(raw: string) {
   return raw.trim().replace(/^@+/, '').toLowerCase();
 }
 
+// 转换为数据库存储格式的频道用户名（补齐 @ 前缀）。
 function toDbChannelUsername(normalized: string) {
   return `@${normalized}`;
 }
 
+// 解析单条消息链接（t.me/channel/messageId）并返回标准化结果。
 function parseSingleMessageLink(raw?: string | null) {
   const value = String(raw ?? '').trim();
   if (!value) return null;
@@ -56,6 +65,7 @@ function parseSingleMessageLink(raw?: string | null) {
   };
 }
 
+// 解析并校验内容类型过滤项，非法值自动忽略并回退默认集合。
 function parseContentTypes(raw: string[] | CloneContentType[] | undefined): CloneContentType[] {
   const allowed: CloneContentType[] = ['text', 'image', 'video'];
   if (!raw || raw.length === 0) return allowed;
@@ -134,10 +144,12 @@ type AdFilterReason =
   | 'video_with_blue_link'
   | 'text_with_blue_link_and_button';
 
+// 规范化文本：去首尾空白并统一为小写，便于规则匹配。
 function normalizeText(value: unknown) {
   return String(value ?? '').trim().toLowerCase();
 }
 
+// 提取消息正文与实体中的所有链接。
 function extractMessageLinks(msg: any): string[] {
   const text = String(msg?.message ?? '');
   const textLinks = text.match(/https?:\/\/[^\s]+/gi) ?? [];
@@ -154,6 +166,7 @@ function extractMessageLinks(msg: any): string[] {
   return Array.from(new Set([...textLinks, ...entityLinks].map((v) => String(v).trim())));
 }
 
+// 提取按钮文案与按钮链接，用于广告/引流规则判断。
 function extractButtonTextsAndLinks(msg: any): { texts: string[]; links: string[] } {
   const rows = Array.isArray(msg?.replyMarkup?.rows) ? msg.replyMarkup.rows : [];
   const texts: string[] = [];
@@ -170,6 +183,7 @@ function extractButtonTextsAndLinks(msg: any): { texts: string[]; links: string[
   return { texts, links };
 }
 
+// 根据实体类型判断消息中是否存在“蓝链”。
 function hasBlueLinkByEntity(msg: any) {
   const entities = Array.isArray(msg?.entities) ? msg.entities : [];
   return entities.some((e: any) => {
@@ -178,12 +192,31 @@ function hasBlueLinkByEntity(msg: any) {
   });
 }
 
+// 判断消息是否携带回复按钮。
 function hasReplyButtons(msg: any) {
   const rows = Array.isArray(msg?.replyMarkup?.rows) ? msg.replyMarkup.rows : [];
   return rows.some((row: any) => Array.isArray(row?.buttons) && row.buttons.length > 0);
 }
 
-function detectAdReasons(msg: any): AdFilterReason[] {
+function createEmptyAdFilterStats(): Record<AdFilterReason, number> {
+  return {
+    keyword: 0,
+    hashtag: 0,
+    link: 0,
+    button: 0,
+    pinned_service: 0,
+    image_with_blue_link: 0,
+    video_with_blue_link: 0,
+    text_with_blue_link_and_button: 0,
+  };
+}
+
+// 命中广告/引流规则检测并返回原因集合。
+function detectAdReasons(msg: any, options?: { bypassFilter?: boolean }): AdFilterReason[] {
+  if (options?.bypassFilter) {
+    return [];
+  }
+
   const reasons = new Set<AdFilterReason>();
   const messageText = normalizeText(msg?.message);
 
@@ -252,10 +285,12 @@ function detectAdReasons(msg: any): AdFilterReason[] {
   return Array.from(reasons);
 }
 
+// 清理文件名中的非法字符，确保可落盘。
 function sanitizeFileName(name: string) {
   return name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_').replace(/\s+/g, ' ').trim();
 }
 
+// 根据 MIME 类型解析文件扩展名。
 function resolveFileExtensionByMime(mimeType?: string | null) {
   const normalized = (mimeType ?? '').toLowerCase();
   if (normalized === 'video/mp4') return '.mp4';
@@ -268,6 +303,7 @@ function resolveFileExtensionByMime(mimeType?: string | null) {
   return '.bin';
 }
 
+// 生成媒体文件基础名（频道-消息-序号）。
 function resolveMediaBaseName(params: {
   channelUsername: string;
   messageId: bigint;
@@ -281,15 +317,18 @@ function resolveMediaBaseName(params: {
   return `${fallbackStem}-${params.mediaType}${Math.max(1, params.mediaIndex)}${ext}`;
 }
 
+// 解析分组目录名：有 groupedId 用 grouped-，否则使用 single-。
 function resolveGroupDirName(groupedId: string | undefined, messageId: bigint) {
   if (groupedId && groupedId.trim()) return `grouped-${sanitizeFileName(groupedId.trim())}`;
   return `single-${messageId.toString()}`;
 }
 
+// 计算分组消息的目标落盘路径。
 function resolveGroupedTargetPath(baseTargetPath: string, groupedId: string | undefined, messageId: bigint) {
   return path.join(baseTargetPath, resolveGroupDirName(groupedId, messageId));
 }
 
+// 推断条目媒体类型（image/video），用于分组计数统计。
 function inferCloneItemMediaKind(item: {
   hasVideo: boolean;
   mimeType?: string | null;
@@ -310,6 +349,7 @@ function inferCloneItemMediaKind(item: {
   return null;
 }
 
+// 持久化消息文本到目标目录 message.txt。
 async function persistMessageText(params: {
   targetPath: string;
   channelUsername: string;
@@ -326,6 +366,7 @@ async function persistMessageText(params: {
   await writeFile(txtPath, content, 'utf8');
 }
 
+// 拉取增量消息并按内容类型/广告规则过滤。
 async function fetchIncrementalMessages(params: {
   channelUsername: string;
   lastFetchedMessageId?: bigint | null;
@@ -377,13 +418,7 @@ async function fetchIncrementalMessages(params: {
   let skippedByNoId = 0;
   let skippedByType = 0;
   let skippedByAd = 0;
-  const skippedByAdReasons: Record<AdFilterReason, number> = {
-    keyword: 0,
-    hashtag: 0,
-    link: 0,
-    button: 0,
-    pinned_service: 0,
-  };
+  const skippedByAdReasons = createEmptyAdFilterStats();
   let pickedVideo = 0;
   let pickedImage = 0;
   let pickedText = 0;
@@ -495,6 +530,7 @@ async function fetchIncrementalMessages(params: {
   return picked;
 }
 
+// 拉取指定单条消息（若属于 groupedId 则补全同组消息）。
 async function fetchSingleMessage(params: {
   channelUsername: string;
   messageId: bigint;
@@ -548,13 +584,7 @@ async function fetchSingleMessage(params: {
   let skippedByNoId = 0;
   let skippedByType = 0;
   let skippedByAd = 0;
-  const skippedByAdReasons: Record<AdFilterReason, number> = {
-    keyword: 0,
-    hashtag: 0,
-    link: 0,
-    button: 0,
-    pinned_service: 0,
-  };
+  const skippedByAdReasons = createEmptyAdFilterStats();
   let foundTargetMessage = false;
 
   for (const msg of messages) {
@@ -596,7 +626,7 @@ async function fetchSingleMessage(params: {
       continue;
     }
 
-    const adReasons = detectAdReasons(msg as any);
+    const adReasons = detectAdReasons(msg as any, { bypassFilter: true });
     if (adReasons.length > 0) {
       skippedByAd += 1;
       for (const reason of adReasons) {
@@ -641,6 +671,7 @@ async function fetchSingleMessage(params: {
   return picked;
 }
 
+// 批量写入索引条目：去重、落库并按策略派发下载任务。
 async function upsertIndexedItems(params: {
   taskId: bigint;
   runId: bigint;
@@ -820,6 +851,7 @@ async function upsertIndexedItems(params: {
   return { inserted, deduped, queuedDownloads, maxMessageId };
 }
 
+// 将爬虫统计的分组媒体数量写入 sourceExpectedCount。
 async function writeGroupSourceExpectedCountFromCrawl(params: {
   taskId: bigint;
   channelId: bigint;
@@ -965,6 +997,7 @@ async function writeGroupSourceExpectedCountFromCrawl(params: {
   }
 }
 
+// clone 索引主流程：拉取消息、写入 crawl item，并处理重试与收尾。
 export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
   const runId = BigInt(job.runId);
   const taskId = BigInt(job.taskId);

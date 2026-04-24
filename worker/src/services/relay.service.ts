@@ -1,3 +1,8 @@
+/**
+ * ?????TypeA ??????????????????????????????????? media_asset?
+ * ?????task-definition / relay scheduler -> enqueueRelayAssetsFromTaskDefinition -> media_assets ???? -> relay-upload.worker ???
+ */
+
 import { stat, unlink } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { MediaStatus } from '@prisma/client';
@@ -13,6 +18,7 @@ import {
 import { tryAcquireRelayPathLock, releaseRelayPathLock } from '../shared/relay-path-lock';
 import { TYPEA_INGEST_ERROR_CODE, TYPEA_INGEST_FINAL_REASON } from '../shared/metrics';
 
+// ?? remove Local Duplicate File ?????????????????????
 async function removeLocalDuplicateFile(filePath: string, mediaAssetId: string) {
   try {
     await unlink(filePath);
@@ -31,6 +37,7 @@ async function removeLocalDuplicateFile(filePath: string, mediaAssetId: string) 
   }
 }
 
+// ?? parse Grouped Meta ????????????????????????
 function parseGroupedMeta(filePath: string) {
   const normalized = filePath.replace(/\\/g, '/');
   const match = normalized.match(/\/(grouped-\d+|single-\d+)\//i);
@@ -42,6 +49,7 @@ function parseGroupedMeta(filePath: string) {
   return { groupKey, groupedId };
 }
 
+// ????? resolve Source Expected Count ????????????????????
 async function resolveSourceExpectedCount(args: {
   channelId: bigint;
   filePath: string;
@@ -115,6 +123,7 @@ async function resolveSourceExpectedCount(args: {
   return terminalCount;
 }
 
+// ?? parse Clone Source Meta ????????????????????????
 function parseCloneSourceMeta(filePath: string, groupedMeta: { groupKey: string; groupedId: string | null } | null) {
   if (!groupedMeta) return null;
 
@@ -135,11 +144,13 @@ function parseCloneSourceMeta(filePath: string, groupedMeta: { groupKey: string;
   };
 }
 
+// ?? build Stored File Hash ?????????????????????
 function buildStoredFileHash(fileHash: string, cloneSourceMeta: { sourceMessageId: string } | null) {
   if (!cloneSourceMeta?.sourceMessageId) return fileHash;
   return `${fileHash}:srcmsg:${cloneSourceMeta.sourceMessageId}`;
 }
 
+// ???????????? Skip Relay Scan File ??????????????
 function shouldSkipRelayScanFile(filePath: string): { skip: boolean; reason?: string } {
   const name = basename(filePath).toLowerCase();
 
@@ -156,6 +167,7 @@ function shouldSkipRelayScanFile(filePath: string): { skip: boolean; reason?: st
   return { skip: false };
 }
 
+// ?? parse Collection Meta ????????????????????????
 function parseCollectionMeta(filePath: string) {
   const normalizedFile = filePath.replace(/\\/g, '/');
   const marker = '/collection/';
@@ -199,6 +211,7 @@ function parseCollectionMeta(filePath: string) {
   };
 }
 
+// ???????????????????? relay ????????????????
 export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: bigint) {
   const definition = await getTaskDefinitionModel().findUnique({
     where: { id: taskDefinitionId },

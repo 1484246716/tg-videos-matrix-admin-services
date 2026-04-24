@@ -1,9 +1,15 @@
+/**
+ * Clone Channels 下载 Worker：消费下载队列并执行媒体下载。
+ * 负责 payload 校验、调用下载服务以及失败日志上报。
+ */
+
 import { Worker } from 'bullmq';
 import { cloneMediaDownloadQueue, connection } from '../../infra/redis';
 import { logger, logError } from '../../logger';
 import { CLONE_DOWNLOAD_GLOBAL_CONCURRENCY } from '../constants/clone-queue.constants';
 import { processCloneMediaDownload } from '../services/clone-download.service';
 
+// 校验下载任务是否具备必需字段。
 function hasRequiredDownloadPayload(data: any) {
   const hasTaskId = typeof data?.taskId === 'string' || typeof data?.taskId === 'number' || typeof data?.taskId === 'bigint';
   const hasRunId = typeof data?.runId === 'string' || typeof data?.runId === 'number' || typeof data?.runId === 'bigint';

@@ -1,3 +1,8 @@
+/**
+ * Task Definition Scheduler：统一调度 task_definition 配置任务。
+ * 在 bootstrap 定时触发，负责抢锁执行、失败回退与指标统计。
+ */
+
 import { TaskDefinitionType } from '@prisma/client';
 import { MAX_SCHEDULE_BATCH, TASK_DEFINITION_ERROR_RETRY_SEC } from '../config/env';
 import { getTaskDefinitionModel } from '../infra/prisma';
@@ -13,6 +18,7 @@ import { scheduleDueMassMessageItems } from './mass-message-scheduler';
 
 let hasWarnedMissingTaskDefinitionsTable = false;
 
+// 根据任务类型分发到对应 scheduler 执行。
 export async function scheduleTaskDefinitionByType(definition: {
   id: bigint;
   taskType: TaskDefinitionType;
@@ -46,6 +52,7 @@ export async function scheduleTaskDefinitionByType(definition: {
   }
 }
 
+// 扫描并执行已启用且到点的任务定义。
 export async function scheduleEnabledTaskDefinitions() {
   taskdefMetrics.tickTotal += 1;
 

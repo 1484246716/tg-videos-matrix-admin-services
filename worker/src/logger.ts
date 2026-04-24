@@ -1,3 +1,8 @@
+/**
+ * Worker 日志模块：统一输出普通日志与 clone 专用日志。
+ * 为 scheduler / worker / service / shared 提供一致的日志与错误记录能力。
+ */
+
 import winston from 'winston';
 import DailyRotateFile from 'winston-daily-rotate-file';
 import { mkdirSync } from 'node:fs';
@@ -11,6 +16,7 @@ const LOG_RETENTION_DAYS = Number(process.env.WORKER_LOG_RETENTION_DAYS || '14')
 mkdirSync(LOG_DIR, { recursive: true });
 mkdirSync(CLONE_LOG_DIR, { recursive: true });
 
+// 判断是否为 clone 相关日志。
 function isCloneLog(info: winston.Logform.TransformableInfo) {
   const message = String(info.message ?? '');
   return message.includes('[clone]') || message.includes('[clone-');
@@ -53,6 +59,7 @@ export const logger = winston.createLogger({
   transports: [fileTransport, cloneFileTransport, consoleTransport],
 });
 
+// 将未知错误转换为可读摘要。
 export function toReadableErrorSummary(error: unknown): string {
   if (error instanceof Error) {
     return error.message || error.name || 'Unknown error';
@@ -103,6 +110,7 @@ export function toReadableErrorSummary(error: unknown): string {
   return 'Unknown error';
 }
 
+// 序列化未知错误对象，便于结构化日志落盘。
 function serializeUnknownError(error: unknown): Record<string, unknown> {
   if (error instanceof Error) {
     const withCause = error as Error & { cause?: unknown };
@@ -145,6 +153,7 @@ function serializeUnknownError(error: unknown): Record<string, unknown> {
   };
 }
 
+// 统一错误日志入口。
 export function logError(message: string, error?: unknown) {
   if (!error) {
     logger.error(message);

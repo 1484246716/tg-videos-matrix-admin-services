@@ -10,6 +10,7 @@ import { StringSession } from 'telegram/sessions';
 import { TelegramClient } from 'telegram';
 import { Api } from 'telegram';
 import { computeCheck } from 'telegram/Password';
+import { CloneDownloadStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateCloneTaskDto } from './dto/create-clone-task.dto';
 import { UpdateCloneTaskDto } from './dto/update-clone-task.dto';
@@ -147,6 +148,19 @@ export class CloneChannelsService {
     return BigInt(id);
   }
 
+  private parsePositiveInt(value: string | number | undefined, fallback: number, max?: number) {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+    if (max && parsed > max) return max;
+    return parsed;
+  }
+
+  private parseDateOrUndefined(value?: string) {
+    if (!value) return undefined;
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+  }
+
   private computeInitialNextRunAt(scheduleType: 'once' | 'hourly' | 'daily') {
     if (scheduleType === 'once') return new Date();
     if (scheduleType === 'hourly') return new Date();
@@ -217,18 +231,121 @@ export class CloneChannelsService {
     return this.serializeBigInt(created);
   }
 
-  async listTasks() {
+  async listTasks(filters?: {
+    keyword?: string;
+    status?: string;
+    crawlMode?: string;
+    scheduleType?: string;
+    createdBy?: string;
+    updatedFrom?: string;
+    updatedTo?: string;
+  }) {
+    const where: Record<string, any> = {};
+    const keyword = String(filters?.keyword ?? '').trim();
+    const status = String(filters?.status ?? '').trim();
+    const crawlMode = String(filters?.crawlMode ?? '').trim();
+    const scheduleType = String(filters?.scheduleType ?? '').trim();
+    const createdByKeyword = String(filters?.createdBy ?? '').trim();
+    const updatedFrom = this.parseDateOrUndefined(filters?.updatedFrom);
+    const updatedTo = this.parseDateOrUndefined(filters?.updatedTo);
+
+    if (keyword) {
+      where.OR = [
+        { name: { contains: keyword, mode: 'insensitive' } },
+        {
+          channels: {
+            some: {
+              channelUsername: { contains: keyword.replace(/^@+/, ''), mode: 'insensitive' },
+            },
+          },
+        },
+      ];
+    }
+
+    if (status) where.status = status;
+    if (crawlMode) where.crawlMode = crawlMode;
+    if (scheduleType) where.scheduleType = scheduleType;
+
+    if (updatedFrom || updatedTo) {
+      where.updatedAt = {
+        ...(updatedFrom ? { gte: updatedFrom } : {}),
+        ...(updatedTo ? { lte: updatedTo } : {}),
+      };
+    }
+
+    if (createdByKeyword) {
+      const users = await this.prisma.user.findMany({
+        where: {
+          username: {
+            contains: createdByKeyword,
+            mode: 'insensitive',
+          },
+        },
+        select: { id: true },
+        take: 20,
+      });
+
+      if (users.length === 0) {
+        return [];
+      }
+
+      where.createdBy = { in: users.map((user) => user.id) };
+    }
+
     const rows = await this.taskModel.findMany({
+      where,
       include: {
         _count: {
           select: { channels: true, runs: true },
         },
+        runs: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: {
+            id: true,
+            status: true,
+            channelSuccess: true,
+            channelFailed: true,
+            indexedCount: true,
+            downloadedCount: true,
+            dedupCount: true,
+            createdAt: true,
+          },
+        },
       },
       orderBy: { updatedAt: 'desc' },
-      take: 100,
+      take: 200,
     });
 
-    return this.serializeBigInt(rows);
+    const creatorIds = Array.from(
+      new Set(
+        rows
+          .map((row) => row.createdBy)
+          .filter((value): value is bigint => typeof value === 'bigint'),
+      ),
+    );
+
+    const creators = creatorIds.length
+      ? await this.prisma.user.findMany({
+          where: { id: { in: creatorIds } },
+          select: { id: true, username: true, displayName: true },
+        })
+      : [];
+
+    const creatorMap = new Map(
+      creators.map((user) => [
+        user.id.toString(),
+        user.displayName?.trim() || user.username,
+      ]),
+    );
+
+    const enriched = rows.map((row) => ({
+      ...row,
+      createdByUsername: row.createdBy ? creatorMap.get(row.createdBy.toString()) ?? null : null,
+      latestRun: row.runs[0] ?? null,
+    }));
+
+    return this.serializeBigInt(enriched);
   }
 
   async getTask(id: string) {
@@ -436,19 +553,41 @@ export class CloneChannelsService {
     };
   }
 
-  async listDownloadQueue() {
-    const rows = await this.prisma.cloneCrawlItem.findMany({
-      where: {
-        downloadStatus: {
-          in: ['queued', 'downloading', 'downloaded', 'failed_retryable', 'failed_final', 'paused_by_guard'],
-        },
+  async listDownloadQueue(params?: {
+    page?: string;
+    pageSize?: string;
+    failedOnly?: string;
+  }) {
+    const page = this.parsePositiveInt(params?.page, 1);
+    const pageSize = this.parsePositiveInt(params?.pageSize, 20, 100);
+    const failedOnly = String(params?.failedOnly ?? '').trim() === 'true';
+    const statuses: CloneDownloadStatus[] = failedOnly
+      ? ['failed_retryable', 'failed_final', 'paused_by_guard']
+      : ['queued', 'downloading', 'downloaded', 'failed_retryable', 'failed_final', 'paused_by_guard'];
+    const where = {
+      downloadStatus: {
+        in: statuses,
       },
-      orderBy: { updatedAt: 'desc' },
-      take: 200,
-    });
+    };
+
+    const [rows, total, guardRows] = await Promise.all([
+      this.prisma.cloneCrawlItem.findMany({
+        where,
+        orderBy: { updatedAt: 'desc' },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.cloneCrawlItem.count({ where }),
+      this.prisma.cloneCrawlItem.findMany({
+        where: {
+          ...where,
+          downloadStatus: 'paused_by_guard',
+        },
+        select: { downloadErrorCode: true },
+      }),
+    ]);
 
     const reasonCounter = new Map<string, number>();
-    const guardRows = rows.filter((row) => row.downloadStatus === 'paused_by_guard');
 
     for (const row of guardRows) {
       const key = (row.downloadErrorCode || 'unknown').trim() || 'unknown';
@@ -468,6 +607,10 @@ export class CloneChannelsService {
       items: rows,
       reasonStats,
       guardTotal,
+      total,
+      page,
+      pageSize,
+      totalPages: Math.max(1, Math.ceil(total / pageSize)),
     });
   }
 
@@ -613,6 +756,19 @@ export class CloneChannelsService {
     });
 
     return { retried: updated.count };
+  }
+
+  async deleteDownloadQueue(ids: string[]) {
+    const parsedIds = ids.filter((id) => /^\d+$/.test(id)).map((id) => BigInt(id));
+    if (parsedIds.length === 0) {
+      throw new BadRequestException('ids is required');
+    }
+
+    const deleted = await this.prisma.cloneCrawlItem.deleteMany({
+      where: { id: { in: parsedIds } },
+    });
+
+    return { deleted: deleted.count };
   }
 
   async pauseAllDownloads() {

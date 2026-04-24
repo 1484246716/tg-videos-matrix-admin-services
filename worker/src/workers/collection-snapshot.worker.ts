@@ -1,3 +1,8 @@
+/**
+ * Collection Snapshot Worker：消费快照队列并执行增量刷新。
+ * 在 bootstrap 注册后由 BullMQ 驱动，负责接收 job 并调用 snapshot service。
+ */
+
 import { Worker } from 'bullmq';
 import { connection } from '../infra/redis';
 import { logger } from '../logger';

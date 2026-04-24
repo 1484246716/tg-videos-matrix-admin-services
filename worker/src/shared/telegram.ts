@@ -1,3 +1,8 @@
+/**
+ * Telegram 请求封装：统一处理 Bot API 调用、重试与错误归一化。
+ * 为 relay / dispatch / catalog / mass-message 提供稳定的 Telegram 发送能力。
+ */
+
 import axios from 'axios';
 import http from 'node:http';
 import https from 'node:https';
@@ -21,14 +26,17 @@ export type TelegramError = {
   retryAfterSec?: number;
 };
 
+// 规范化 Telegram API Base（移除末尾斜杠）。
 function normalizeTelegramApiBase(raw: string): string {
   return raw.replace(/\/+$/, '');
 }
 
+// 脱敏日志中的 Telegram endpoint（隐藏 bot token）。
 function maskTelegramEndpoint(url: string): string {
   return url.replace(/\/bot[^/]+\//, '/bot***\/');
 }
 
+// 将 chatId/messageId 转换为可访问的消息链接。
 function toTelegramMessageLink(chatIdRaw: string, messageId: number): string | null {
   if (chatIdRaw.startsWith('-100')) {
     const internalId = chatIdRaw.slice(4);
@@ -111,11 +119,13 @@ export type TelegramResponse = {
   updateIdMax?: number;
 };
 
+// 简单异步等待函数。
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 let lastTelegramRequestAt = 0;
+// 控制 Telegram 请求频率，避免突发过载。
 async function throttleTelegramRequests() {
   if (TG_SEND_MIN_INTERVAL_MS <= 0) return;
   const now = Date.now();
@@ -126,6 +136,7 @@ async function throttleTelegramRequests() {
   lastTelegramRequestAt = Date.now();
 }
 
+// 从错误描述中提取 retry_after 秒数。
 function parseRetryAfterSeconds(description: string, fallback?: number): number | undefined {
   if (typeof fallback === 'number' && Number.isFinite(fallback) && fallback > 0) {
     return Math.floor(fallback);
@@ -137,6 +148,7 @@ function parseRetryAfterSeconds(description: string, fallback?: number): number 
   return Math.floor(n);
 }
 
+// 计算重试延迟（优先 retry_after，其次指数退避）。
 function computeRetryDelayMs(attempt: number, retryAfterSec?: number) {
   if (retryAfterSec && retryAfterSec > 0) {
     const jitter = Math.floor(Math.random() * 250);
@@ -148,6 +160,7 @@ function computeRetryDelayMs(attempt: number, retryAfterSec?: number) {
   return expSec * 1000 + jitter;
 }
 
+// 将对象安全序列化为日志字符串。
 function stringifyForLog(value: unknown): string | null {
   if (value === undefined || value === null) return null;
   if (typeof value === 'string') return value;
@@ -159,6 +172,7 @@ function stringifyForLog(value: unknown): string | null {
   }
 }
 
+// 统一发送 Telegram 请求（含限流、重试、错误归一化）。
 export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<TelegramResponse> {
   const endpoint = `${normalizeTelegramApiBase(telegramApiBase)}/bot${args.botToken}/${args.method}`;
 
@@ -407,6 +421,7 @@ export async function sendTelegramRequest(args: TelegramRequestArgs): Promise<Te
   };
 }
 
+// 通过 Telegram 发送视频（使用 file_id）。
 export async function sendVideoByTelegram(args: {
   botToken: string;
   chatId: string;
@@ -436,6 +451,7 @@ export async function sendVideoByTelegram(args: {
   };
 }
 
+// 通过 Telegram 发送图片（使用 file_id）。
 export async function sendPhotoByTelegram(args: {
   botToken: string;
   chatId: string;
@@ -465,6 +481,7 @@ export async function sendPhotoByTelegram(args: {
   };
 }
 
+// 通过 Telegram 发送文本消息。
 export async function sendTextByTelegram(args: {
   botToken: string;
   chatId: string;
@@ -495,6 +512,7 @@ export async function sendTextByTelegram(args: {
   };
 }
 
+// 调用 getUpdates 获取 Telegram 更新流。
 export async function getTelegramUpdates(args: {
   botToken: string;
   offset?: number;
@@ -519,6 +537,7 @@ export async function getTelegramUpdates(args: {
   return { updates: result.updates ?? [], updateIdMax: result.updateIdMax };
 }
 
+// 通过 Telegram 编辑消息文本。
 export async function editMessageTextByTelegram(args: {
   botToken: string;
   chatId: string;
@@ -545,6 +564,7 @@ export async function editMessageTextByTelegram(args: {
   }
 }
 
+// 通过 Telegram 置顶消息。
 export async function pinMessageByTelegram(args: {
   botToken: string;
   chatId: string;
@@ -561,6 +581,7 @@ export async function pinMessageByTelegram(args: {
   });
 }
 
+// 通过 Telegram 取消置顶消息。
 export async function unpinMessageByTelegram(args: {
   botToken: string;
   chatId: string;

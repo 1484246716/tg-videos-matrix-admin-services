@@ -1,3 +1,8 @@
+/**
+ * ?????TypeB ?????????????????????????????????????
+ * ?????dispatch.worker -> handleDispatchJob / handleDispatchGroupJob -> Telegram ????????????????????
+ */
+
 import { rm } from 'node:fs/promises';
 import path from 'node:path';
 import { AiModelProfile, DispatchMediaType, MediaStatus, TaskStatus } from '@prisma/client';
@@ -16,6 +21,7 @@ import { sendPhotoByTelegram, sendTelegramRequest, sendVideoByTelegram, Telegram
 import { classifyAndAssignForTypeB } from './typeb-category.service';
 import { assignContentTagsForTypeB } from './typeb-content-tag.service';
 
+// ?? Parse Entities Error ??????????????????????
 function isParseEntitiesError(error: { code?: string; message?: string } | null | undefined) {
   const message = (error?.message ?? '').toLowerCase();
   const code = error?.code ?? '';
@@ -30,6 +36,7 @@ function isParseEntitiesError(error: { code?: string; message?: string } | null 
   );
 }
 
+// ?? Deterministic Dispatch Error ??????????????????????
 function isDeterministicDispatchError(error: { code?: string; message?: string } | null | undefined) {
   const message = (error?.message ?? '').toLowerCase();
 
@@ -41,16 +48,19 @@ function isDeterministicDispatchError(error: { code?: string; message?: string }
   );
 }
 
+// ?? Photo As Video Error ??????????????????????
 function isPhotoAsVideoError(error: { code?: string; message?: string } | null | undefined) {
   const message = (error?.message ?? '').toLowerCase();
   return error?.code === 'TG_400' && message.includes("can't use file of type photo as video");
 }
 
+// ?? Video As Photo Error ??????????????????????
 function isVideoAsPhotoError(error: { code?: string; message?: string } | null | undefined) {
   const message = (error?.message ?? '').toLowerCase();
   return error?.code === 'TG_400' && message.includes("can't use file of type video as photo");
 }
 
+// ????? resolve Dispatch Method ????????????????????
 function resolveDispatchMethod(meta: Record<string, unknown> | null | undefined, originalName: string) {
   const mediaTypeRaw = typeof meta?.relayResolvedMediaType === 'string' ? meta.relayResolvedMediaType.toLowerCase() : '';
   if (mediaTypeRaw === 'photo') return 'sendPhoto' as const;
@@ -65,12 +75,14 @@ function resolveDispatchMethod(meta: Record<string, unknown> | null | undefined,
   return 'sendVideo' as const;
 }
 
+// ?? get File Stem ?????????????????????
 function getFileStem(fileName: string) {
   const trimmed = fileName.trim();
   const stem = trimmed.replace(/\.[^./\\]+$/, '').trim();
   return stem || trimmed;
 }
 
+// ?? AI Failure Text ??????????????????????
 function isAiFailureText(text?: string | null) {
   if (!text) return false;
   const normalized = text.trim();
@@ -79,6 +91,7 @@ function isAiFailureText(text?: string | null) {
   return /无法识别|抱歉|如果可以提供更多|视频的内容简介|主要角色|生成相关文案/.test(normalized);
 }
 
+// ????? resolve Dispatch AI Profile ????????????????????
 async function resolveDispatchAiProfile(aiModelProfileId: bigint | null | undefined): Promise<AiModelProfile | null> {
   const profile = aiModelProfileId
     ? await prisma.aiModelProfile.findUnique({
@@ -114,15 +127,18 @@ async function resolveDispatchAiProfile(aiModelProfileId: bigint | null | undefi
   };
 }
 
+// ?? get Collection Display Name ?????????????????????
 function getCollectionDisplayName(name: string) {
   const normalized = name.replace(/合集/g, '').trim();
   return normalized || name.trim();
 }
 
+// ?? build Collection Episode Title ?????????????????????
 function buildCollectionEpisodeTitle(collectionName: string, episodeNo: number) {
   return `${getCollectionDisplayName(collectionName)}第${episodeNo}集`;
 }
 
+// ?? apply Collection Episode Title ?????????????????????
 function applyCollectionEpisodeTitle(caption: string, title: string) {
   const desiredLine = `📺片名：${title}`;
   const trimmedCaption = caption.trim();
@@ -135,6 +151,7 @@ function applyCollectionEpisodeTitle(caption: string, title: string) {
   return `${desiredLine}\n${trimmedCaption}`;
 }
 
+// ??? normalize Title Fallback ????????????????????????
 function normalizeTitleFallback(raw: string, fallback: string) {
   const candidate = raw
     .replace(/[《》#]/g, '')
@@ -146,6 +163,7 @@ function normalizeTitleFallback(raw: string, fallback: string) {
   return cleanFallback || '精彩视频';
 }
 
+// ?? sanitize Type BCaption Unknown ??????????????????????
 function sanitizeTypeBCaptionUnknown(caption: string, fallbackTitle: string) {
   let next = caption.trim();
   if (!next) return fallbackTitle;
@@ -171,17 +189,20 @@ function sanitizeTypeBCaptionUnknown(caption: string, fallbackTitle: string) {
   return next;
 }
 
+// ??? normalize Caption Text ????????????????????????
 function normalizeCaptionText(raw?: string | null) {
   if (!raw) return '';
   return raw.replace(/^\uFEFF/, '').trim();
 }
 
+// ????? truncate Catalog Title ???????????????
 function truncateCatalogTitle(text: string, maxChars = 15) {
   const chars = Array.from(text);
   if (chars.length <= maxChars) return text;
   return `${chars.slice(0, maxChars).join('')}...`;
 }
 
+// ???????? extract Catalog Short Title ??????????????????
 function extractCatalogShortTitle(raw?: string | null) {
   const caption = normalizeCaptionText(raw);
   if (!caption) return null;
@@ -208,6 +229,7 @@ function extractCatalogShortTitle(raw?: string | null) {
   return truncateCatalogTitle(normalized, 15);
 }
 
+// ????? resolve Caption From Source Meta ????????????????????
 function resolveCaptionFromSourceMeta(meta: Record<string, unknown> | null | undefined) {
   if (!meta) return '';
   const direct = typeof meta.caption === 'string' ? meta.caption : '';
@@ -216,6 +238,7 @@ function resolveCaptionFromSourceMeta(meta: Record<string, unknown> | null | und
   return normalizeCaptionText(msg);
 }
 
+// ?? to Finite Number ?????????????????????
 function toFiniteNumber(v: unknown) {
   if (typeof v === 'number' && Number.isFinite(v)) return v;
   if (typeof v === 'string' && v.trim()) {
@@ -225,6 +248,7 @@ function toFiniteNumber(v: unknown) {
   return null;
 }
 
+// ?? read Media Dimensions ?????????????????????
 function readMediaDimensions(meta: Record<string, unknown> | null | undefined) {
   const width = toFiniteNumber(meta?.width) ?? toFiniteNumber(meta?.videoWidth) ?? toFiniteNumber(meta?.imageWidth);
   const height = toFiniteNumber(meta?.height) ?? toFiniteNumber(meta?.videoHeight) ?? toFiniteNumber(meta?.imageHeight);
@@ -235,6 +259,7 @@ function readMediaDimensions(meta: Record<string, unknown> | null | undefined) {
   return { width, height, aspectRatio, area: width * height };
 }
 
+// ? classify Image Orientation ?????????????????????????
 function classifyImageOrientation(aspectRatio: number | null) {
   if (!aspectRatio) return 'square' as const;
   if (aspectRatio >= 1.2) return 'landscape' as const;
@@ -242,6 +267,7 @@ function classifyImageOrientation(aspectRatio: number | null) {
   return 'square' as const;
 }
 
+// ????? resolve Media Type By Meta ????????????????????
 function resolveMediaTypeByMeta(meta: Record<string, unknown> | null | undefined, originalNameHint?: string | null) {
   const relayResolvedMediaType =
     typeof meta?.relayResolvedMediaType === 'string' ? meta.relayResolvedMediaType.toLowerCase() : '';
@@ -264,10 +290,12 @@ function resolveMediaTypeByMeta(meta: Record<string, unknown> | null | undefined
   return null;
 }
 
+// ?? Dispatch Scoped Temp Dir Name ??????????????????????
 function isDispatchScopedTempDirName(dirName: string) {
   return /^(single|grouped)-[a-z0-9][a-z0-9_-]*$/i.test(dirName);
 }
 
+// ????? resolve Dispatch Scoped Dir From Meta ????????????????????
 function resolveDispatchScopedDirFromMeta(
   meta: Record<string, unknown> | null | undefined,
   localPathFallback?: string | null,
@@ -287,6 +315,7 @@ function resolveDispatchScopedDirFromMeta(
   return match[1].replace(/\//g, path.sep);
 }
 
+// ?? cleanup Dispatch Scoped Directories After Success ?????????????????????
 async function cleanupDispatchScopedDirectoriesAfterSuccess(
   tasks: Array<{ mediaAsset: { sourceMeta: unknown; localPath?: string | null } }>,
   allowedDirNames?: Set<string>,
@@ -343,6 +372,7 @@ async function cleanupDispatchScopedDirectoriesAfterSuccess(
   }
 }
 
+// ?? build Group Caption From Tasks ?????????????????????
 function buildGroupCaptionFromTasks(tasks: Array<{ mediaAsset: { sourceMeta: unknown } }>) {
   let firstTxt = '';
   for (const t of tasks) {
@@ -389,10 +419,12 @@ function buildGroupCaptionFromTasks(tasks: Array<{ mediaAsset: { sourceMeta: unk
   return { caption: '', captionSource: 'none' as const };
 }
 
+// ?? get Source Meta Object ?????????????????????
 function getSourceMetaObject(sourceMeta: unknown) {
   return sourceMeta && typeof sourceMeta === 'object' ? (sourceMeta as Record<string, unknown>) : null;
 }
 
+// ?? parse Source Expected Count From Meta ????????????????????????
 function parseSourceExpectedCountFromMeta(sourceMeta: unknown) {
   const meta = getSourceMetaObject(sourceMeta);
   const parsed = toFiniteNumber(meta?.sourceExpectedCount);
@@ -400,6 +432,7 @@ function parseSourceExpectedCountFromMeta(sourceMeta: unknown) {
   return Math.floor(parsed);
 }
 
+// ?? parse Source Message ID From Meta ????????????????????????
 function parseSourceMessageIdFromMeta(sourceMeta: unknown) {
   const meta = getSourceMetaObject(sourceMeta);
   const raw = meta?.sourceMessageId;
@@ -409,6 +442,7 @@ function parseSourceMessageIdFromMeta(sourceMeta: unknown) {
   return null;
 }
 
+// ? dedupe Group Tasks By Source ID ???????????????????
 function dedupeGroupTasksBySourceId<T extends {
   id: bigint;
   mediaAsset: {
@@ -419,12 +453,14 @@ function dedupeGroupTasksBySourceId<T extends {
     sourceMeta: unknown;
   };
 }>(tasks: T[]) {
+  // ?? key Of ?????????????????????
   const keyOf = (task: T) => {
     const sourceMessageId = parseSourceMessageIdFromMeta(task.mediaAsset.sourceMeta);
     // 方案4：业务兜底去重键优先使用 sourceMessageId（即 source_id）；缺失时退化到 mediaAssetId。
     return sourceMessageId ? `src:${sourceMessageId}` : `asset:${task.mediaAsset.id.toString()}`;
   };
 
+  // ?? score Of ?????????????????????
   const scoreOf = (task: T) => {
     const uploadedReady =
       task.mediaAsset.status === MediaStatus.relay_uploaded &&
@@ -465,6 +501,7 @@ function dedupeGroupTasksBySourceId<T extends {
   };
 }
 
+// ?? parse Collection Source Meta ????????????????????????
 function parseCollectionSourceMeta(sourceMeta: unknown) {
   const meta = getSourceMetaObject(sourceMeta);
   if (meta?.isCollection !== true) {
@@ -486,6 +523,7 @@ function parseCollectionSourceMeta(sourceMeta: unknown) {
   };
 }
 
+// ?? delete Catalog Source Item From Single ???????????????????????
 async function deleteCatalogSourceItemFromSingle(args: {
   channelId: bigint;
   telegramMessageId: number;
@@ -508,6 +546,7 @@ async function deleteCatalogSourceItemFromSingle(args: {
   return deletedCount;
 }
 
+// ?? delete Catalog Source Item From Group ???????????????????????
 async function deleteCatalogSourceItemFromGroup(args: {
   channelId: bigint;
   groupKey: string;
@@ -534,6 +573,7 @@ async function deleteCatalogSourceItemFromGroup(args: {
   return deletedCount;
 }
 
+// ??????? upsert Catalog Source Item From Single ?????????????????
 async function upsertCatalogSourceItemFromSingle(args: {
   channelId: bigint;
   dispatchTaskId: bigint;
@@ -605,6 +645,7 @@ async function upsertCatalogSourceItemFromSingle(args: {
   }
 }
 
+// ??????? upsert Catalog Source Item From Group ?????????????????
 async function upsertCatalogSourceItemFromGroup(args: {
   channelId: bigint;
   seedDispatchTaskId: bigint;
@@ -679,6 +720,7 @@ async function upsertCatalogSourceItemFromGroup(args: {
   }
 }
 
+// ???? TypeB ???????????? sendMediaGroup ??????????????
 export async function handleDispatchGroupJob(
   dispatchTaskIdRaw: string,
   jobId: string,
@@ -1249,6 +1291,7 @@ export async function handleDispatchGroupJob(
   } else {
     // 多图多视频：视频在图片之后；图片按尺寸自由排列（横->方->竖，组内面积降序）
     const photoSorted = [...photos].sort((a, b) => {
+      // ?? rank ?????????????????????
       const rank = (o: string | null) => (o === 'landscape' ? 0 : o === 'square' ? 1 : 2);
       const r = rank(a.orientation) - rank(b.orientation);
       if (r !== 0) return r;
@@ -1284,6 +1327,7 @@ export async function handleDispatchGroupJob(
   const fallbackSingleMode = media.length === 1;
   const { caption, captionSource } = buildGroupCaptionFromTasks(sortedGroupTasks as any);
 
+  // ?? build Input Media ?????????????????????
   const buildInputMedia = (overrideTypeByTaskId?: Map<string, 'photo' | 'video'>) =>
     media.map((item, index) => ({
       type: overrideTypeByTaskId?.get(item.taskId.toString()) ?? item.type,
@@ -1317,6 +1361,7 @@ export async function handleDispatchGroupJob(
 
     if (fallbackSingleMode) {
       const only = media[0];
+      // ?? send Single ?????????????????????
       const sendSingle = async (method: 'sendPhoto' | 'sendVideo', parseMode: string | null | undefined) => {
         if (method === 'sendPhoto') {
           return sendPhotoByTelegram({
@@ -1597,6 +1642,7 @@ export async function handleDispatchGroupJob(
   }
 }
 
+// ???? TypeB ????????????????????????????
 export async function handleDispatchJob(
   dispatchTaskIdRaw: string,
   jobId: string,
@@ -1829,6 +1875,7 @@ export async function handleDispatchJob(
           mediaAssetId: task.mediaAsset.id,
           originalName: aiSearchVideoName,
           aiCaption: finalCaption || '',
+          durationSec: task.mediaAsset.durationSec,
           profile: aiProfile,
         });
       } catch (categoryErr) {
@@ -1952,6 +1999,7 @@ export async function handleDispatchJob(
       originalName: task.mediaAsset.originalName,
     });
 
+    // ?? send With Method ?????????????????????
     const sendWithMethod = async (method: 'sendVideo' | 'sendPhoto', parseMode: string | null | undefined) => {
       if (method === 'sendPhoto') {
         return sendPhotoByTelegram({

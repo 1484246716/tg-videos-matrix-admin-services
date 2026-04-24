@@ -1,3 +1,8 @@
+/**
+ * Redis 与 BullMQ 基础设施初始化：提供 worker 侧连接与队列实例。
+ * 为 bootstrap、scheduler、service 与 worker 提供统一队列访问。
+ */
+
 import IORedis from 'ioredis';
 import { Queue } from 'bullmq';
 import { redisUrl } from '../config/env';

@@ -1,5 +1,11 @@
+/**
+ * 资源选择工具：供 scheduler/worker/service 共享使用。
+ * 提供随机选择 bot 与 relayChannel 的查询方法。
+ */
+
 import { prisma } from '../infra/prisma';
 
+// 随机选择一个可用 bot。
 export async function pickRandomBot() {
   const bots = await prisma.bot.findMany({
     where: { status: 'active' },
@@ -13,6 +19,7 @@ export async function pickRandomBot() {
   return bots[Math.floor(Math.random() * bots.length)];
 }
 
+// 随机选择一个可用 relay channel。
 export async function pickRandomRelayChannel() {
   const relayChannels = await prisma.relayChannel.findMany({
     where: {
@@ -31,6 +38,7 @@ export async function pickRandomRelayChannel() {
   return relayChannels[Math.floor(Math.random() * relayChannels.length)];
 }
 
+// 同时随机选择 bot 与 relay channel。
 export async function pickRandomBotAndRelay() {
   const [bot, relay] = await Promise.all([
     pickRandomBot(),

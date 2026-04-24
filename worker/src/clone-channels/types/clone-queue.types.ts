@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 任务队列与服务层共享类型定义。
+ * 为 clone scheduler、worker 与 service 提供统一的入参/状态类型约束。
+ */
+
 export type CloneCrawlScheduleJob = {
   taskId: string;
   runAt: string;

@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 任务调度服务：负责生成 run 并派发频道索引任务。
+ * 用于在 clone scheduler/worker 链路中推进 nextRunAt 与任务生命周期。
+ */
+
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../infra/prisma';
 import { cloneChannelIndexQueue } from '../../infra/redis';
@@ -13,10 +18,12 @@ import { CloneChannelIndexJob, CloneContentType } from '../types/clone-queue.typ
 
 type CloneScheduleType = 'once' | 'hourly' | 'daily';
 
+// 规范化频道用户名：去除 @ 前缀并统一小写。
 function normalizeChannelUsername(raw: string) {
   return raw.trim().replace(/^@+/, '').toLowerCase();
 }
 
+// 构建频道索引任务入队 payload。
 function buildCloneChannelIndexJobInput(params: {
   task: {
     id: bigint;
@@ -45,6 +52,7 @@ function buildCloneChannelIndexJobInput(params: {
   };
 }
 
+// 解析每日运行时间（HH:mm）。
 function parseDailyRunTime(raw?: string | null) {
   const fallback = CLONE_DAILY_DEFAULT_TIME;
   const source = (raw ?? fallback).trim();
@@ -57,12 +65,14 @@ function parseDailyRunTime(raw?: string | null) {
   return { hour, minute };
 }
 
+// 为计划时间添加随机抖动，避免任务同秒集中触发。
 function applyJitter(date: Date, maxJitterSec: number) {
   if (!Number.isFinite(maxJitterSec) || maxJitterSec <= 0) return date;
   const jitterMs = Math.floor(Math.random() * (Math.floor(maxJitterSec) + 1)) * 1000;
   return new Date(date.getTime() + jitterMs);
 }
 
+// 获取指定时区下的年月日时分秒。
 function zonedDateParts(date: Date, timeZone: string) {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone,
@@ -75,6 +85,7 @@ function zonedDateParts(date: Date, timeZone: string) {
     hour12: false,
   }).formatToParts(date);
 
+  // 读取指定类型的日期片段数值。
   const get = (type: string) => Number(parts.find((p) => p.type === type)?.value || '0');
 
   return {
@@ -87,6 +98,7 @@ function zonedDateParts(date: Date, timeZone: string) {
   };
 }
 
+// 将时区本地时间换算为 UTC 时间点。
 function zonedLocalToUtc(datePart: { year: number; month: number; day: number }, hour: number, minute: number, timeZone: string) {
   const baseUtc = Date.UTC(datePart.year, datePart.month - 1, datePart.day, hour, minute, 0, 0);
   const probe = new Date(baseUtc);
@@ -105,6 +117,7 @@ function zonedLocalToUtc(datePart: { year: number; month: number; day: number },
   return new Date(targetAsUtc - offsetMs);
 }
 
+// 计算任务下一次运行时间（once/hourly/daily）。
 export function computeCloneTaskNextRunAt(params: {
   scheduleType: CloneScheduleType;
   timezone: string;
@@ -149,6 +162,7 @@ export function computeCloneTaskNextRunAt(params: {
   return applyJitter(target, CLONE_DAILY_JITTER_SEC);
 }
 
+// 标记 run 完成并推进任务 nextRunAt。
 export async function markCloneTaskRunFinished(params: {
   taskId: bigint;
   scheduleType: CloneScheduleType;
@@ -179,6 +193,7 @@ export async function markCloneTaskRunFinished(params: {
   });
 }
 
+// clone 调度主流程：扫描到点任务、创建 run 并派发频道索引。
 export async function scheduleCloneTasks() {
   const now = new Date();
 

@@ -1,3 +1,8 @@
+/**
+ * Catalog Worker：消费目录队列并执行目录任务处理。
+ * 在 bootstrap 注册后由 BullMQ 驱动，负责接收 job 并调用 catalog service。
+ */
+
 import { Worker } from 'bullmq';
 import { TYPEC_ALERT_MANUAL_REPAIR_QUEUE_LAG_SECONDS } from '../config/env';
 import { connection } from '../infra/redis';

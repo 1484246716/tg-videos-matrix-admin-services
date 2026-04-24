@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 会话服务：统一获取 Telegram 客户端并封装超时与错误归一化。
+ * 用于在 clone 调度/执行链路中提供稳定的 user/bot 会话访问入口。
+ */
+
 import { TelegramClient } from 'telegram';
 import { logger } from '../../logger';
 import { getGramjsBotClient, getGramjsUserClient } from '../../shared/gramjs/client';
@@ -16,6 +21,7 @@ type WithClientParams = {
   accountType?: CloneAccountType;
 };
 
+// 为异步调用附加超时控制。
 async function runWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return promise;
 
@@ -30,6 +36,7 @@ async function runWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promis
   ]);
 }
 
+// 统一归一化 clone 相关错误，便于上层重试策略判断。
 function normalizeCloneError(err: unknown): Error {
   const message = err instanceof Error ? err.message : String(err);
   const lowered = message.toLowerCase();
@@ -49,6 +56,7 @@ function normalizeCloneError(err: unknown): Error {
   return err instanceof Error ? err : new Error(message);
 }
 
+// 获取可用 Telegram 客户端（支持 user/bot 类型）。
 export async function getClient(params?: GetClientParams): Promise<TelegramClient> {
   if (params?.forceReconnect) {
     await disconnectClient(params.accountId);
@@ -66,6 +74,7 @@ export async function getClient(params?: GetClientParams): Promise<TelegramClien
   }
 }
 
+// 以统一日志/超时/错误处理包装客户端调用。
 export async function withClient<T>(
   params: WithClientParams,
   fn: (client: TelegramClient) => Promise<T>,
@@ -97,6 +106,7 @@ export async function withClient<T>(
   }
 }
 
+// 兼容断连入口：当前共享客户端实现下为 no-op。
 export async function disconnectClient(_accountId?: string): Promise<void> {
   // 目前 shared/gramjs/client.ts 仅暴露单例 getGramjsClient，未暴露安全断开接口。
   // 这里先保留兼容签名，后续若 client 层支持 disconnect，再接入真实释放逻辑。

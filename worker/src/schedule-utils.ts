@@ -1,4 +1,9 @@
 /**
+ * 调度通用工具函数集合。
+ * 提供 task-definition scheduler 需要的间隔与锁 key 计算能力。
+ */
+
+/**
  * Pure / side-effect-free utilities extracted from main.ts
  * for unit testing (§13 of the A+B plan).
  */

@@ -1,3 +1,8 @@
+/**
+ * Catalog Scheduler：扫描并入队到期的频道导航任务。
+ * 在 bootstrap 定时触发，负责到点判断、加锁与投递 catalog worker。
+ */
+
 import {
   CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED,
   TYPEC_ALERT_EMPTY_RUN_CONSECUTIVE_THRESHOLD,
@@ -14,6 +19,7 @@ import { releaseChannelLock, tryAcquireChannelLock } from '../shared/channel-loc
 import { catalogMetrics } from '../shared/metrics';
 import { updateTaskDefinitionRunStatus } from '../services/task-definition.service';
 
+// 计算目录任务下次允许执行时间。
 function computeCatalogNextAllowedAt(args: {
   lastNavUpdateAt: Date | null;
   navIntervalSec: number;
@@ -23,6 +29,7 @@ function computeCatalogNextAllowedAt(args: {
   return new Date(args.lastNavUpdateAt.getTime() + Math.max(0, args.navIntervalSec) * 1000);
 }
 
+// 扫描到期目录任务并入队执行。
 export async function scheduleDueCatalogTasks() {
   catalogMetrics.tickTotal += 1;
   const now = new Date();
@@ -160,6 +167,7 @@ export async function scheduleDueCatalogTasks() {
   }
 }
 
+// 任务定义入口：执行一次目录调度并回写任务定义运行状态。
 export async function scheduleCatalogForDefinition(taskDefinitionId: bigint) {
   try {
     await scheduleDueCatalogTasks();

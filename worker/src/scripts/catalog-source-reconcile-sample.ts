@@ -1,7 +1,13 @@
+/**
+ * catalog_source_item 抽样对账脚本。
+ * 对比 dispatch 成功样本与 catalog_source_item 映射的一致性。
+ */
+
 import '../config/env';
 import { prisma } from '../infra/prisma';
 import { logger } from '../logger';
 
+// 解析命令行参数（--name=value）。
 function parseArg(name: string, defaultValue: string) {
   const hit = process.argv.find((item) => item.startsWith(`--${name}=`));
   if (!hit) return defaultValue;
@@ -10,17 +16,20 @@ function parseArg(name: string, defaultValue: string) {
   return hit.slice(eqIndex + 1).trim() || defaultValue;
 }
 
+// 安全转换为整数并限制在给定范围内。
 function toInt(value: string, fallback: number, min: number, max: number) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
+// 判断 sourceMeta 是否标记为合集来源。
 function isCollectionSourceMeta(sourceMeta: unknown) {
   if (!sourceMeta || typeof sourceMeta !== 'object') return false;
   return (sourceMeta as Record<string, unknown>).isCollection === true;
 }
 
+// 主流程：抽样读取、对账统计并输出结果。
 async function main() {
   const channelIdRaw = parseArg('channelId', '');
   if (!/^\d+$/.test(channelIdRaw)) {

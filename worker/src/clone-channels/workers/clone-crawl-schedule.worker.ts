@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 调度 Worker：触发定时 crawl 调度入口。
+ * 负责在 bootstrap 后消费调度队列并调用 clone task 调度服务。
+ */
+
 import { Worker } from 'bullmq';
 import { connection, cloneCrawlScheduleQueue } from '../../infra/redis';
 import { logger, logError } from '../../logger';

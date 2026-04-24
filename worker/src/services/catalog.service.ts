@@ -398,6 +398,7 @@ async function deleteTelegramMessages(args: {
   }
 }
 
+// ?? delete Collection Nav State Messages ???????????????????????
 async function deleteCollectionNavStateMessages(args: {
   botToken: string;
   chatId: string;
@@ -440,6 +441,7 @@ async function deleteCollectionNavStateMessages(args: {
   }
 }
 
+// ?? build Catalog Index Content ?????????????????????
 function buildCatalogIndexContent(args: {
   channelName: string;
   totalPages: number;
@@ -455,6 +457,7 @@ function buildCatalogIndexContent(args: {
   ].join('\n');
 }
 
+// ?? build Catalog Page Buttons ?????????????????????
 function buildCatalogPageButtons(args: { chatId: string; pageMessageIds: number[] }) {
   const buttons = args.pageMessageIds
     .map((messageId, index) => {
@@ -481,6 +484,7 @@ function buildCatalogPageButtons(args: { chatId: string; pageMessageIds: number[
   return { inline_keyboard: inlineKeyboard };
 }
 
+// ?? build Catalog Content Page Reply Markup ?????????????????????
 function buildCatalogContentPageReplyMarkup(args: {
   chatId: string;
   currentPage: number;
@@ -530,6 +534,7 @@ function buildCatalogContentPageReplyMarkup(args: {
   return inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : null;
 }
 
+// ?? build Collection Index Reply Markup ?????????????????????
 function buildCollectionIndexReplyMarkup(args: {
   chatId: string;
   pageItems: Array<{ text: string; url: string }>;
@@ -586,6 +591,7 @@ function buildCollectionIndexReplyMarkup(args: {
   return { inline_keyboard: inlineKeyboard };
 }
 
+// ?? build Collection Detail Reply Markup ?????????????????????
 function buildCollectionDetailReplyMarkup(args: {
   chatId: string;
   currentPage: number;
@@ -631,6 +637,7 @@ function buildCollectionDetailReplyMarkup(args: {
   return inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : null;
 }
 
+// ?? parse Collection Meta ????????????????????????
 function parseCollectionMeta(sourceMeta: unknown) {
   if (!sourceMeta || typeof sourceMeta !== 'object') return null;
   const meta = sourceMeta as Record<string, unknown>;
@@ -667,6 +674,7 @@ type CollectionCatalogEpisode = {
   isMissingPlaceholder?: boolean;
 };
 
+// ??? format Collection Episode Title ????????????????????
 function formatCollectionEpisodeTitle(args: {
   episodeNo: number;
   episodeTitle?: string | null;
@@ -687,6 +695,7 @@ function formatCollectionEpisodeTitle(args: {
   return fallbackTitle;
 }
 
+// ?? build Collection Episode Dedup Key ?????????????????????
 function buildCollectionEpisodeDedupKey(collectionName: string, episodeNo: number) {
   return `${normalizeCollectionKey(collectionName)}#${episodeNo}`;
 }
@@ -697,6 +706,7 @@ interface CollectionCatalogReadProvider {
 }
 
 class DbCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
+  // ?? get Collections ?????????????????????
   async getCollections(channelId: bigint): Promise<CollectionCatalogConfig[]> {
     return prisma.collection.findMany({
       where: { channelId },
@@ -705,6 +715,7 @@ class DbCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
     });
   }
 
+  // ?? get Collection Episodes ?????????????????????
   async getCollectionEpisodes(channelId: bigint): Promise<CollectionCatalogEpisode[]> {
     const collections = await prisma.collection.findMany({
       where: { channelId },
@@ -899,12 +910,15 @@ class DbCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
 }
 
 class CachedCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
+  // ?????????????????????????
   constructor(private readonly dbProvider: CollectionCatalogReadProvider) { }
 
+  // ?? get Collections ?????????????????????
   async getCollections(channelId: bigint): Promise<CollectionCatalogConfig[]> {
     return this.dbProvider.getCollections(channelId);
   }
 
+  // ?? get Collection Episodes ?????????????????????
   async getCollectionEpisodes(channelId: bigint): Promise<CollectionCatalogEpisode[]> {
     const now = Date.now();
     const staleMs = TYPEC_COLLECTION_CACHE_STALE_SECONDS * 1000;
@@ -979,6 +993,7 @@ class CachedCollectionCatalogReadProvider implements CollectionCatalogReadProvid
   }
 }
 
+// ??????????????????????????????
 export async function handleCatalogJob(
   channelIdRaw: string,
   options?: { selfHealOnly?: boolean; triggerType?: 'scheduler' | 'manual_repair'; runId?: string },

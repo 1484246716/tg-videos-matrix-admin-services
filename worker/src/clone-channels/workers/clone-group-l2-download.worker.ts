@@ -1,3 +1,8 @@
+/**
+ * Clone Channels L2 下载 Worker：执行分组媒体下载任务。
+ * 负责消费 L2 队列、调用下载服务，并在完成/失败后驱动下一轮 L1 分发。
+ */
+
 import { Worker } from 'bullmq';
 import { cloneGroupL1DispatchQueue, cloneGroupL2DownloadQueue, connection } from '../../infra/redis';
 import { logger, logError } from '../../logger';
@@ -7,6 +12,7 @@ import {
   onCloneGroupL2Done,
 } from '../services/clone-group-scheduler.service';
 
+// 校验下载任务是否具备必需字段。
 function hasRequiredDownloadPayload(data: any) {
   const hasTaskId = typeof data?.taskId === 'string' || typeof data?.taskId === 'number' || typeof data?.taskId === 'bigint';
   const hasRunId = typeof data?.runId === 'string' || typeof data?.runId === 'number' || typeof data?.runId === 'bigint';

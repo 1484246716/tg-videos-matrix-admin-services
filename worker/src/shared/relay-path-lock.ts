@@ -1,12 +1,19 @@
+/**
+ * 本地中转路径锁工具：供 scheduler/worker/service 共享使用。
+ * 防止同一路径被并发上传或重复处理造成竞争冲突。
+ */
+
 import { createHash } from 'node:crypto';
 import { connection } from '../infra/redis';
 import { RELAY_LOCAL_PATH_LOCK_TTL_MS } from '../config/env';
 
+// 构建本地路径锁 key（路径哈希）。
 function buildRelayPathLockKey(localPath: string) {
   const digest = createHash('sha1').update(localPath.toLowerCase()).digest('hex');
   return `lock:relay:path:${digest}`;
 }
 
+// 尝试获取本地路径锁。
 export async function tryAcquireRelayPathLock(localPath: string) {
   const lockKey = buildRelayPathLockKey(localPath);
 
@@ -21,6 +28,7 @@ export async function tryAcquireRelayPathLock(localPath: string) {
   };
 }
 
+// 释放本地路径锁（仅在 token 匹配时删除）。
 export async function releaseRelayPathLock(params: {
   lockKey: string;
   lockToken: string | null;

@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 下载队列服务测试：验证入队前去重与状态判定逻辑。
+ * 覆盖 clone 调度/执行链路中任务存在性检查、终态清理与重复入队防护。
+ */
+
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const getJob = vi.fn();

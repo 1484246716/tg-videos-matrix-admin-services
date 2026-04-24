@@ -1,10 +1,17 @@
+/**
+ * 频道级分布式锁工具：供 scheduler/worker/service 共享使用。
+ * 用于限制同一频道并发执行，避免重复调度与竞争写入。
+ */
+
 import { CHANNEL_LOCK_ENABLED, CHANNEL_LOCK_TTL_MS } from '../config/env';
 import { connection } from '../infra/redis';
 
+// 构造频道锁 key。
 function buildLockKey(scope: 'dispatch' | 'catalog', channelId: bigint) {
   return `lock:${scope}:channel:${channelId.toString()}`;
 }
 
+// 尝试获取频道锁。
 export async function tryAcquireChannelLock(params: {
   scope: 'dispatch' | 'catalog';
   channelId: bigint;
@@ -30,6 +37,7 @@ export async function tryAcquireChannelLock(params: {
   };
 }
 
+// 释放频道锁（仅在 token 匹配时删除）。
 export async function releaseChannelLock(params: {
   lockKey: string;
   lockToken: string | null;

@@ -1,3 +1,8 @@
+/**
+ * Relay Upload Worker：消费中转上传队列并执行上传流程。
+ * 在 bootstrap 注册后由 BullMQ 驱动，负责接收 job 并调用 relay-upload 相关逻辑。
+ */
+
 import { Worker } from 'bullmq';
 import { createReadStream } from 'node:fs';
 import { readFile, unlink } from 'node:fs/promises';
@@ -32,6 +37,7 @@ import { TYPEA_INGEST_ERROR_CODE, TYPEA_INGEST_FINAL_REASON } from '../shared/me
 const PROGRESS_TTL_SECONDS = 24 * 60 * 60;
 const PROGRESS_WRITE_INTERVAL_MS = 5000;
 
+// 读取 grouped 目录下的 message.txt 文本。
 async function readGroupMessageTxt(localPath: string) {
   try {
     const messageTxtPath = join(dirname(localPath), 'message.txt');
@@ -43,6 +49,7 @@ async function readGroupMessageTxt(localPath: string) {
   }
 }
 
+// 创建上传进度里程碑日志函数。
 function createProgressMilestoneLogger(params: {
   traceId: string;
   mediaAssetId: string;
@@ -71,6 +78,7 @@ function createProgressMilestoneLogger(params: {
   };
 }
 
+// 计算入库阶段耗时（秒）。
 function calcIngestDurationSec(startedAt?: Date | null, finishedAt?: Date | null) {
   if (!startedAt || !finishedAt) return null;
   const diffMs = finishedAt.getTime() - startedAt.getTime();
@@ -78,10 +86,12 @@ function calcIngestDurationSec(startedAt?: Date | null, finishedAt?: Date | null
   return Math.floor(diffMs / 1000);
 }
 
+// 构建上传进度缓存 key。
 function buildProgressKey(mediaAssetId: string) {
   return `media:progress:${mediaAssetId}`;
 }
 
+// ?? write Progress ?????????????????????
 async function writeProgress(params: {
   mediaAssetId: string;
   streamedBytes: number;
@@ -104,6 +114,7 @@ async function writeProgress(params: {
   );
 }
 
+// ?? remove Uploaded Source File ?????????????????????
 async function removeUploadedSourceFile(filePath: string, context: {
   traceId: string;
   mediaAssetId: string;
@@ -133,6 +144,7 @@ async function removeUploadedSourceFile(filePath: string, context: {
   }
 }
 
+// ?? log Clone Relay Dispatch Link Snapshot ?????????????????????
 async function logCloneRelayDispatchLinkSnapshot(context: {
   traceId: string;
   mediaAssetId: string;
@@ -263,6 +275,7 @@ async function logCloneRelayDispatchLinkSnapshot(context: {
   }
 }
 
+// ?? reconcile Grouped Dispatch After Relay Upload ?????????????????????
 async function reconcileGroupedDispatchAfterRelayUpload(context: {
   traceId: string;
   mediaAssetId: string;
@@ -512,6 +525,7 @@ async function reconcileGroupedDispatchAfterRelayUpload(context: {
   };
 }
 
+// ?? trigger Dispatch After Relay Upload ?????????????????????
 async function triggerDispatchAfterRelayUpload(context: {
   traceId: string;
   mediaAssetId: string;
@@ -634,6 +648,7 @@ export const relayUploadWorker = new Worker(
     const mediaAssetId = BigInt(mediaAssetIdRaw);
     const traceId = `relay-upload-${mediaAssetIdRaw}-${Date.now()}`;
 
+    // ?? build Lease Until ?????????????????????
     const buildLeaseUntil = () =>
       new Date(Date.now() + TYPEA_INGEST_LEASE_MS).toISOString();
 
@@ -670,6 +685,7 @@ export const relayUploadWorker = new Worker(
       });
     }
 
+    // ?? heartbeat ?????????????????????
     const heartbeat = async (extra?: Record<string, unknown>) => {
       await prisma.mediaAsset.update({
         where: { id: mediaAssetId },
@@ -1537,6 +1553,7 @@ relayUploadWorker.on('error', (err) => {
   logError('[q_relay_upload] Worker 异常', err);
 });
 
+// ?? try Recover After Hang Up ?????????????????????
 async function tryRecoverAfterHangUp(args: {
   botToken: string;
   relayChannelId: string;

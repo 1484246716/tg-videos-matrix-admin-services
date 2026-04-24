@@ -1,12 +1,19 @@
+/**
+ * 任务定义锁工具：供 scheduler/worker/service 共享使用。
+ * 通过 Redis 分布式锁避免同一 task definition 并发执行。
+ */
+
 import { connection } from '../infra/redis';
 import { TASK_DEFINITION_LOCK_TTL_MS } from '../config/env';
 import { getTaskDefinitionLockKey as getLockKey } from '../schedule-utils';
 import { logger } from '../logger';
 
+// 获取任务定义锁 key。
 export function getTaskDefinitionLockKey(taskDefinitionId: bigint) {
   return getLockKey(taskDefinitionId);
 }
 
+// 尝试获取任务定义锁。
 export async function tryAcquireTaskDefinitionLock(taskDefinitionId: bigint) {
   const lockKey = getTaskDefinitionLockKey(taskDefinitionId);
   const lockToken = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -43,6 +50,7 @@ export async function tryAcquireTaskDefinitionLock(taskDefinitionId: bigint) {
   return lockToken;
 }
 
+// 释放任务定义锁（仅在 token 匹配时删除）。
 export async function releaseTaskDefinitionLock(taskDefinitionId: bigint, lockToken: string) {
   const lockKey = getTaskDefinitionLockKey(taskDefinitionId);
   const lua = `

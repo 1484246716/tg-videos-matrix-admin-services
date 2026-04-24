@@ -1,3 +1,8 @@
+/**
+ * Clone Channels guard-wait 服务：缓存受限任务并按公平策略恢复下载。
+ * 用于在 clone 调度/执行链路中将被风控暂停的任务按频道轮询重入队。
+ */
+
 import { cloneMediaDownloadQueue } from '../../infra/redis';
 import { prisma } from '../../infra/prisma';
 import { logger } from '../../logger';
@@ -11,10 +16,12 @@ import { prepareCloneDownloadJobForEnqueue } from './clone-download-queue.servic
 
 let processedCount = 0;
 
+// 规范化频道用户名：去除 @ 前缀并统一小写。
 function normalizeChannelUsername(raw: string | undefined) {
   return (raw ?? '').trim().replace(/^@+/, '').toLowerCase();
 }
 
+// 将任务按频道写入 guard-wait 公平队列。
 export async function enqueueCloneGuardWait(job: CloneMediaDownloadJob) {
   const channelUsername = normalizeChannelUsername(job.channelUsername);
   if (!channelUsername) return;
@@ -37,6 +44,7 @@ export async function enqueueCloneGuardWait(job: CloneMediaDownloadJob) {
   });
 }
 
+// 处理 guard-wait 任务：入公平队列并轮询取下一个可恢复任务重入下载队列。
 export async function processCloneGuardWait(job: CloneMediaDownloadJob) {
   await enqueueCloneGuardWait(job);
 

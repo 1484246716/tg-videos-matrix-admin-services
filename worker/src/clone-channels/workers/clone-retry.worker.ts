@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 重试 Worker：消费重试队列并回推分组分发。
+ * 负责执行 retry 逻辑，并在下载重试后触发下一轮 L1 调度。
+ */
+
 import { Worker } from 'bullmq';
 import { cloneGroupL1DispatchQueue, cloneRetryQueue, connection } from '../../infra/redis';
 import { logger, logError } from '../../logger';

@@ -1,9 +1,15 @@
+/**
+ * GramJS 上传封装：提供 Telegram 文件发送能力。
+ * 为 relay / clone-channels 共享大文件上传与消息发送实现。
+ */
+
 import { basename } from 'node:path';
 import { stat } from 'node:fs/promises';
 import { Api } from 'telegram';
 import { getGramjsClient } from './client';
 import type { GramjsSendResult, GramjsVideoMeta } from './types';
 
+// 通过 GramJS 发送媒体文件并返回消息标识。
 export async function sendViaGramjs(args: {
   filePath: string;
   fileName?: string;

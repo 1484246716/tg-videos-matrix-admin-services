@@ -1,3 +1,8 @@
+/**
+ * ???????????????????????????????????
+ * ??????????? -> ??????? -> ??????????
+ */
+
 import '../config/env';
 import { prisma } from '../infra/prisma';
 import {
@@ -12,10 +17,12 @@ import {
 } from '../config/env';
 import { logger } from '../logger';
 
+// ?????????????????????
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// 从命令行参数读取 checkpoint。
 function getCheckpointFromArg() {
   const arg = process.argv.find((item) => item.startsWith('--from-id='));
   if (!arg) return BigInt(0);
@@ -24,6 +31,7 @@ function getCheckpointFromArg() {
   return BigInt(value);
 }
 
+// 从命令行参数读取 channelId。
 function getChannelIdFromArg() {
   const arg = process.argv.find((item) => item.startsWith('--channel-id='));
   if (!arg) return null;
@@ -32,17 +40,20 @@ function getChannelIdFromArg() {
   return BigInt(value);
 }
 
+// ??? normalize Caption Text ????????????????????????
 function normalizeCaptionText(raw?: string | null) {
   if (!raw) return '';
   return raw.replace(/^\uFEFF/, '').trim();
 }
 
+// ????? truncate Catalog Title ???????????????
 function truncateCatalogTitle(text: string, maxChars = 15) {
   const chars = Array.from(text);
   if (chars.length <= maxChars) return text;
   return `${chars.slice(0, maxChars).join('')}...`;
 }
 
+// ??? normalize Title Fallback ????????????????????????
 function normalizeTitleFallback(raw: string, fallback: string) {
   const candidate = raw
     .replace(/[#]/g, '') // 不再删除《》
@@ -54,6 +65,7 @@ function normalizeTitleFallback(raw: string, fallback: string) {
   return cleanFallback || '精彩视频';
 }
 
+// ???????? extract Catalog Short Title ??????????????????
 function extractCatalogShortTitle(raw?: string | null) {
   const caption = normalizeCaptionText(raw);
   if (!caption) return null;
@@ -84,17 +96,20 @@ function extractCatalogShortTitle(raw?: string | null) {
   return truncateCatalogTitle(firstLine, 40);
 }
 
+// ?? build Group Message Link ?????????????????????
 function buildGroupMessageLink(tgChatId: string | null, messageId: bigint | null): string | null {
   if (!tgChatId || !messageId) return null;
   const prefix = tgChatId.startsWith('-100') ? tgChatId.slice(4) : tgChatId.replace(/^-/, '');
   return `https://t.me/c/${prefix}/${messageId.toString()}`;
 }
 
+// ?? Collection Source Meta ??????????????????????
 function isCollectionSourceMeta(sourceMeta: unknown) {
   if (!sourceMeta || typeof sourceMeta !== 'object') return false;
   return (sourceMeta as Record<string, unknown>).isCollection === true;
 }
 
+// ?? delete Single Projection ???????????????????????
 async function deleteSingleProjection(channelId: bigint, messageId: number) {
   const result = await (prisma as any).catalogSourceItem.deleteMany({
     where: {
@@ -105,6 +120,7 @@ async function deleteSingleProjection(channelId: bigint, messageId: number) {
   return Number(result?.count || 0);
 }
 
+// ?? delete Group Projection ???????????????????????
 async function deleteGroupProjection(channelId: bigint, groupKey: string, firstMessageId: number | null) {
   const result = await (prisma as any).catalogSourceItem.deleteMany({
     where: {
@@ -118,6 +134,7 @@ async function deleteGroupProjection(channelId: bigint, groupKey: string, firstM
   return Number(result?.count || 0);
 }
 
+// ??????? upsert Single ?????????????????
 async function upsertSingle(row: {
   id: bigint;
   channelId: bigint;
@@ -170,6 +187,7 @@ async function upsertSingle(row: {
   return { action: 'upserted' as const, deletedCount: 0 };
 }
 
+// ??????? upsert Group ?????????????????
 async function upsertGroup(
   groupKey: string,
   seedTask: {
@@ -235,6 +253,7 @@ async function upsertGroup(
   return { action: 'upserted' as const, deletedCount: 0 };
 }
 
+// ???????????????????????????
 async function main() {
   const batchSize = TYPEC_CATALOG_SOURCE_BACKFILL_BATCH_SIZE;
   const sleepMs = TYPEC_CATALOG_SOURCE_BACKFILL_SLEEP_MS;

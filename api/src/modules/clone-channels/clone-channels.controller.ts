@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Request, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Request, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { Permissions } from '../auth/permissions.decorator';
 import { PermissionsGuard } from '../auth/permissions.guard';
@@ -23,8 +23,24 @@ export class CloneChannelsController {
 
   @Permissions('channels:view')
   @Get('tasks')
-  listTasks() {
-    return this.cloneChannelsService.listTasks();
+  listTasks(
+    @Query('keyword') keyword?: string,
+    @Query('status') status?: string,
+    @Query('crawlMode') crawlMode?: string,
+    @Query('scheduleType') scheduleType?: string,
+    @Query('createdBy') createdBy?: string,
+    @Query('updatedFrom') updatedFrom?: string,
+    @Query('updatedTo') updatedTo?: string,
+  ) {
+    return this.cloneChannelsService.listTasks({
+      keyword,
+      status,
+      crawlMode,
+      scheduleType,
+      createdBy,
+      updatedFrom,
+      updatedTo,
+    });
   }
 
   @Permissions('channels:view')
@@ -77,8 +93,16 @@ export class CloneChannelsController {
 
   @Permissions('channels:view')
   @Get('download-queue')
-  listDownloadQueue() {
-    return this.cloneChannelsService.listDownloadQueue();
+  listDownloadQueue(
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+    @Query('failedOnly') failedOnly?: string,
+  ) {
+    return this.cloneChannelsService.listDownloadQueue({
+      page,
+      pageSize,
+      failedOnly,
+    });
   }
 
   @Permissions('channels:view')
@@ -103,6 +127,12 @@ export class CloneChannelsController {
   @Post('download-queue/retry')
   retryDownloadQueue(@Body() body: { ids?: string[] }) {
     return this.cloneChannelsService.retryDownloadQueue(body.ids ?? []);
+  }
+
+  @Permissions('channels:update')
+  @Post('download-queue/delete')
+  deleteDownloadQueue(@Body() body: { ids?: string[] }) {
+    return this.cloneChannelsService.deleteDownloadQueue(body.ids ?? []);
   }
 
   @Permissions('channels:update')

@@ -1,3 +1,8 @@
+/**
+ * Dispatch Scheduler：扫描并入队到期分发任务，并维护分组派发门禁。
+ * 在 bootstrap 定时触发，负责顺序闸门判断、频道窗口控制与投递 dispatch worker。
+ */
+
 import { MediaStatus, TaskStatus } from '@prisma/client';
 import {
   COLLECTION_AUTO_BYPASS_AFTER_MINUTES,

@@ -1,3 +1,8 @@
+/**
+ * 指标计数与常量定义：供 scheduler/worker/service 共享使用。
+ * 统一沉淀运行计数器、告警阈值标签与错误原因枚举。
+ */
+
 export const taskdefMetrics = {
   tickTotal: 0,
   dueTotal: 0,

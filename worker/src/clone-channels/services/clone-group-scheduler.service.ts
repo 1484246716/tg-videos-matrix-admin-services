@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 分组调度服务：实现 L1/L2 分层队列与轮询公平分发。
+ * 用于在 clone 调度/执行链路中按 groupKey 聚合任务并控制全局/分组并发。
+ */
+
 import { cloneGroupL2DownloadQueue, connection } from '../../infra/redis';
 import { logger } from '../../logger';
 import { CloneMediaDownloadJob } from '../types/clone-queue.types';
@@ -16,33 +21,39 @@ const L1_RUNNING_KEY = 'clone:l1:running_count';
 const L2_PENDING_PREFIX = 'clone:l2:pending:';
 const GROUP_FIRST_SEEN_PREFIX = 'clone:group:first_seen:';
 
+// 规范化分组键：优先使用 groupKey，其次退化为 groupedId。
 function normalizeGroupKey(job: CloneMediaDownloadJob) {
   if (job.groupKey && job.groupKey.trim()) return job.groupKey.trim();
   if (job.groupedId && job.groupedId.trim()) return `grouped-${job.groupedId.trim()}`;
   return '';
 }
 
+// 判断任务是否属于分组下载任务。
 function isGroupedCloneJob(job: CloneMediaDownloadJob) {
   return Boolean(normalizeGroupKey(job));
 }
 
+// 构造分组待处理队列 key。
 function buildPendingKey(groupKey: string) {
   return `${L2_PENDING_PREFIX}${groupKey}`;
 }
 
 let hasLoggedLuaAtomicDisabled = false;
 
+// 在 Lua 原子路径被禁用时仅告警一次，避免日志噪音。
 function maybeWarnLuaAtomicDisabled() {
   if (CLONE_USE_LUA_ATOMIC || hasLoggedLuaAtomicDisabled) return;
   hasLoggedLuaAtomicDisabled = true;
   logger.warn('[clone][l1l2] CLONE_USE_LUA_ATOMIC is false, fallback path is not implemented; keeping Lua path');
 }
 
+// 判断是否启用 Clone L1/L2 分层调度路径。
 export function shouldUseCloneL1L2(job: CloneMediaDownloadJob) {
   if (!CLONE_GROUP_L1L2_ENABLED) return false;
   return isGroupedCloneJob(job);
 }
 
+// 将分组任务写入 L2 pending，并在首次出现时加入 L1 轮询环。
 export async function enqueueCloneGroupItem(job: CloneMediaDownloadJob) {
   maybeWarnLuaAtomicDisabled();
 
@@ -109,6 +120,7 @@ export async function enqueueCloneGroupItem(job: CloneMediaDownloadJob) {
   return true;
 }
 
+// 执行一轮 L1 分发：从轮询环选组并下发一个任务到 L2。
 export async function dispatchCloneGroupOneRound() {
   maybeWarnLuaAtomicDisabled();
 
@@ -209,10 +221,12 @@ export async function dispatchCloneGroupOneRound() {
   return true;
 }
 
+// L2 worker 完成一个任务后回收全局运行计数。
 export async function onCloneGroupL2Done() {
   await connection.decr(L1_RUNNING_KEY);
 }
 
+// 获取 L2 每组并发配置（最小为 1）。
 export function getCloneGroupL2Concurrency() {
   return Math.max(1, CLONE_GROUP_L2_PER_GROUP_CONCURRENCY);
 }

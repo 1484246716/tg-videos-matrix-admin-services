@@ -1,6 +1,12 @@
+/**
+ * Collection Snapshot Scheduler：定时触发合集快照增量刷新任务。
+ * 在 bootstrap 定时触发，负责节流判断与投递 snapshot worker。
+ */
+
 import { COLLECTION_SNAPSHOT_REFRESH_MS } from '../config/env';
 import { collectionSnapshotQueue, connection } from '../infra/redis';
 
+// 按节流窗口入队一次合集快照增量刷新任务。
 export async function scheduleCollectionSnapshotRefresh() {
   const throttleKey = 'scheduler:collection-snapshot:throttle';
   const throttleAcquired = await connection.set(

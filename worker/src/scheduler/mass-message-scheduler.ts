@@ -1,3 +1,8 @@
+/**
+ * Mass Message Scheduler：扫描并入队到期群发项。
+ * 在 bootstrap 定时触发，负责状态迁移与投递 mass-message worker。
+ */
+
 import { MAX_SCHEDULE_BATCH } from '../config/env';
 import { prisma } from '../infra/prisma';
 import { massMessageQueue } from '../infra/redis';
@@ -5,6 +10,7 @@ import { logger } from '../logger';
 
 const DUE_STATUSES = ['pending', 'scheduled', 'failed'] as const;
 
+// 扫描到期群发项并入队执行。
 export async function scheduleDueMassMessageItems() {
   const now = new Date();
 

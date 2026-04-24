@@ -1,3 +1,8 @@
+/**
+ * Worker 环境变量与运行参数集中配置。
+ * 为 bootstrap、scheduler、worker、service 提供统一且安全的默认值。
+ */
+
 import dotenv from 'dotenv';
 
 // 加载环境变量：优先读取 apps/.env（相对 worker），再读取默认 .env

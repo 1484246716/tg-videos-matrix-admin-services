@@ -1,17 +1,25 @@
+/**
+ * Clone Channels guard-wait 公平性服务：按频道维度做轮询出队。
+ * 用于在 clone 调度/执行链路中避免某个频道长期占满 guard-wait 处理机会。
+ */
+
 import { connection } from '../../infra/redis';
 
 const RR_CURSOR_KEY = 'clone:guard_wait:rr:cursor';
 const CH_QUEUE_KEY_PREFIX = 'clone:guard_wait:chq:';
 const CH_SET_KEY = 'clone:guard_wait:channels';
 
+// 规范化频道用户名：去除 @ 前缀并统一小写。
 function normalizeChannelUsername(raw: string) {
   return raw.trim().replace(/^@+/, '').toLowerCase();
 }
 
+// 构造频道维度的 guard-wait 队列 key。
 function buildChannelQueueKey(channelUsername: string) {
   return `${CH_QUEUE_KEY_PREFIX}${normalizeChannelUsername(channelUsername)}`;
 }
 
+// 按频道入队 guard-wait 任务。
 export async function enqueueGuardWaitJobByChannel(params: {
   channelUsername: string;
   payload: unknown;
@@ -24,6 +32,7 @@ export async function enqueueGuardWaitJobByChannel(params: {
   await connection.rpush(qKey, JSON.stringify(params.payload));
 }
 
+// 按轮询策略从各频道队列出队下一个 guard-wait 任务。
 export async function dequeueNextGuardWaitJobRoundRobin() {
   const channels = await connection.smembers(CH_SET_KEY);
   if (!channels.length) {
@@ -62,6 +71,7 @@ export async function dequeueNextGuardWaitJobRoundRobin() {
   return null;
 }
 
+// 获取 guard-wait 公平性快照（频道数与队列深度 Top）。
 export async function getGuardWaitFairnessSnapshot() {
   const channels = await connection.smembers(CH_SET_KEY);
   const top: Array<{ channelUsername: string; depth: number }> = [];

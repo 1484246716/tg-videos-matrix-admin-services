@@ -1,3 +1,8 @@
+/**
+ * Clone Channels guard-wait 服务测试：验证 guard 暂停后的恢复与重入队行为。
+ * 覆盖状态迁移守卫、按频道公平出队以及下载队列再投递逻辑。
+ */
+
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const add = vi.fn();

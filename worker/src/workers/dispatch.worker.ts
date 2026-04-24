@@ -1,3 +1,8 @@
+/**
+ * Dispatch Worker：消费分发队列并执行单条/分组分发任务。
+ * 在 bootstrap 注册后由 BullMQ 驱动，负责接收 job 并调用 dispatch service。
+ */
+
 import { Worker } from 'bullmq';
 import { connection } from '../infra/redis';
 import { logger, logError, toReadableErrorSummary } from '../logger';

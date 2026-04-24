@@ -1,3 +1,8 @@
+/**
+ * Relay Scheduler：扫描并入队到期的中转上传任务。
+ * 在 bootstrap 定时触发，负责状态修复、分组轮转与投递 relay-upload worker。
+ */
+
 import { MediaStatus } from '@prisma/client';
 import {
   MAX_SCHEDULE_BATCH,
@@ -12,6 +17,7 @@ import { updateTaskDefinitionRunStatus } from '../services/task-definition.servi
 import { enqueueRelayAssetsFromTaskDefinition } from '../services/relay.service';
 import { TYPEA_INGEST_FINAL_REASON } from '../shared/metrics';
 
+// 扫描到期中转任务并按分组策略入队上传。
 export async function scheduleDueRelayUploadTasks() {
   const staleIngestingBefore = new Date(Date.now() - TYPEA_INGEST_STALE_MS);
 
@@ -254,6 +260,7 @@ export async function scheduleDueRelayUploadTasks() {
     });
 }
 
+// 任务定义入口：先扫描入库，再触发到期上传调度。
 export async function scheduleRelayForDefinition(taskDefinitionId: bigint) {
   try {
     const enqueueSummary = await enqueueRelayAssetsFromTaskDefinition(taskDefinitionId);

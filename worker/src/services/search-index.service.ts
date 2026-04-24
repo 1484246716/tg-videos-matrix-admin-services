@@ -1,4 +1,9 @@
 /**
+ * ?????????????????? q_search_index ?????????????????????
+ * ?????dispatch / trigger service ?? -> search-index.worker -> ????? search document -> outbox / taxonomy ???
+ */
+
+/**
  * SearchIndexService
  * ──────────────────
  * 处理 q_search_index 队列任务：
@@ -89,6 +94,7 @@ async function buildFromCollection(collectionId: bigint): Promise<SearchDocOutpu
   return SearchDocumentBuilder.fromCollection(c as CollectionInput);
 }
 
+// ?? build From Episode ?????????????????????
 async function buildFromEpisode(episodeId: bigint): Promise<SearchDocOutput | null> {
   const ep = await prisma.collectionEpisode.findUnique({
     where: { id: episodeId },
@@ -112,6 +118,7 @@ async function buildFromEpisode(episodeId: bigint): Promise<SearchDocOutput | nu
   return SearchDocumentBuilder.fromEpisode(ep as unknown as EpisodeInput);
 }
 
+// ?? build From Media Asset ?????????????????????
 async function buildFromMediaAsset(mediaAssetId: bigint): Promise<SearchDocOutput | null> {
   const asset = await prisma.mediaAsset.findUnique({
     where: { id: mediaAssetId },
@@ -296,6 +303,7 @@ async function syncSearchDocumentTaxonomy(searchDocument: {
   }
 }
 
+// ?? handle Delete ???????????????????????
 async function handleDelete(sourceType: string, sourceId: string): Promise<void> {
   let docId: string;
 

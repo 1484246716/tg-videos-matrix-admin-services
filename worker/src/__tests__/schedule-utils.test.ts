@@ -1,4 +1,9 @@
 /**
+ * 调度工具单测：基于 Vitest 验证调度核心函数行为。
+ * 覆盖枚举校验、到期判断、锁键生成与 nextRunAt 推进逻辑。
+ */
+
+/**
  * §13.1 Unit Tests for the A+B unified scheduling plan.
  *
  * Covers:

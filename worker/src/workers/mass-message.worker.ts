@@ -1,3 +1,8 @@
+/**
+ * Mass Message Worker：消费群发队列并处理单条群发项。
+ * 在 bootstrap 注册后由 BullMQ 驱动，负责接收 job 并调用 mass-message service。
+ */
+
 import { Worker } from 'bullmq';
 import { connection } from '../infra/redis';
 import { logger, logError } from '../logger';

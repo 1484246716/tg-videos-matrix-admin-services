@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 队列与运行时参数常量定义。
+ * 统一提供 clone 相关 scheduler/worker/service 所依赖的配置项与默认值。
+ */
+
 export const CLONE_QUEUE_NAMES = {
   crawlSchedule: 'q_clone_crawl_schedule',
   channelIndex: 'q_clone_channel_index',

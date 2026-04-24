@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 通道公平性服务：控制同频道下载并发，避免热点频道长期占用。
+ * 用于在 clone 调度/执行链路中做频道级互斥与陈旧锁自动接管。
+ */
+
 import { connection } from '../../infra/redis';
 
 const CHANNEL_SLOT_TTL_MS = (() => {
@@ -12,14 +17,17 @@ const CHANNEL_SLOT_STALE_MS = (() => {
   return Math.min(60 * 60_000, Math.floor(n));
 })();
 
+// 规范化频道用户名：去除 @ 前缀并统一小写。
 function normalizeChannelUsername(raw: string) {
   return raw.trim().replace(/^@+/, '').toLowerCase();
 }
 
+// 构造频道级下载槽位锁 key。
 function buildChannelSlotKey(channelUsername: string) {
   return `lock:clone:download:channel:${normalizeChannelUsername(channelUsername)}`;
 }
 
+// 尝试获取频道槽位：支持对陈旧锁进行替换接管。
 export async function tryAcquireCloneChannelSlot(channelUsername: string) {
   const key = buildChannelSlotKey(channelUsername);
   const token = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -69,6 +77,7 @@ export async function tryAcquireCloneChannelSlot(channelUsername: string) {
   };
 }
 
+// 释放频道槽位：仅在 token 匹配时删除，避免误删他人锁。
 export async function releaseCloneChannelSlot(params: {
   key: string;
   token: string;

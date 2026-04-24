@@ -1,8 +1,14 @@
+/**
+ * Clone Channels 频道索引 Worker：消费索引队列并调用索引服务。
+ * 负责在 bootstrap 后执行 clone channel index job 的校验、处理与失败上报。
+ */
+
 import { Worker } from 'bullmq';
 import { cloneChannelIndexQueue, connection } from '../../infra/redis';
 import { logger, logError } from '../../logger';
 import { processCloneChannelIndex } from '../services/clone-index.service';
 
+// 校验索引任务是否具备必需字段。
 function hasRequiredIndexPayload(data: any) {
   const hasTaskId = typeof data?.taskId === 'string' || typeof data?.taskId === 'number' || typeof data?.taskId === 'bigint';
   const hasRunId = typeof data?.runId === 'string' || typeof data?.runId === 'number' || typeof data?.runId === 'bigint';

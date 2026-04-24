@@ -1,3 +1,8 @@
+/**
+ * 文件处理通用工具：供 scheduler/worker/service 共享使用。
+ * 提供稳定性检测、视频探测、封面生成、路径安全与文件操作能力。
+ */
+
 import { createReadStream } from 'node:fs';
 import { mkdir, readdir, rename, stat, unlink, open } from 'node:fs/promises';
 import { basename, dirname, extname, join, normalize, resolve } from 'node:path';
@@ -37,6 +42,7 @@ const SUPPORTED_TEXT_EXT = new Set(['.txt']);
 
 
 const execFileAsync = promisify(execFile);
+// 简单异步等待函数。
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export type VideoProbeMeta = {
@@ -46,6 +52,7 @@ export type VideoProbeMeta = {
   supportsStreaming: boolean;
 };
 
+// 将文件移动到归档目录并返回新路径。
 export async function moveToArchive(localPath: string): Promise<string> {
   if (localPath.includes(`${join('archived')}`)) {
     return localPath;
@@ -64,6 +71,7 @@ export async function moveToArchive(localPath: string): Promise<string> {
   return archivePath;
 }
 
+// 使用 ffprobe 执行完整性探测并校验关键视频条件。
 async function probeVideoByFfprobe(filePath: string) {
   const probeStart = Date.now();
   logger.info('[relay] ffprobe 开始探测', {
@@ -117,6 +125,7 @@ async function probeVideoByFfprobe(filePath: string) {
   });
 }
 
+// 获取视频探测元数据（时长、分辨率、可流式播放能力）。
 export async function getVideoProbeMeta(filePath: string): Promise<VideoProbeMeta> {
   const { stdout } = await execFileAsync(
     'ffprobe',
@@ -167,6 +176,7 @@ export async function getVideoProbeMeta(filePath: string): Promise<VideoProbeMet
   };
 }
 
+// 尝试执行 MP4 faststart 以优化流式播放体验。
 export async function ensureMp4Faststart(filePath: string): Promise<string> {
   const ext = extname(filePath).toLowerCase();
   if (ext !== '.mp4') {
@@ -208,6 +218,7 @@ export async function ensureMp4Faststart(filePath: string): Promise<string> {
   }
 }
 
+// 生成视频封面缩略图供上传使用。
 export async function createVideoThumbnail(filePath: string): Promise<string> {
   const thumbnailPath = `${filePath}.tg-thumb.jpg`;
 
@@ -233,6 +244,7 @@ export async function createVideoThumbnail(filePath: string): Promise<string> {
   return thumbnailPath;
 }
 
+// 等待文件稳定：大小不再变化、静默期满足、可选 ffprobe 通过。
 export async function waitForFileStable(filePath: string) {
   const stableStart = Date.now();
   logger.info('[relay] 文件稳定性检查开始', {
@@ -357,6 +369,7 @@ export async function hashFile(filePath: string): Promise<string> {
   }
 }
 
+// 规范化中转路径（统一分隔符/大小写/尾斜杠）。
 export function normalizeRelayPath(filePath: string): string {
   let normalized = filePath.trim().replace(/\\/g, '/');
   normalized = normalized.replace(/\/+/g, '/');
@@ -372,6 +385,7 @@ export function normalizeRelayPath(filePath: string): string {
   return normalized;
 }
 
+// 生成中转路径指纹（channelId + normalizedPath）。
 export function buildRelayPathFingerprint(channelId: bigint, filePath: string): {
   pathNormalized: string;
   pathFingerprint: string;
@@ -384,6 +398,7 @@ export function buildRelayPathFingerprint(channelId: bigint, filePath: string): 
   return { pathNormalized, pathFingerprint };
 }
 
+// 扫描频道目录下可用视频文件并返回候选列表。
 export async function scanChannelVideos(folderPath: string) {
   const rawRoot = (process.env.CHANNELS_ROOT_DIR || './data/channels').trim();
 
@@ -459,6 +474,7 @@ export async function scanChannelVideos(folderPath: string) {
     let cursor = 0;
     const workerCount = Math.min(TYPEA_GROUP_SCAN_CONCURRENCY, Math.max(1, limitedDirs.length));
 
+    // 扫描单个分组目录并提取可处理文件。
     const scanOneDir = async (groupDir: string) => {
       if (discoveredFiles.length >= TYPEA_GROUP_SCAN_MAX_FILES_PER_TICK) return;
       try {

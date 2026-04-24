@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 资源守卫服务：在下载前做磁盘与并发准入判断。
+ * 用于在 clone 调度/执行链路中提前拦截高风险任务并写入暂停状态。
+ */
+
 import { statfs } from 'node:fs/promises';
 import path from 'node:path';
 import { prisma } from '../../infra/prisma';
@@ -9,6 +14,7 @@ import {
 import { logger } from '../../logger';
 import { GuardDecision, GuardReason, ResourceSnapshot } from '../types/clone-queue.types';
 
+// 获取目标路径的磁盘使用率百分比。
 async function getDiskUsagePercent(targetPath?: string | null) {
   try {
     const safePath = targetPath && targetPath.trim() ? targetPath : process.cwd();
@@ -27,6 +33,7 @@ async function getDiskUsagePercent(targetPath?: string | null) {
   }
 }
 
+// 采集运行时资源快照（磁盘占用、全局与频道下载并发）。
 export async function collectRuntimeResourceSnapshot(params: {
   targetPath: string;
   channelUsername?: string;
@@ -59,6 +66,7 @@ export async function collectRuntimeResourceSnapshot(params: {
   };
 }
 
+// 执行下载守卫检查：磁盘阈值、全局并发、频道并发。
 export async function checkDownloadGuards(params: {
   taskId: bigint;
   runId: bigint;
@@ -95,7 +103,7 @@ export async function checkDownloadGuards(params: {
     return {
       pass: false,
       reason: 'global_concurrency_exceeded',
-      retryDelayMs: 10_000,
+      retryDelayMs: 30_000,
     };
   }
 
@@ -103,7 +111,7 @@ export async function checkDownloadGuards(params: {
     return {
       pass: false,
       reason: 'per_channel_concurrency_exceeded',
-      retryDelayMs: 10_000,
+      retryDelayMs: 30_000,
     };
   }
 
@@ -113,6 +121,7 @@ export async function checkDownloadGuards(params: {
   };
 }
 
+// 记录守卫触发结果：将条目标记为 paused_by_guard 并写告警日志。
 export async function recordGuardTriggered(params: {
   itemId: bigint;
   reason: GuardReason;

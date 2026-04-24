@@ -1,3 +1,8 @@
+/**
+ * Clone Channels 下载自愈服务：识别卡住下载并自动修复/重入队。
+ * 用于在 clone 调度/执行链路中处理租约过期、任务丢失和恢复次数耗尽。
+ */
+
 import { stat } from 'node:fs/promises';
 import { cloneMediaDownloadQueue } from '../../infra/redis';
 import { prisma } from '../../infra/prisma';
@@ -13,6 +18,7 @@ import {
   prepareCloneDownloadJobForEnqueue,
 } from './clone-download-queue.service';
 
+// 判断本地下载文件是否可用（存在且大小大于 0）。
 async function isDownloadedFileReady(localPath: string | null | undefined) {
   if (!localPath) return false;
   try {
@@ -23,6 +29,7 @@ async function isDownloadedFileReady(localPath: string | null | undefined) {
   }
 }
 
+// 组装重入队 payload，保留下载任务恢复所需上下文。
 function buildRequeuePayload(item: any) {
   return {
     taskId: item.taskId.toString(),
@@ -38,6 +45,7 @@ function buildRequeuePayload(item: any) {
   };
 }
 
+// 扫描并修复卡住下载：补状态、判在途、重入队或落终态。
 export async function reconcileCloneDownloadStuck() {
   const now = new Date();
   const staleBefore = new Date(Date.now() - CLONE_DOWNLOAD_STUCK_MS);

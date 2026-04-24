@@ -1,4 +1,9 @@
 /**
+ * 搜索文本归一化与构建工具。
+ * 为 search-document-builder 提供标题清洗与 search_text 生成能力。
+ */
+
+/**
  * 搜索文本归一化工具
  * ─────────────────
  * 将原始文件名/标题清理为可用于全文检索的纯净文本，
@@ -47,6 +52,7 @@ export interface SearchDocInput {
   description?: string | null;
 }
 
+// ?? build Search Text ?????????????????????
 export function buildSearchText(doc: SearchDocInput): string {
   const parts: string[] = [];
 

@@ -1,3 +1,8 @@
+/**
+ * GramJS 客户端管理：统一维护 Telegram Bot/User 客户端实例。
+ * 为 relay / clone-channels 提供可复用的授权会话与连接能力。
+ */
+
 import crypto from 'crypto';
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
@@ -15,6 +20,7 @@ let cachedBotClient: TelegramClient | null = null;
 let cachedUserClient: TelegramClient | null = null;
 let cachedUserClientPhone: string | null = null;
 
+// 解密数据库中保存的加密 session 字符串。
 function decryptSession(encrypted: string) {
   const keyRaw = process.env.CLONE_ACCOUNT_ENCRYPT_KEY || 'dev-only-insecure-key-change-me';
   const key = crypto.createHash('sha256').update(keyRaw).digest();
@@ -35,6 +41,7 @@ function decryptSession(encrypted: string) {
   return plain.toString('utf8');
 }
 
+// 从数据库读取并解密可用 user session 列表。
 async function resolveUserSessionsFromDb() {
   const accounts = await prisma.cloneCrawlAccount.findMany({
     where: { status: 'active', accountType: 'user' },
@@ -66,6 +73,7 @@ async function resolveUserSessionsFromDb() {
   return result;
 }
 
+// 获取并缓存 GramJS Bot 客户端。
 export async function getGramjsBotClient() {
   if (cachedBotClient) return cachedBotClient;
 
@@ -86,6 +94,7 @@ export async function getGramjsBotClient() {
   return client;
 }
 
+// 获取并缓存 GramJS User 客户端（优先 DB，会话不足时回退 ENV）。
 export async function getGramjsUserClient() {
   if (cachedUserClient) {
     try {
