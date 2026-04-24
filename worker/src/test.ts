@@ -1,6 +1,6 @@
 /**
- * ????????????????? worker ???????????????????????
- * ??????????? -> main() -> ??????????? sourceMeta ???
+ * 开发环境故障注入测试脚本
+ * 使用方法: ts-node src/test.ts -> main() -> 执行注入逻辑
  */
 
 import { PrismaClient, MediaStatus } from '@prisma/client';
@@ -9,17 +9,17 @@ import { relayUploadQueue } from './infra/redis';
 
 const prisma = new PrismaClient();
 
-// ?? Prod Like Env ??????????????????????
+// 判断是否为类生产环境
 function isProdLikeEnv() {
   return process.env.NODE_ENV === 'production';
 }
 
-// ?? bigint Json Replacer ?????????????????????
+// BigInt JSON 序列化替换器
 function bigintJsonReplacer(_key: string, value: unknown) {
   return typeof value === 'bigint' ? value.toString() : value;
 }
 
-// ?? cmd Find By Name ?????????????????????
+// 命令: 按名称查找资产
 async function cmdFindByName(keyword: string) {
   const asset = await prisma.mediaAsset.findFirst({
     where: {
@@ -37,7 +37,7 @@ async function cmdFindByName(keyword: string) {
   console.log(JSON.stringify(asset, bigintJsonReplacer, 2));
 }
 
-// ?? cmd Inject Missing File ?????????????????????
+// 命令: 注入“源文件缺失”故障
 async function cmdInjectMissingFile(mediaAssetIdRaw: string) {
   const mediaAssetId = BigInt(mediaAssetIdRaw);
   const asset = await prisma.mediaAsset.findUnique({
@@ -73,7 +73,7 @@ async function cmdInjectMissingFile(mediaAssetIdRaw: string) {
   console.log(`[inject:missing-file] 已标记为 ingesting，等待 worker/reconcile 自愈处理: ${mediaAssetIdRaw}`);
 }
 
-// ?? cmd Inject Stale Ingesting ?????????????????????
+// 命令: 注入“ingesting 超时”故障
 async function cmdInjectStaleIngesting(mediaAssetIdRaw: string, staleMinutesRaw?: string) {
   const mediaAssetId = BigInt(mediaAssetIdRaw);
   const staleMinutes = Number(staleMinutesRaw || '120');
@@ -109,7 +109,7 @@ async function cmdInjectStaleIngesting(mediaAssetIdRaw: string, staleMinutesRaw?
   console.log(`[inject:stale] 已注入 ingesting 超时场景: mediaAssetId=${mediaAssetIdRaw}, staleMinutes=${staleMinutes}`);
 }
 
-// ?? cmd Inject Queue Backlog ?????????????????????
+// 命令: 注入“队列堆积”故障
 async function cmdInjectQueueBacklog(channelIdRaw: string, countRaw?: string) {
   const channelId = BigInt(channelIdRaw);
   const count = Math.max(1, Number(countRaw || '30'));
@@ -160,7 +160,7 @@ async function cmdInjectQueueBacklog(channelIdRaw: string, countRaw?: string) {
   console.log(`[inject:queue-backlog] 已注入队列堆积任务: channelId=${channelIdRaw}, count=${enqueued}`);
 }
 
-// ??????????????????????????????
+// 打印帮助信息
 function printHelp() {
   console.log(`
 用法（开发环境故障注入）:
@@ -179,7 +179,7 @@ function printHelp() {
 `);
 }
 
-// ???????????????????????????
+// 主函数
 async function main() {
   const [, , command, subCommand, ...rest] = process.argv;
 

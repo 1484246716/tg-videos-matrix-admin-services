@@ -1,6 +1,6 @@
 /**
- * ?????TypeB ???????????????????AI ???????????????????
- * ?????dispatch.service -> assignContentTagsForTypeB -> media_asset_tags / media_asset_tagging_runs / ?????????
+ * 内容标签服务: 负责为 TypeB 资源分配 AI 内容标签。
+ * 调用链路: dispatch.service -> assignContentTagsForTypeB -> 更新数据库相关表。
  */
 
 import { AiModelProfile, ContentTag } from '@prisma/client';
@@ -43,7 +43,7 @@ export type AssignContentTagsForTypeBResult = {
   reason: string | null;
 };
 
-// ?????????????????????AI ???????????????
+// 为 TypeB 资源异步分配 AI 内容标签
 export async function assignContentTagsForTypeB(args: {
   mediaAssetId: bigint;
   channelId: bigint;
@@ -224,7 +224,7 @@ export async function assignContentTagsForTypeB(args: {
   }
 }
 
-// ?? load Active Adult Tags ???????????????????
+// 加载当前活跃的成人内容标签
 async function loadActiveAdultTags(): Promise<AdultContentTagRecord[]> {
   return prisma.contentTag.findMany({
     where: {
@@ -235,7 +235,7 @@ async function loadActiveAdultTags(): Promise<AdultContentTagRecord[]> {
   });
 }
 
-// ?? load Channel Default Tags ???????????????????
+// 加载频道默认标签
 async function loadChannelDefaultTags(channelId: bigint) {
   const rows = await prisma.channelDefaultTag.findMany({
     where: { channelId },
@@ -253,7 +253,7 @@ async function loadChannelDefaultTags(channelId: bigint) {
     }));
 }
 
-// ?? parse AI Selection ????????????????????????
+// 解析 AI 选择结果
 function parseAiSelection(raw: string): AiSelectionParseResult {
   const jsonText = extractJsonBlock(raw);
   const parsed = JSON.parse(jsonText) as {
@@ -271,7 +271,7 @@ function parseAiSelection(raw: string): AiSelectionParseResult {
   };
 }
 
-// ???????? extract Json Block ??????????????????
+// 从 AI 返回文本中提取 JSON 块
 function extractJsonBlock(raw: string) {
   const trimmed = raw.trim();
   const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -283,7 +283,7 @@ function extractJsonBlock(raw: string) {
   return trimmed;
 }
 
-// ?? validate AI Selected Tag IDs ?????????????????????
+// 校验 AI 选择的标签 ID 是否合法（必须在候选列表中且为活跃状态）
 function validateAiSelectedTagIds(args: {
   selectedTagIds: bigint[];
   candidateTagIds: bigint[];
@@ -297,7 +297,7 @@ function validateAiSelectedTagIds(args: {
     .slice(0, MAX_SELECTED_TAGS);
 }
 
-// ??? normalize Big Int Array ????????????????????????
+// 归一化 BigInt 数组
 function normalizeBigIntArray(value: unknown) {
   if (!Array.isArray(value)) return [];
   return dedupeBigInt(
@@ -312,7 +312,7 @@ function normalizeBigIntArray(value: unknown) {
   );
 }
 
-// ??? normalize Confidence ????????????????????????
+// 归一化置信度分数
 function normalizeConfidence(value: unknown) {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return clampConfidence(value);
@@ -328,14 +328,14 @@ function normalizeConfidence(value: unknown) {
   return null;
 }
 
-// ?? clamp Confidence ?????????????????????
+// 限制置信度在 0-1 之间
 function clampConfidence(value: number) {
   if (value < 0) return 0;
   if (value > 1) return 1;
   return Number(value.toFixed(4));
 }
 
-// ? enqueue Search Rebuild ????????????????????????
+// 将搜索索引重建任务加入队列
 async function enqueueSearchRebuild(mediaAssetId: bigint) {
   await searchIndexQueue.add(
     'upsert',
@@ -349,7 +349,7 @@ async function enqueueSearchRebuild(mediaAssetId: bigint) {
   );
 }
 
-// ?? write Tagging Run Log ?????????????????????
+// 记录标签运行日志
 async function writeTaggingRunLog(args: {
   mediaAssetId: bigint;
   channelId: bigint;
@@ -388,18 +388,18 @@ async function writeTaggingRunLog(args: {
   }
 }
 
-// ??? normalize Trigger Source ????????????????????????
+// 归一化触发源名称
 function normalizeTriggerSource(value: string | null | undefined) {
   const normalized = String(value || '').trim();
   return normalized || 'dispatch_typeb';
 }
 
-// ? dedupe Big Int ???????????????????
+// BigInt 数组去重
 function dedupeBigInt(values: bigint[]) {
   return Array.from(new Set(values.map((value) => value.toString()))).map((value) => BigInt(value));
 }
 
-// ????? truncate Text ???????????????
+// 截断超长文本
 function truncateText(value: string | null, maxLength: number) {
   if (!value) return null;
   return value.length <= maxLength ? value : `${value.slice(0, maxLength)}...`;

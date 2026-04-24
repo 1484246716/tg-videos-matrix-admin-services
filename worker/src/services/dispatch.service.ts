@@ -1,6 +1,6 @@
 /**
- * ?????TypeB ?????????????????????????????????????
- * ?????dispatch.worker -> handleDispatchJob / handleDispatchGroupJob -> Telegram ????????????????????
+ * TypeB 资源分发逻辑: 消费分发任务并推送到 Telegram。
+ * 调用链路: dispatch.worker -> handleDispatchJob / handleDispatchGroupJob -> 调用 Telegram API。
  */
 
 import { rm } from 'node:fs/promises';
@@ -21,7 +21,7 @@ import { sendPhotoByTelegram, sendTelegramRequest, sendVideoByTelegram, Telegram
 import { classifyAndAssignForTypeB } from './typeb-category.service';
 import { assignContentTagsForTypeB } from './typeb-content-tag.service';
 
-// ?? Parse Entities Error ??????????????????????
+// 检查是否为解析实体（Entities）错误
 function isParseEntitiesError(error: { code?: string; message?: string } | null | undefined) {
   const message = (error?.message ?? '').toLowerCase();
   const code = error?.code ?? '';
@@ -36,7 +36,7 @@ function isParseEntitiesError(error: { code?: string; message?: string } | null 
   );
 }
 
-// ?? Deterministic Dispatch Error ??????????????????????
+// 检查是否为确定性分发错误（重试无效）
 function isDeterministicDispatchError(error: { code?: string; message?: string } | null | undefined) {
   const message = (error?.message ?? '').toLowerCase();
 
@@ -48,19 +48,19 @@ function isDeterministicDispatchError(error: { code?: string; message?: string }
   );
 }
 
-// ?? Photo As Video Error ??????????????????????
+// 检查是否为“照片当作视频”错误
 function isPhotoAsVideoError(error: { code?: string; message?: string } | null | undefined) {
   const message = (error?.message ?? '').toLowerCase();
   return error?.code === 'TG_400' && message.includes("can't use file of type photo as video");
 }
 
-// ?? Video As Photo Error ??????????????????????
+// 检查是否为“视频当作照片”错误
 function isVideoAsPhotoError(error: { code?: string; message?: string } | null | undefined) {
   const message = (error?.message ?? '').toLowerCase();
   return error?.code === 'TG_400' && message.includes("can't use file of type video as photo");
 }
 
-// ????? resolve Dispatch Method ????????????????????
+// 解析分发方法（sendPhoto/sendVideo）
 function resolveDispatchMethod(meta: Record<string, unknown> | null | undefined, originalName: string) {
   const mediaTypeRaw = typeof meta?.relayResolvedMediaType === 'string' ? meta.relayResolvedMediaType.toLowerCase() : '';
   if (mediaTypeRaw === 'photo') return 'sendPhoto' as const;
@@ -75,14 +75,14 @@ function resolveDispatchMethod(meta: Record<string, unknown> | null | undefined,
   return 'sendVideo' as const;
 }
 
-// ?? get File Stem ?????????????????????
+// 获取文件主文件名（去掉扩展名）
 function getFileStem(fileName: string) {
   const trimmed = fileName.trim();
   const stem = trimmed.replace(/\.[^./\\]+$/, '').trim();
   return stem || trimmed;
 }
 
-// ?? AI Failure Text ??????????????????????
+// 检查是否为 AI 生成失败的占位文本
 function isAiFailureText(text?: string | null) {
   if (!text) return false;
   const normalized = text.trim();
@@ -91,12 +91,12 @@ function isAiFailureText(text?: string | null) {
   return /无法识别|抱歉|如果可以提供更多|视频的内容简介|主要角色|生成相关文案/.test(normalized);
 }
 
-// ????? resolve Dispatch AI Profile ????????????????????
+// 解析分发使用的 AI 模型配置
 async function resolveDispatchAiProfile(aiModelProfileId: bigint | null | undefined): Promise<AiModelProfile | null> {
   const profile = aiModelProfileId
     ? await prisma.aiModelProfile.findUnique({
-        where: { id: aiModelProfileId },
-      })
+      where: { id: aiModelProfileId },
+    })
     : null;
 
   if (profile?.isActive) {
@@ -127,18 +127,18 @@ async function resolveDispatchAiProfile(aiModelProfileId: bigint | null | undefi
   };
 }
 
-// ?? get Collection Display Name ?????????????????????
+// 获取合集展示名称
 function getCollectionDisplayName(name: string) {
   const normalized = name.replace(/合集/g, '').trim();
   return normalized || name.trim();
 }
 
-// ?? build Collection Episode Title ?????????????????????
+// 构建合集集标题
 function buildCollectionEpisodeTitle(collectionName: string, episodeNo: number) {
   return `${getCollectionDisplayName(collectionName)}第${episodeNo}集`;
 }
 
-// ?? apply Collection Episode Title ?????????????????????
+// 将集标题应用到文案中
 function applyCollectionEpisodeTitle(caption: string, title: string) {
   const desiredLine = `📺片名：${title}`;
   const trimmedCaption = caption.trim();
@@ -151,7 +151,7 @@ function applyCollectionEpisodeTitle(caption: string, title: string) {
   return `${desiredLine}\n${trimmedCaption}`;
 }
 
-// ??? normalize Title Fallback ????????????????????????
+// 归一化标题（带兜底）
 function normalizeTitleFallback(raw: string, fallback: string) {
   const candidate = raw
     .replace(/[《》#]/g, '')
@@ -163,7 +163,7 @@ function normalizeTitleFallback(raw: string, fallback: string) {
   return cleanFallback || '精彩视频';
 }
 
-// ?? sanitize Type BCaption Unknown ??????????????????????
+// 清洗 TypeB 资源中的“未知”标题
 function sanitizeTypeBCaptionUnknown(caption: string, fallbackTitle: string) {
   let next = caption.trim();
   if (!next) return fallbackTitle;
@@ -189,20 +189,20 @@ function sanitizeTypeBCaptionUnknown(caption: string, fallbackTitle: string) {
   return next;
 }
 
-// ??? normalize Caption Text ????????????????????????
+// 归一化文案文本
 function normalizeCaptionText(raw?: string | null) {
   if (!raw) return '';
   return raw.replace(/^\uFEFF/, '').trim();
 }
 
-// ????? truncate Catalog Title ???????????????
+// 截断目录标题
 function truncateCatalogTitle(text: string, maxChars = 15) {
   const chars = Array.from(text);
   if (chars.length <= maxChars) return text;
   return `${chars.slice(0, maxChars).join('')}...`;
 }
 
-// ???????? extract Catalog Short Title ??????????????????
+// 提取目录短标题
 function extractCatalogShortTitle(raw?: string | null) {
   const caption = normalizeCaptionText(raw);
   if (!caption) return null;
@@ -229,7 +229,7 @@ function extractCatalogShortTitle(raw?: string | null) {
   return truncateCatalogTitle(normalized, 15);
 }
 
-// ????? resolve Caption From Source Meta ????????????????????
+// 从元数据中解析文案
 function resolveCaptionFromSourceMeta(meta: Record<string, unknown> | null | undefined) {
   if (!meta) return '';
   const direct = typeof meta.caption === 'string' ? meta.caption : '';
@@ -238,7 +238,7 @@ function resolveCaptionFromSourceMeta(meta: Record<string, unknown> | null | und
   return normalizeCaptionText(msg);
 }
 
-// ?? to Finite Number ?????????????????????
+// 转为有限数值
 function toFiniteNumber(v: unknown) {
   if (typeof v === 'number' && Number.isFinite(v)) return v;
   if (typeof v === 'string' && v.trim()) {
@@ -248,7 +248,7 @@ function toFiniteNumber(v: unknown) {
   return null;
 }
 
-// ?? read Media Dimensions ?????????????????????
+// 读取媒体尺寸信息
 function readMediaDimensions(meta: Record<string, unknown> | null | undefined) {
   const width = toFiniteNumber(meta?.width) ?? toFiniteNumber(meta?.videoWidth) ?? toFiniteNumber(meta?.imageWidth);
   const height = toFiniteNumber(meta?.height) ?? toFiniteNumber(meta?.videoHeight) ?? toFiniteNumber(meta?.imageHeight);
@@ -259,7 +259,7 @@ function readMediaDimensions(meta: Record<string, unknown> | null | undefined) {
   return { width, height, aspectRatio, area: width * height };
 }
 
-// ? classify Image Orientation ?????????????????????????
+// 判定图像方向（横屏/竖屏/正方形）
 function classifyImageOrientation(aspectRatio: number | null) {
   if (!aspectRatio) return 'square' as const;
   if (aspectRatio >= 1.2) return 'landscape' as const;
@@ -267,7 +267,7 @@ function classifyImageOrientation(aspectRatio: number | null) {
   return 'square' as const;
 }
 
-// ????? resolve Media Type By Meta ????????????????????
+// 根据元数据解析媒体类型
 function resolveMediaTypeByMeta(meta: Record<string, unknown> | null | undefined, originalNameHint?: string | null) {
   const relayResolvedMediaType =
     typeof meta?.relayResolvedMediaType === 'string' ? meta.relayResolvedMediaType.toLowerCase() : '';
@@ -290,12 +290,12 @@ function resolveMediaTypeByMeta(meta: Record<string, unknown> | null | undefined
   return null;
 }
 
-// ?? Dispatch Scoped Temp Dir Name ??????????????????????
+// 检查是否为分发作用域的临时目录名
 function isDispatchScopedTempDirName(dirName: string) {
   return /^(single|grouped)-[a-z0-9][a-z0-9_-]*$/i.test(dirName);
 }
 
-// ????? resolve Dispatch Scoped Dir From Meta ????????????????????
+// 从元数据中解析分发作用域目录
 function resolveDispatchScopedDirFromMeta(
   meta: Record<string, unknown> | null | undefined,
   localPathFallback?: string | null,
@@ -315,7 +315,7 @@ function resolveDispatchScopedDirFromMeta(
   return match[1].replace(/\//g, path.sep);
 }
 
-// ?? cleanup Dispatch Scoped Directories After Success ?????????????????????
+// 成功后清理分发作用域目录
 async function cleanupDispatchScopedDirectoriesAfterSuccess(
   tasks: Array<{ mediaAsset: { sourceMeta: unknown; localPath?: string | null } }>,
   allowedDirNames?: Set<string>,
@@ -372,7 +372,7 @@ async function cleanupDispatchScopedDirectoriesAfterSuccess(
   }
 }
 
-// ?? build Group Caption From Tasks ?????????????????????
+// 从多个任务中构建组合文案
 function buildGroupCaptionFromTasks(tasks: Array<{ mediaAsset: { sourceMeta: unknown } }>) {
   let firstTxt = '';
   for (const t of tasks) {
@@ -419,12 +419,12 @@ function buildGroupCaptionFromTasks(tasks: Array<{ mediaAsset: { sourceMeta: unk
   return { caption: '', captionSource: 'none' as const };
 }
 
-// ?? get Source Meta Object ?????????????????????
+// 获取源元数据对象
 function getSourceMetaObject(sourceMeta: unknown) {
   return sourceMeta && typeof sourceMeta === 'object' ? (sourceMeta as Record<string, unknown>) : null;
 }
 
-// ?? parse Source Expected Count From Meta ????????????????????????
+// 从元数据中解析预期的源数量
 function parseSourceExpectedCountFromMeta(sourceMeta: unknown) {
   const meta = getSourceMetaObject(sourceMeta);
   const parsed = toFiniteNumber(meta?.sourceExpectedCount);
@@ -432,7 +432,7 @@ function parseSourceExpectedCountFromMeta(sourceMeta: unknown) {
   return Math.floor(parsed);
 }
 
-// ?? parse Source Message ID From Meta ????????????????????????
+// 从元数据中解析源消息 ID
 function parseSourceMessageIdFromMeta(sourceMeta: unknown) {
   const meta = getSourceMetaObject(sourceMeta);
   const raw = meta?.sourceMessageId;
@@ -442,7 +442,7 @@ function parseSourceMessageIdFromMeta(sourceMeta: unknown) {
   return null;
 }
 
-// ? dedupe Group Tasks By Source ID ???????????????????
+// 根据源 ID 对组任务去重
 function dedupeGroupTasksBySourceId<T extends {
   id: bigint;
   mediaAsset: {
@@ -453,14 +453,14 @@ function dedupeGroupTasksBySourceId<T extends {
     sourceMeta: unknown;
   };
 }>(tasks: T[]) {
-  // ?? key Of ?????????????????????
+  // 获取任务去重键
   const keyOf = (task: T) => {
     const sourceMessageId = parseSourceMessageIdFromMeta(task.mediaAsset.sourceMeta);
     // 方案4：业务兜底去重键优先使用 sourceMessageId（即 source_id）；缺失时退化到 mediaAssetId。
     return sourceMessageId ? `src:${sourceMessageId}` : `asset:${task.mediaAsset.id.toString()}`;
   };
 
-  // ?? score Of ?????????????????????
+  // 获取任务分值（用于去重优选）
   const scoreOf = (task: T) => {
     const uploadedReady =
       task.mediaAsset.status === MediaStatus.relay_uploaded &&
@@ -501,7 +501,7 @@ function dedupeGroupTasksBySourceId<T extends {
   };
 }
 
-// ?? parse Collection Source Meta ????????????????????????
+// 解析合集源元数据
 function parseCollectionSourceMeta(sourceMeta: unknown) {
   const meta = getSourceMetaObject(sourceMeta);
   if (meta?.isCollection !== true) {
@@ -523,7 +523,7 @@ function parseCollectionSourceMeta(sourceMeta: unknown) {
   };
 }
 
-// ?? delete Catalog Source Item From Single ???????????????????????
+// 从单体任务删除目录源项
 async function deleteCatalogSourceItemFromSingle(args: {
   channelId: bigint;
   telegramMessageId: number;
@@ -546,7 +546,7 @@ async function deleteCatalogSourceItemFromSingle(args: {
   return deletedCount;
 }
 
-// ?? delete Catalog Source Item From Group ???????????????????????
+// 从组任务删除目录源项
 async function deleteCatalogSourceItemFromGroup(args: {
   channelId: bigint;
   groupKey: string;
@@ -573,7 +573,7 @@ async function deleteCatalogSourceItemFromGroup(args: {
   return deletedCount;
 }
 
-// ??????? upsert Catalog Source Item From Single ?????????????????
+// 更新/插入单体目录源项
 async function upsertCatalogSourceItemFromSingle(args: {
   channelId: bigint;
   dispatchTaskId: bigint;
@@ -645,7 +645,7 @@ async function upsertCatalogSourceItemFromSingle(args: {
   }
 }
 
-// ??????? upsert Catalog Source Item From Group ?????????????????
+// 更新/插入组目录源项
 async function upsertCatalogSourceItemFromGroup(args: {
   channelId: bigint;
   seedDispatchTaskId: bigint;
@@ -720,7 +720,7 @@ async function upsertCatalogSourceItemFromGroup(args: {
   }
 }
 
-// ???? TypeB ???????????? sendMediaGroup ??????????????
+// 处理 TypeB 的 sendMediaGroup 任务
 export async function handleDispatchGroupJob(
   dispatchTaskIdRaw: string,
   jobId: string,
@@ -850,13 +850,13 @@ export async function handleDispatchGroupJob(
   const normalizedGroupTasks = groupTasks.map((t) =>
     recoverableDeadTasks.some((r) => r.id === t.id)
       ? {
-          ...t,
-          status: TaskStatus.scheduled,
-          nextRunAt: now,
-          telegramErrorCode: null,
-          telegramErrorMessage: null,
-          finishedAt: null,
-        }
+        ...t,
+        status: TaskStatus.scheduled,
+        nextRunAt: now,
+        telegramErrorCode: null,
+        telegramErrorMessage: null,
+        finishedAt: null,
+      }
       : t,
   );
 
@@ -1796,20 +1796,20 @@ export async function handleDispatchJob(
     const aiUserPrompt =
       isCollectionAsset && collectionName && episodeNo !== null
         ? [
-            '请为这个合集视频生成文案（仅针对本条视频）。',
-            `基础视频名：${task.mediaAsset.originalName}`,
-            `增强视频名：${aiSearchVideoName}`,
-            `合集名：${collectionName}`,
-            `集数：第${episodeNo}集`,
-            runtimeHint,
-            '要求：必须优先依据“增强视频名（合集名+第N集+视频名）”进行搜索与理解，再按系统提示词要求的格式输出；禁止编造。',
-          ].join('\n')
+          '请为这个合集视频生成文案（仅针对本条视频）。',
+          `基础视频名：${task.mediaAsset.originalName}`,
+          `增强视频名：${aiSearchVideoName}`,
+          `合集名：${collectionName}`,
+          `集数：第${episodeNo}集`,
+          runtimeHint,
+          '要求：必须优先依据“增强视频名（合集名+第N集+视频名）”进行搜索与理解，再按系统提示词要求的格式输出；禁止编造。',
+        ].join('\n')
         : [
-            '请为这个视频生成文案。',
-            `视频名：${aiSearchVideoName}`,
-            runtimeHint,
-            '要求：按系统提示词要求的格式输出；信息不确定时请明确标注未知，不要编造。',
-          ].join('\n');
+          '请为这个视频生成文案。',
+          `视频名：${aiSearchVideoName}`,
+          runtimeHint,
+          '要求：按系统提示词要求的格式输出；信息不确定时请明确标注未知，不要编造。',
+        ].join('\n');
 
     let finalCaption = task.caption || task.mediaAsset.aiGeneratedCaption;
     if (isAiFailureText(finalCaption)) {

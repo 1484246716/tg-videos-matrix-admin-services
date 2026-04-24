@@ -1,6 +1,6 @@
 /**
- * ?????TypeB ??????????????????????????????????????
- * ?????typeb-content-tag.service ????????????????????? AI ???
+ * 内容标签召回规则: 根据关键字和元数据初步筛选候选标签。
+ * 调用链路: typeb-content-tag.service 调用此服务生成候选列表，然后交给 AI 进一步筛选。
  */
 
 import { ContentTag } from '@prisma/client';
@@ -96,7 +96,7 @@ const TAG_ALIAS_MAP: Record<string, string[]> = {
   '道具': ['props'],
 };
 
-// ?? build Adult Content Tag Recall ?????????????????????
+// 构建成人内容标签召回列表
 export function buildAdultContentTagRecall(args: {
   activeTags: AdultContentTagRecord[];
   channelDefaultTags: Array<Pick<ContentTag, 'id' | 'name' | 'slug'>>;
@@ -216,7 +216,7 @@ export function buildAdultContentTagRecall(args: {
   };
 }
 
-// ?? build Recall Sources ?????????????????????
+// 构建召回源数据
 function buildRecallSources(args: {
   originalName: string;
   aiCaption: string | null;
@@ -224,7 +224,7 @@ function buildRecallSources(args: {
   sourceChannel: string | null;
 }): RecallSource[] {
   const result: RecallSource[] = [];
-  // ?? push If Present ?????????????????????
+  // 如果存在则推入数组
   const pushIfPresent = (source: RecallSource) => {
     const text = normalizeOptionalText(source.text);
     if (!text) return;
@@ -259,7 +259,7 @@ function buildRecallSources(args: {
   return result;
 }
 
-// ?? build Tag Keywords ?????????????????????
+// 构建标签匹配关键字
 function buildTagKeywords(tag: AdultContentTagRecord) {
   const keywords = new Set<string>();
   addKeyword(keywords, tag.name);
@@ -279,14 +279,14 @@ function buildTagKeywords(tag: AdultContentTagRecord) {
   return Array.from(keywords.values());
 }
 
-// ?? add Keyword ?????????????????????
+// 添加关键字
 function addKeyword(target: Set<string>, value: string | null | undefined) {
   const normalized = normalizeOptionalText(value);
   if (!normalized) return;
   target.add(normalized);
 }
 
-// ?? contains Keyword ?????????????????????
+// 检查是否包含关键字
 function containsKeyword(text: string, keyword: string) {
   const normalizedText = normalizeKeyword(text);
   const normalizedKeyword = normalizeKeyword(keyword);
@@ -301,7 +301,7 @@ function containsKeyword(text: string, keyword: string) {
   return normalizedText.includes(normalizedKeyword);
 }
 
-// ??? normalize Boundary Text ????????????????????????
+// 归一化边界文本
 function normalizeBoundaryText(value: string) {
   return String(value || '')
     .toLowerCase()
@@ -310,7 +310,7 @@ function normalizeBoundaryText(value: string) {
     .trim();
 }
 
-// ??? normalize Keyword ????????????????????????
+// 归一化关键字
 function normalizeKeyword(value: string) {
   return String(value || '')
     .toLowerCase()
@@ -318,18 +318,18 @@ function normalizeKeyword(value: string) {
     .trim();
 }
 
-// ??? normalize Optional Text ????????????????????????
+// 归一化可选文本
 function normalizeOptionalText(value: string | null | undefined) {
   const normalized = String(value || '').trim();
   return normalized ? normalized : null;
 }
 
-// ?? escape Reg Exp ??????????HTML ??????????
+// 正则表达式转义
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// ?? pick First Non Empty String ?????????????????????
+// 获取第一个非空字符串
 function pickFirstNonEmptyString(source: Record<string, unknown> | null, keys: string[]) {
   if (!source) return null;
   for (const key of keys) {
@@ -341,20 +341,20 @@ function pickFirstNonEmptyString(source: Record<string, unknown> | null, keys: s
   return null;
 }
 
-// ?? get Source Meta Object ?????????????????????
+// 获取元数据对象
 function getSourceMetaObject(sourceMeta: unknown) {
   return sourceMeta && typeof sourceMeta === 'object' && !Array.isArray(sourceMeta)
     ? (sourceMeta as Record<string, unknown>)
     : null;
 }
 
-// ??? normalize Candidate Limit ????????????????????????
+// 归一化候选数量限制
 function normalizeCandidateLimit(value: number | null | undefined) {
   const numeric = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : DEFAULT_CONTENT_TAG_CANDIDATE_LIMIT;
   return Math.min(MAX_CONTENT_TAG_CANDIDATE_LIMIT, Math.max(1, numeric));
 }
 
-// ? dedupe Big Int ???????????????????
+// BigInt 数组去重
 function dedupeBigInt(values: bigint[]) {
   return Array.from(new Set(values.map((value) => value.toString()))).map((value) => BigInt(value));
 }

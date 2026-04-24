@@ -91,7 +91,7 @@ function buildProgressKey(mediaAssetId: string) {
   return `media:progress:${mediaAssetId}`;
 }
 
-// ?? write Progress ?????????????????????
+// 写入进度
 async function writeProgress(params: {
   mediaAssetId: string;
   streamedBytes: number;
@@ -114,7 +114,7 @@ async function writeProgress(params: {
   );
 }
 
-// ?? remove Uploaded Source File ?????????????????????
+// 删除已上传的源文件
 async function removeUploadedSourceFile(filePath: string, context: {
   traceId: string;
   mediaAssetId: string;
@@ -144,7 +144,7 @@ async function removeUploadedSourceFile(filePath: string, context: {
   }
 }
 
-// ?? log Clone Relay Dispatch Link Snapshot ?????????????????????
+// 记录克隆中转分发链路快照
 async function logCloneRelayDispatchLinkSnapshot(context: {
   traceId: string;
   mediaAssetId: string;
@@ -275,7 +275,7 @@ async function logCloneRelayDispatchLinkSnapshot(context: {
   }
 }
 
-// ?? reconcile Grouped Dispatch After Relay Upload ?????????????????????
+// 中转上传后对半分组分发进行对账
 async function reconcileGroupedDispatchAfterRelayUpload(context: {
   traceId: string;
   mediaAssetId: string;
@@ -525,7 +525,7 @@ async function reconcileGroupedDispatchAfterRelayUpload(context: {
   };
 }
 
-// ?? trigger Dispatch After Relay Upload ?????????????????????
+// 中转上传后触发分发调度
 async function triggerDispatchAfterRelayUpload(context: {
   traceId: string;
   mediaAssetId: string;
@@ -648,7 +648,7 @@ export const relayUploadWorker = new Worker(
     const mediaAssetId = BigInt(mediaAssetIdRaw);
     const traceId = `relay-upload-${mediaAssetIdRaw}-${Date.now()}`;
 
-    // ?? build Lease Until ?????????????????????
+    // 构建租约过期时间
     const buildLeaseUntil = () =>
       new Date(Date.now() + TYPEA_INGEST_LEASE_MS).toISOString();
 
@@ -685,7 +685,7 @@ export const relayUploadWorker = new Worker(
       });
     }
 
-    // ?? heartbeat ?????????????????????
+    // 心跳汇报
     const heartbeat = async (extra?: Record<string, unknown>) => {
       await prisma.mediaAsset.update({
         where: { id: mediaAssetId },
@@ -1553,7 +1553,7 @@ relayUploadWorker.on('error', (err) => {
   logError('[q_relay_upload] Worker 异常', err);
 });
 
-// ?? try Recover After Hang Up ?????????????????????
+// 尝试在中断后恢复
 async function tryRecoverAfterHangUp(args: {
   botToken: string;
   relayChannelId: string;

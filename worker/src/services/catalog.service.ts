@@ -398,7 +398,7 @@ async function deleteTelegramMessages(args: {
   }
 }
 
-// ?? delete Collection Nav State Messages ???????????????????????
+// 删除合集导航状态消息
 async function deleteCollectionNavStateMessages(args: {
   botToken: string;
   chatId: string;
@@ -441,7 +441,7 @@ async function deleteCollectionNavStateMessages(args: {
   }
 }
 
-// ?? build Catalog Index Content ?????????????????????
+// 构建目录索引内容
 function buildCatalogIndexContent(args: {
   channelName: string;
   totalPages: number;
@@ -457,7 +457,7 @@ function buildCatalogIndexContent(args: {
   ].join('\n');
 }
 
-// ?? build Catalog Page Buttons ?????????????????????
+// 构建目录分页按钮
 function buildCatalogPageButtons(args: { chatId: string; pageMessageIds: number[] }) {
   const buttons = args.pageMessageIds
     .map((messageId, index) => {
@@ -484,7 +484,7 @@ function buildCatalogPageButtons(args: { chatId: string; pageMessageIds: number[
   return { inline_keyboard: inlineKeyboard };
 }
 
-// ?? build Catalog Content Page Reply Markup ?????????????????????
+// 构建目录内容页回复标记（分页导航）
 function buildCatalogContentPageReplyMarkup(args: {
   chatId: string;
   currentPage: number;
@@ -534,7 +534,7 @@ function buildCatalogContentPageReplyMarkup(args: {
   return inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : null;
 }
 
-// ?? build Collection Index Reply Markup ?????????????????????
+// 构建合集索引回复标记
 function buildCollectionIndexReplyMarkup(args: {
   chatId: string;
   pageItems: Array<{ text: string; url: string }>;
@@ -591,7 +591,7 @@ function buildCollectionIndexReplyMarkup(args: {
   return { inline_keyboard: inlineKeyboard };
 }
 
-// ?? build Collection Detail Reply Markup ?????????????????????
+// 构建合集详情回复标记
 function buildCollectionDetailReplyMarkup(args: {
   chatId: string;
   currentPage: number;
@@ -637,7 +637,7 @@ function buildCollectionDetailReplyMarkup(args: {
   return inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : null;
 }
 
-// ?? parse Collection Meta ????????????????????????
+// 解析合集元数据
 function parseCollectionMeta(sourceMeta: unknown) {
   if (!sourceMeta || typeof sourceMeta !== 'object') return null;
   const meta = sourceMeta as Record<string, unknown>;
@@ -674,7 +674,7 @@ type CollectionCatalogEpisode = {
   isMissingPlaceholder?: boolean;
 };
 
-// ??? format Collection Episode Title ????????????????????
+// 格式化合集集标题
 function formatCollectionEpisodeTitle(args: {
   episodeNo: number;
   episodeTitle?: string | null;
@@ -695,7 +695,7 @@ function formatCollectionEpisodeTitle(args: {
   return fallbackTitle;
 }
 
-// ?? build Collection Episode Dedup Key ?????????????????????
+// 构建合集集去重键
 function buildCollectionEpisodeDedupKey(collectionName: string, episodeNo: number) {
   return `${normalizeCollectionKey(collectionName)}#${episodeNo}`;
 }
@@ -706,7 +706,7 @@ interface CollectionCatalogReadProvider {
 }
 
 class DbCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
-  // ?? get Collections ?????????????????????
+  // 获取合集列表
   async getCollections(channelId: bigint): Promise<CollectionCatalogConfig[]> {
     return prisma.collection.findMany({
       where: { channelId },
@@ -715,7 +715,7 @@ class DbCollectionCatalogReadProvider implements CollectionCatalogReadProvider {
     });
   }
 
-  // ?? get Collection Episodes ?????????????????????
+  // 获取合集集列表
   async getCollectionEpisodes(channelId: bigint): Promise<CollectionCatalogEpisode[]> {
     const collections = await prisma.collection.findMany({
       where: { channelId },
