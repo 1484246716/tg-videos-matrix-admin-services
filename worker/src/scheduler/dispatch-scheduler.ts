@@ -53,6 +53,23 @@ type CollectionGateEvalStats = {
   blockedCount: number;
 };
 
+type DispatchGroupTaskSnapshot = {
+  id: bigint;
+  sourceExpectedCount: number | null;
+};
+
+type DispatchGroupTaskUpsertResult = {
+  id: bigint;
+  scheduleSlot: Date;
+  readyDeadlineAt: Date | null;
+  expectedMediaCount: number;
+  sourceExpectedCount: number | null;
+  actualUploadedCount: number;
+  lastArrivalAt: Date | null;
+  sealedAt: Date | null;
+  sealReason: string | null;
+};
+
 /**
  * 从文件名/文本中尽量解析 episodeNo（用于合集集号解析失败的兜底修复）。
  * 注意：这里只是“尝试性”解析，不保证覆盖所有命名风格。
@@ -488,6 +505,7 @@ export async function scheduleDueDispatchTasks() {
           retryCount: true,
           maxRetries: true,
           nextRunAt: true,
+          scheduleSlot: true,
           channel: {
             select: {
               postIntervalSec: true,
@@ -851,7 +869,7 @@ export async function scheduleDueDispatchTasks() {
                     {
                       sourceMeta: {
                         path: ['groupKey'],
-                        equals: task.groupKey,
+                        equals: String(task.groupKey),
                       },
                     },
                     {
@@ -902,7 +920,7 @@ export async function scheduleDueDispatchTasks() {
                     {
                       sourceMeta: {
                         path: ['groupKey'],
-                        equals: task.groupKey,
+                        equals: String(task.groupKey),
                       },
                     },
                     {
@@ -955,7 +973,7 @@ export async function scheduleDueDispatchTasks() {
           const groupScheduleSlot = groupedTasks
             .map((t) => t.scheduleSlot)
             .sort((a, b) => a.getTime() - b.getTime())[0] ?? task.scheduleSlot;
-          const existingGroupTaskSnapshot = await withPrismaRetry(
+          const existingGroupTaskSnapshot = await withPrismaRetry<DispatchGroupTaskSnapshot | null>(
             () =>
               (prisma as any).dispatchGroupTask.findFirst({
                 where: {
@@ -988,7 +1006,7 @@ export async function scheduleDueDispatchTasks() {
             groupedSourceExpectedCount,
           );
 
-          const groupTask = await withPrismaRetry(
+          const groupTask = await withPrismaRetry<DispatchGroupTaskUpsertResult>(
             () =>
               (prisma as any).dispatchGroupTask.upsert({
                 where: {
@@ -1139,7 +1157,7 @@ export async function scheduleDueDispatchTasks() {
             actualUploadedCount: effectiveUploadedCount,
           });
 
-          const enqueueGate = await withPrismaRetry(
+          const enqueueGate = await withPrismaRetry<{ count: number }>(
             () =>
               (prisma as any).dispatchGroupTask.updateMany({
                 where: {
@@ -1408,7 +1426,7 @@ export async function scheduleDispatchForDefinition(taskDefinitionId: bigint) {
           : null;
       const existingGroupTaskSnapshot =
         isRealGroup && groupKey
-          ? await withPrismaRetry(
+          ? await withPrismaRetry<DispatchGroupTaskSnapshot | null>(
               () =>
                 (prisma as any).dispatchGroupTask.findFirst({
                   where: {

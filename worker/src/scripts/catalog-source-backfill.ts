@@ -9,12 +9,6 @@ import {
   TYPEC_CATALOG_SOURCE_BACKFILL_BATCH_SIZE,
   TYPEC_CATALOG_SOURCE_BACKFILL_SLEEP_MS,
 } from '../config/env';
-import '../config/env';
-import { prisma } from '../infra/prisma';
-import {
-  TYPEC_CATALOG_SOURCE_BACKFILL_BATCH_SIZE,
-  TYPEC_CATALOG_SOURCE_BACKFILL_SLEEP_MS,
-} from '../config/env';
 import { logger } from '../logger';
 
 // ?????????????????????
@@ -309,6 +303,7 @@ async function main() {
 
     for (const row of singles) {
       const result = await upsertSingle(row);
+      if (!result) continue;
       if (result.action === 'upserted') {
         totalUpserted += 1;
       } else if (result.action === 'skipped_collection') {
@@ -382,7 +377,9 @@ async function main() {
     }
 
     totalProcessed += rows.length;
-    cursor = rows[rows.length - 1].id;
+    const lastRow = rows[rows.length - 1];
+    if (!lastRow) break;
+    cursor = lastRow.id;
 
     logger.info('[catalog_source_backfill] batch done', {
       batchRows: rows.length,

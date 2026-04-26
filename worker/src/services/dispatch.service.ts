@@ -17,7 +17,7 @@ import { searchIndexQueue } from '../infra/redis';
 import { logger, logError } from '../logger';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
 import { catalogSourceWriteMetrics } from '../shared/metrics';
-import { sendPhotoByTelegram, sendTelegramRequest, sendVideoByTelegram, TelegramError } from '../shared/telegram';
+import { sendPhotoByTelegram, sendTelegramRequest, sendVideoByTelegram, TelegramError, TelegramResponse, TelegramSendResult } from '../shared/telegram';
 import { classifyAndAssignForTypeB } from './typeb-category.service';
 import { assignContentTagsForTypeB } from './typeb-content-tag.service';
 
@@ -433,6 +433,24 @@ function parseSourceExpectedCountFromMeta(sourceMeta: unknown) {
   return Math.floor(parsed);
 }
 
+type DeleteManyResult = { count: number };
+
+type DispatchGroupTaskState = {
+  id: bigint;
+  status: TaskStatus;
+  expectedMediaCount: number;
+  sourceExpectedCount: number | null;
+  actualReadyCount: number;
+  actualUploadedCount: number;
+  lastArrivalAt: Date | null;
+  sealedAt: Date | null;
+  sealReason: string | null;
+};
+
+type DispatchGroupTaskSealState = {
+  sealedAt: Date | null;
+  sealReason: string | null;
+};
 // 从元数据中解析源消息 ID
 function parseSourceMessageIdFromMeta(sourceMeta: unknown) {
   const meta = getSourceMetaObject(sourceMeta);
@@ -529,7 +547,7 @@ async function deleteCatalogSourceItemFromSingle(args: {
   channelId: bigint;
   telegramMessageId: number;
 }) {
-  const deleted = await withPrismaRetry(
+  const deleted = await withPrismaRetry<DeleteManyResult>(
     () =>
       (prisma as any).catalogSourceItem.deleteMany({
         where: {
@@ -553,7 +571,7 @@ async function deleteCatalogSourceItemFromGroup(args: {
   groupKey: string;
   telegramMessageId: number | null;
 }) {
-  const deleted = await withPrismaRetry(
+  const deleted = await withPrismaRetry<DeleteManyResult>(
     () =>
       (prisma as any).catalogSourceItem.deleteMany({
         where: {
@@ -739,6 +757,7 @@ export async function handleDispatchGroupJob(
               id: true,
               tgChatId: true,
               defaultBotId: true,
+              aiReplyMarkup: true,
             },
           },
           mediaAsset: {
@@ -792,7 +811,7 @@ export async function handleDispatchGroupJob(
     { label: 'dispatch.handleDispatchGroupJob.findGroupTasks' },
   );
 
-  let groupTaskState = await withPrismaRetry(
+  let groupTaskState = await withPrismaRetry<DispatchGroupTaskState | null>(
     () =>
       (prisma as any).dispatchGroupTask.findFirst({
         where: {
@@ -825,8 +844,7 @@ export async function handleDispatchGroupJob(
 
   const recoverableDeadTasks = groupTasks.filter((t) => {
     if (t.status !== TaskStatus.dead) return false;
-    if (!t.readyDeadlineAt) return false;
-    return t.readyDeadlineAt.getTime() > now.getTime();
+    return t.nextRunAt.getTime() > now.getTime();
   });
 
   if (recoverableDeadTasks.length > 0) {
@@ -887,11 +905,12 @@ export async function handleDispatchGroupJob(
   // 仅当 dispatchGroupTask 当前值缺失(<=0)时才补写，避免覆盖已有正确值。
   // 这里使用 updateMany + 条件 where，确保并发场景下是幂等/保守补写。
   if (groupTaskState?.id && Number(groupTaskState.sourceExpectedCount ?? 0) <= 0 && computedSourceExpectedCount > 0) {
+    const dispatchGroupTaskId = groupTaskState.id;
     await withPrismaRetry(
       () =>
         (prisma as any).dispatchGroupTask.updateMany({
           where: {
-            id: groupTaskState.id,
+            id: dispatchGroupTaskId,
             OR: [{ sourceExpectedCount: null }, { sourceExpectedCount: { lte: 0 } }],
           },
           data: {
@@ -904,12 +923,12 @@ export async function handleDispatchGroupJob(
     logger.info('[typeb_group][verify] sourceExpectedCount backfilled from grouped assets', {
       dispatchTaskId: dispatchTaskIdRaw,
       groupKey: seedTask.groupKey,
-      dispatchGroupTaskId: groupTaskState.id.toString(),
+      dispatchGroupTaskId: dispatchGroupTaskId.toString(),
       computedSourceExpectedCount,
       sourceFrom: 'grouped_media_asset_source_meta',
     });
 
-    groupTaskState = await withPrismaRetry(
+    groupTaskState = await withPrismaRetry<DispatchGroupTaskState | null>(
       () =>
         (prisma as any).dispatchGroupTask.findFirst({
           where: {
@@ -975,7 +994,7 @@ export async function handleDispatchGroupJob(
       { label: 'dispatch.handleDispatchGroupJob.sealBeforeSendByQuietPeriodCas' },
     );
 
-    const sealedState = await withPrismaRetry(
+    const sealedState = await withPrismaRetry<DispatchGroupTaskSealState | null>(
       () =>
         (prisma as any).dispatchGroupTask.findUnique({
           where: { id: groupTaskState.id },
@@ -1017,14 +1036,14 @@ export async function handleDispatchGroupJob(
       retryCount: t.retryCount,
       maxRetries: t.maxRetries,
       nextRunAt: t.nextRunAt?.toISOString?.() ?? null,
-      readyDeadlineAt: t.readyDeadlineAt?.toISOString?.() ?? null,
+      readyDeadlineAt: t.nextRunAt?.toISOString?.() ?? null,
       telegramErrorCode: t.telegramErrorCode ?? null,
       telegramErrorMessage: t.telegramErrorMessage ?? null,
     })),
     excludedTasks: excludedGroupTasks.map((t) => ({
       taskId: t.id.toString(),
       status: t.status,
-      readyDeadlineAt: t.readyDeadlineAt?.toISOString?.() ?? null,
+      readyDeadlineAt: t.nextRunAt?.toISOString?.() ?? null,
       telegramErrorCode: t.telegramErrorCode ?? null,
       telegramErrorMessage: t.telegramErrorMessage ?? null,
     })),
@@ -1357,7 +1376,7 @@ export async function handleDispatchGroupJob(
   });
 
   try {
-    let sendResult;
+    let sendResult: TelegramResponse | TelegramSendResult;
     let correctedByRetry = false;
 
     if (fallbackSingleMode) {
@@ -1485,7 +1504,9 @@ export async function handleDispatchGroupJob(
       }
     }
 
-    const firstMessageId = sendResult.messageIds?.[0] ?? sendResult.messageId;
+    const firstMessageId = 'messageIds' in sendResult
+      ? (sendResult.messageIds?.[0] ?? sendResult.messageId)
+      : sendResult.messageId;
 
     const groupMessageLink = firstMessageId
       ? `https://t.me/c/${seedTask.channel.tgChatId.replace('-100', '')}/${firstMessageId}`
@@ -1551,7 +1572,7 @@ export async function handleDispatchGroupJob(
       dispatchTaskId: dispatchTaskIdRaw,
       groupKey: seedTask.groupKey,
       sentCount: media.length,
-      mediaGroupId: sendResult.mediaGroupId ?? null,
+      mediaGroupId: 'mediaGroupId' in sendResult ? (sendResult.mediaGroupId ?? null) : null,
       captionSource,
       correctedByRetry,
     });
@@ -1568,7 +1589,7 @@ export async function handleDispatchGroupJob(
       groupKey: seedTask.groupKey,
       sentCount: media.length,
       firstMessageId,
-      mediaGroupId: sendResult.mediaGroupId ?? null,
+      mediaGroupId: 'mediaGroupId' in sendResult ? (sendResult.mediaGroupId ?? null) : null,
     };
   } catch (error) {
     const now = new Date();
@@ -2006,7 +2027,7 @@ export async function handleDispatchJob(
         return sendPhotoByTelegram({
           botToken: bot.tokenEncrypted,
           chatId: task.channel.tgChatId,
-          fileId: task.mediaAsset.telegramFileId,
+          fileId: task.mediaAsset.telegramFileId!,
           caption: finalCaption,
           parseMode,
           replyMarkup: task.replyMarkup ?? task.channel.aiReplyMarkup ?? undefined,
@@ -2016,7 +2037,7 @@ export async function handleDispatchJob(
       return sendVideoByTelegram({
         botToken: bot.tokenEncrypted,
         chatId: task.channel.tgChatId,
-        fileId: task.mediaAsset.telegramFileId,
+        fileId: task.mediaAsset.telegramFileId!,
         caption: finalCaption,
         parseMode,
         replyMarkup: task.replyMarkup ?? task.channel.aiReplyMarkup ?? undefined,

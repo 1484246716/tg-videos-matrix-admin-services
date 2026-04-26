@@ -12,6 +12,7 @@ import { withClient } from './clone-session.service';
 import {
   CloneChannelIndexJob,
   CloneContentType,
+  CloneMediaDownloadJob,
   CloneRetryReason,
   IndexedMessageDTO,
 } from '../types/clone-queue.types';
@@ -771,18 +772,19 @@ async function upsertIndexedItems(params: {
     }
 
     if (params.crawlMode === 'index_and_download' && isDownloadableMedia) {
-      const groupCounter = groupMediaIndex.get(row.groupKey) ?? { image: 0, video: 0 };
+      const groupKey = row.groupKey ?? '';
+      const groupCounter = groupMediaIndex.get(groupKey) ?? { image: 0, video: 0 };
       const mediaType: 'image' | 'video' = row.hasVideo ? 'video' : 'image';
       if (mediaType === 'video') {
         groupCounter.video += 1;
       } else {
         groupCounter.image += 1;
       }
-      groupMediaIndex.set(row.groupKey, groupCounter);
+      groupMediaIndex.set(groupKey, groupCounter);
 
       const mediaIndex = mediaType === 'video' ? groupCounter.video : groupCounter.image;
 
-      const downloadJob = {
+      const downloadJob: CloneMediaDownloadJob = {
         taskId: params.taskId.toString(),
         runId: params.runId.toString(),
         itemId: item.id.toString(),
