@@ -6,6 +6,16 @@ node_modules
 dist
 coverage
 *.log
+
+# API / Worker 日志目录（含 winston-daily-rotate-file 的 *-audit.json）
+api/logs/
+worker/logs/
+**/*-audit.json
+**/.*-audit.json
+api/logs/.*-audit.json
+worker/logs/.*-audit.json
+worker/logs/clone-channels/.*-audit.json
+
 apps/api/prisma/migrations
 
 # Ignore local data directory

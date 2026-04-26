@@ -28,6 +28,9 @@ export const catalogMetrics = {
   publishEmptyRunConsecutive: 0,
   manualRepairTriggeredTotal: 0,
   manualRepairAlreadyInProgressTotal: 0,
+  hashGateTotal: 0,
+  hashGateSkipTotal: 0,
+  hashGatePublishTotal: 0,
 };
 
 export const catalogSourceWriteMetrics = {

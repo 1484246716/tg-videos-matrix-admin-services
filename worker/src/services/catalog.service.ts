@@ -6,11 +6,14 @@ import {
   TYPEC_COLLECTION_DATA_SOURCE,
   TYPEC_COLLECTION_FULL_SCAN_BATCH_SIZE,
   TYPEC_COLLECTION_INDEX_SHOW_EMPTY,
+  TYPEC_HASH_FORCE_REPUBLISH_ON_VERSION_CHANGE,
+  TYPEC_HASH_GATE_ENABLED,
+  TYPEC_HASH_SCHEMA_VERSION,
   TYPEC_READ_FROM_CATALOG_SOURCE,
   TYPEC_SELF_HEAL_ON_RUN,
 } from '../config/env';
 import { prisma } from '../infra/prisma';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { logError, logger } from '../logger';
 import { releaseChannelLock, tryAcquireChannelLock } from '../shared/channel-lock';
 import { catalogMetrics } from '../shared/metrics';
@@ -329,6 +332,176 @@ function sanitizeJsonForPrisma(value: unknown): unknown {
   }
 
   return value;
+}
+
+function normalizeTextForHash(text: string): string {
+  return text.replace(/\r\n?/g, '\n').replace(/[ \t]+$/gm, '').trimEnd();
+}
+
+function normalizeMarkupForHash(markup: unknown): unknown {
+  if (markup === null || markup === undefined) return null;
+  if (Array.isArray(markup)) return markup.map((item) => normalizeMarkupForHash(item));
+  if (typeof markup !== 'object') return markup;
+
+  const obj = markup as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(obj).sort()) {
+    const value = normalizeMarkupForHash(obj[key]);
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+function sha256(text: string): string {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+function buildPageCombinedHash(args: { text: string; replyMarkup?: unknown; schemaVersion: number }) {
+  const normalizedText = normalizeTextForHash(args.text);
+  const normalizedMarkup = normalizeMarkupForHash(args.replyMarkup ?? null);
+  const payload = JSON.stringify({
+    schemaVersion: args.schemaVersion,
+    text: normalizedText,
+    replyMarkup: normalizedMarkup,
+  });
+  const combinedHash = sha256(payload);
+  return { combinedHash, normalizedText, normalizedMarkup };
+}
+
+type CatalogHashRecord = {
+  schemaVersion: number;
+  combinedHash: string;
+  updatedAt: string;
+};
+
+type CatalogHashState = {
+  main_catalog?: Record<string, CatalogHashRecord>;
+  collection_index?: Record<string, CatalogHashRecord>;
+  collection_detail?: Record<string, Record<string, CatalogHashRecord>>;
+};
+
+function parseCatalogHashState(rawNavReplyMarkup: unknown): CatalogHashState {
+  if (!rawNavReplyMarkup || typeof rawNavReplyMarkup !== 'object' || Array.isArray(rawNavReplyMarkup)) {
+    return {};
+  }
+  const container = rawNavReplyMarkup as Record<string, unknown>;
+  const raw = container.__catalogHashState;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  return raw as CatalogHashState;
+}
+
+function mergeCatalogHashStateIntoReplyMarkup(rawNavReplyMarkup: unknown, hashState: CatalogHashState | null) {
+  const base =
+    rawNavReplyMarkup && typeof rawNavReplyMarkup === 'object' && !Array.isArray(rawNavReplyMarkup)
+      ? { ...(rawNavReplyMarkup as Record<string, unknown>) }
+      : {};
+
+  if (!hashState) {
+    delete (base as Record<string, unknown>).__catalogHashState;
+    return sanitizeJsonForPrisma(base) as Record<string, unknown>;
+  }
+
+  (base as Record<string, unknown>).__catalogHashState = hashState;
+  return sanitizeJsonForPrisma(base) as Record<string, unknown>;
+}
+
+function readHashRecord(
+  hashState: CatalogHashState,
+  scope: 'main_catalog' | 'collection_index' | 'collection_detail',
+  pageNo: number,
+  collectionName?: string,
+): CatalogHashRecord | null {
+  const key = String(pageNo);
+  if (scope === 'collection_detail') {
+    if (!collectionName) return null;
+    return hashState.collection_detail?.[collectionName]?.[key] ?? null;
+  }
+  return (hashState[scope] as Record<string, CatalogHashRecord> | undefined)?.[key] ?? null;
+}
+
+function writeHashRecord(
+  hashState: CatalogHashState,
+  args: {
+    scope: 'main_catalog' | 'collection_index' | 'collection_detail';
+    pageNo: number;
+    combinedHash: string;
+    schemaVersion: number;
+    collectionName?: string;
+  },
+) {
+  const key = String(args.pageNo);
+  const record: CatalogHashRecord = {
+    schemaVersion: args.schemaVersion,
+    combinedHash: args.combinedHash,
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (args.scope === 'collection_detail') {
+    const collectionName = args.collectionName ?? '';
+    hashState.collection_detail = hashState.collection_detail ?? {};
+    hashState.collection_detail[collectionName] = hashState.collection_detail[collectionName] ?? {};
+    hashState.collection_detail[collectionName][key] = record;
+    return;
+  }
+
+  hashState[args.scope] = hashState[args.scope] ?? {};
+  (hashState[args.scope] as Record<string, CatalogHashRecord>)[key] = record;
+}
+
+function shouldSkipByHash(args: {
+  enabled: boolean;
+  forceRepublish: boolean;
+  existingMessageId: number | null;
+  oldRecord: CatalogHashRecord | null;
+  newCombinedHash: string;
+  schemaVersion: number;
+}) {
+  if (!args.enabled) return false;
+  if (args.forceRepublish) return false;
+  if (!args.existingMessageId || args.existingMessageId <= 0) return false;
+  if (!args.oldRecord) return false;
+  if (args.oldRecord.combinedHash !== args.newCombinedHash) return false;
+  if (
+    TYPEC_HASH_FORCE_REPUBLISH_ON_VERSION_CHANGE &&
+    Number(args.oldRecord.schemaVersion) !== Number(args.schemaVersion)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function pruneHashScopeRecords(records: Record<string, CatalogHashRecord> | undefined, maxPageNoInclusive: number) {
+  if (!records) return;
+  for (const key of Object.keys(records)) {
+    const pageNo = Number(key);
+    if (!Number.isInteger(pageNo) || pageNo <= 0 || pageNo > maxPageNoInclusive) {
+      delete records[key];
+    }
+  }
+}
+
+function pruneCatalogHashState(args: {
+  hashState: CatalogHashState;
+  mainPageCount: number;
+  indexPageCount: number;
+  detailPageCountByCollection: Record<string, number>;
+}) {
+  pruneHashScopeRecords(args.hashState.main_catalog, args.mainPageCount);
+  pruneHashScopeRecords(args.hashState.collection_index, args.indexPageCount);
+
+  if (!args.hashState.collection_detail) return;
+
+  for (const [collectionName, records] of Object.entries(args.hashState.collection_detail)) {
+    const maxCount = args.detailPageCountByCollection[collectionName];
+    if (!maxCount || maxCount <= 0) {
+      delete args.hashState.collection_detail[collectionName];
+      continue;
+    }
+    pruneHashScopeRecords(records, maxCount);
+    if (Object.keys(records || {}).length === 0) {
+      delete args.hashState.collection_detail[collectionName];
+    }
+  }
 }
 
 function mergeCollectionNavStateIntoReplyMarkup(rawNavReplyMarkup: unknown, state: CollectionNavState | null) {
@@ -996,7 +1169,12 @@ class CachedCollectionCatalogReadProvider implements CollectionCatalogReadProvid
 // ??????????????????????????????
 export async function handleCatalogJob(
   channelIdRaw: string,
-  options?: { selfHealOnly?: boolean; triggerType?: 'scheduler' | 'manual_repair'; runId?: string },
+  options?: {
+    selfHealOnly?: boolean;
+    triggerType?: 'scheduler' | 'manual_repair';
+    runId?: string;
+    forceRepublish?: boolean;
+  },
 ) {
   const runStartedAt = Date.now();
   const runId = options?.runId || randomUUID();
@@ -1385,11 +1563,17 @@ export async function handleCatalogJob(
     let selfHealFixedCount = 0;
     let selfHealFallbackCount = 0;
     let selfHealOrphanCleanedCount = 0;
+    let hashGateSkipCount = 0;
+    let hashGatePublishCount = 0;
 
     const collectionSections: string[] = [];
     let collectionIndexLinkInMainCatalog: string | null = null;
     let nextCollectionNavState: CollectionNavState | null = null;
     const existingNavState = parseCollectionNavState(channel.navReplyMarkup);
+    const existingHashState = parseCatalogHashState(channel.navReplyMarkup);
+    const nextHashState: CatalogHashState = JSON.parse(JSON.stringify(existingHashState || {}));
+    const hashSchemaVersion = Math.max(1, Number(TYPEC_HASH_SCHEMA_VERSION || 1));
+    const hashForceRepublish = Boolean(options?.forceRepublish) || triggerType === 'manual_repair';
     if (collectionConfigs.length === 0) {
       await deleteCollectionNavStateMessages({
         botToken,
@@ -1497,17 +1681,51 @@ export async function handleCatalogJob(
 
           detailTexts.push(detailText);
 
-          const detailPublishResult = await publishCatalogMessage({
-            botToken,
-            chatId: channel.tgChatId,
+          const existingDetailMessageId = existingDetailPages[pageIndex] ?? null;
+          const firstPassHash = buildPageCombinedHash({
             text: detailText,
-            existingMessageId: existingDetailPages[pageIndex] ?? null,
+            replyMarkup: undefined,
+            schemaVersion: hashSchemaVersion,
+          });
+          const firstPassOldHashRecord = readHashRecord(
+            nextHashState,
+            'collection_detail',
+            pageIndex + 1,
+            `${name}__firstpass`,
+          );
+          const shouldSkipFirstPass = shouldSkipByHash({
+            enabled: TYPEC_HASH_GATE_ENABLED,
+            forceRepublish: hashForceRepublish,
+            existingMessageId: existingDetailMessageId,
+            oldRecord: firstPassOldHashRecord,
+            newCombinedHash: firstPassHash.combinedHash,
+            schemaVersion: hashSchemaVersion,
           });
 
-          if (selfHealEnabledOnRun && detailPublishResult.notModified) selfHealFixedCount += 1;
-          if (selfHealEnabledOnRun && detailPublishResult.fallbackSent) selfHealFallbackCount += 1;
+          if (shouldSkipFirstPass && existingDetailMessageId) {
+            hashGateSkipCount += 1;
+            publishedDetailPages.push(existingDetailMessageId);
+          } else {
+            hashGatePublishCount += 1;
+            const detailPublishResult = await publishCatalogMessage({
+              botToken,
+              chatId: channel.tgChatId,
+              text: detailText,
+              existingMessageId: existingDetailMessageId,
+            });
 
-          publishedDetailPages.push(detailPublishResult.messageId);
+            if (selfHealEnabledOnRun && detailPublishResult.notModified) selfHealFixedCount += 1;
+            if (selfHealEnabledOnRun && detailPublishResult.fallbackSent) selfHealFallbackCount += 1;
+
+            publishedDetailPages.push(detailPublishResult.messageId);
+            writeHashRecord(nextHashState, {
+              scope: 'collection_detail',
+              collectionName: `${name}__firstpass`,
+              pageNo: pageIndex + 1,
+              combinedHash: firstPassHash.combinedHash,
+              schemaVersion: hashSchemaVersion,
+            });
+          }
         }
 
         if (episodePages.length > 1) {
@@ -1515,17 +1733,39 @@ export async function handleCatalogJob(
             const currentMessageId = publishedDetailPages[pageIndex] ?? null;
             if (!currentMessageId) continue;
 
+            const detailReplyMarkup = buildCollectionDetailReplyMarkup({
+              chatId: channel.tgChatId,
+              currentPage: pageIndex + 1,
+              totalPages: episodePages.length,
+              detailPageMessageIds: publishedDetailPages,
+            }) ?? undefined;
+            const detailSecondPassHash = buildPageCombinedHash({
+              text: detailTexts[pageIndex],
+              replyMarkup: detailReplyMarkup,
+              schemaVersion: hashSchemaVersion,
+            });
+            const detailSecondPassOldHash = readHashRecord(nextHashState, 'collection_detail', pageIndex + 1, name);
+            const shouldSkipDetailSecondPass = shouldSkipByHash({
+              enabled: TYPEC_HASH_GATE_ENABLED,
+              forceRepublish: hashForceRepublish,
+              existingMessageId: currentMessageId,
+              oldRecord: detailSecondPassOldHash,
+              newCombinedHash: detailSecondPassHash.combinedHash,
+              schemaVersion: hashSchemaVersion,
+            });
+
+            if (shouldSkipDetailSecondPass) {
+              hashGateSkipCount += 1;
+              continue;
+            }
+
+            hashGatePublishCount += 1;
             const detailRepublishResult = await publishCatalogMessage({
               botToken,
               chatId: channel.tgChatId,
               text: detailTexts[pageIndex],
               existingMessageId: currentMessageId,
-              replyMarkup: buildCollectionDetailReplyMarkup({
-                chatId: channel.tgChatId,
-                currentPage: pageIndex + 1,
-                totalPages: episodePages.length,
-                detailPageMessageIds: publishedDetailPages,
-              }) ?? undefined,
+              replyMarkup: detailReplyMarkup,
             });
 
             if (selfHealEnabledOnRun && detailRepublishResult.notModified) selfHealFixedCount += 1;
@@ -1538,6 +1778,14 @@ export async function handleCatalogJob(
               orphanCandidateIds: detailOrphanCandidateIds,
               scope: 'collection_detail',
               channelIdRaw,
+            });
+
+            writeHashRecord(nextHashState, {
+              scope: 'collection_detail',
+              collectionName: name,
+              pageNo: pageIndex + 1,
+              combinedHash: detailSecondPassHash.combinedHash,
+              schemaVersion: hashSchemaVersion,
             });
           }
         }
@@ -1607,18 +1855,51 @@ export async function handleCatalogJob(
             inline_keyboard: indexPages[pageIndex].map((item) => [{ text: item.text, url: item.url }]),
           };
 
-          const indexPublishResult = await publishCatalogMessage({
-            botToken,
-            chatId: channel.tgChatId,
+          const existingIndexMessageId = existingIndexPages[pageIndex] ?? null;
+          const indexFirstPassHash = buildPageCombinedHash({
             text,
-            existingMessageId: existingIndexPages[pageIndex] ?? null,
             replyMarkup: firstPassReplyMarkup,
+            schemaVersion: hashSchemaVersion,
+          });
+          const indexFirstPassOldHash = readHashRecord(
+            nextHashState,
+            'collection_index',
+            pageIndex + 1,
+            '__firstpass',
+          );
+          const shouldSkipIndexFirstPass = shouldSkipByHash({
+            enabled: TYPEC_HASH_GATE_ENABLED,
+            forceRepublish: hashForceRepublish,
+            existingMessageId: existingIndexMessageId,
+            oldRecord: indexFirstPassOldHash,
+            newCombinedHash: indexFirstPassHash.combinedHash,
+            schemaVersion: hashSchemaVersion,
           });
 
-          if (selfHealEnabledOnRun && indexPublishResult.notModified) selfHealFixedCount += 1;
-          if (selfHealEnabledOnRun && indexPublishResult.fallbackSent) selfHealFallbackCount += 1;
+          if (shouldSkipIndexFirstPass && existingIndexMessageId) {
+            hashGateSkipCount += 1;
+            publishedIndexPages.push(existingIndexMessageId);
+          } else {
+            hashGatePublishCount += 1;
+            const indexPublishResult = await publishCatalogMessage({
+              botToken,
+              chatId: channel.tgChatId,
+              text,
+              existingMessageId: existingIndexMessageId,
+              replyMarkup: firstPassReplyMarkup,
+            });
 
-          publishedIndexPages.push(indexPublishResult.messageId);
+            if (selfHealEnabledOnRun && indexPublishResult.notModified) selfHealFixedCount += 1;
+            if (selfHealEnabledOnRun && indexPublishResult.fallbackSent) selfHealFallbackCount += 1;
+
+            publishedIndexPages.push(indexPublishResult.messageId);
+            writeHashRecord(nextHashState, {
+              scope: 'collection_index',
+              pageNo: pageIndex + 1,
+              combinedHash: indexFirstPassHash.combinedHash,
+              schemaVersion: hashSchemaVersion,
+            });
+          }
         }
 
         for (let pageIndex = 0; pageIndex < indexPages.length; pageIndex += 1) {
@@ -1638,7 +1919,27 @@ export async function handleCatalogJob(
             totalPages: indexPages.length,
             indexPageMessageIds: publishedIndexPages,
           });
+          const indexSecondPassHash = buildPageCombinedHash({
+            text,
+            replyMarkup,
+            schemaVersion: hashSchemaVersion,
+          });
+          const indexSecondPassOldHash = readHashRecord(nextHashState, 'collection_index', pageIndex + 1);
+          const shouldSkipIndexSecondPass = shouldSkipByHash({
+            enabled: TYPEC_HASH_GATE_ENABLED,
+            forceRepublish: hashForceRepublish,
+            existingMessageId: currentMessageId,
+            oldRecord: indexSecondPassOldHash,
+            newCombinedHash: indexSecondPassHash.combinedHash,
+            schemaVersion: hashSchemaVersion,
+          });
 
+          if (shouldSkipIndexSecondPass) {
+            hashGateSkipCount += 1;
+            continue;
+          }
+
+          hashGatePublishCount += 1;
           const indexRepublishResult = await publishCatalogMessage({
             botToken,
             chatId: channel.tgChatId,
@@ -1657,6 +1958,13 @@ export async function handleCatalogJob(
             orphanCandidateIds: indexOrphanCandidateIds,
             scope: 'collection_index',
             channelIdRaw,
+          });
+
+          writeHashRecord(nextHashState, {
+            scope: 'collection_index',
+            pageNo: pageIndex + 1,
+            combinedHash: indexSecondPassHash.combinedHash,
+            schemaVersion: hashSchemaVersion,
           });
         }
 
@@ -1790,30 +2098,81 @@ export async function handleCatalogJob(
       } else {
         for (let pageIndex = 0; pageIndex < pageContents.length; pageIndex += 1) {
           const pageText = pageIndex === 0 ? mainCatalogContent : pageContents[pageIndex];
+          const existingMainPageId = storedPageMessageIds[pageIndex] ?? null;
+          const mainFirstPassHash = buildPageCombinedHash({
+            text: pageText,
+            replyMarkup: undefined,
+            schemaVersion: hashSchemaVersion,
+          });
+          const mainFirstPassOldHash = readHashRecord(nextHashState, 'main_catalog', pageIndex + 1, '__firstpass');
+          const shouldSkipMainFirstPass = shouldSkipByHash({
+            enabled: TYPEC_HASH_GATE_ENABLED,
+            forceRepublish: hashForceRepublish,
+            existingMessageId: existingMainPageId,
+            oldRecord: mainFirstPassOldHash,
+            newCombinedHash: mainFirstPassHash.combinedHash,
+            schemaVersion: hashSchemaVersion,
+          });
+
+          if (shouldSkipMainFirstPass && existingMainPageId) {
+            hashGateSkipCount += 1;
+            publishedPageMessageIds.push(existingMainPageId);
+            continue;
+          }
+
+          hashGatePublishCount += 1;
           const publishResult = await publishCatalogMessage({
             botToken,
             chatId: channel.tgChatId,
             text: pageText,
-            existingMessageId: storedPageMessageIds[pageIndex] ?? null,
+            existingMessageId: existingMainPageId,
           });
           if (selfHealEnabledOnRun && publishResult.notModified) selfHealFixedCount += 1;
           if (selfHealEnabledOnRun && publishResult.fallbackSent) selfHealFallbackCount += 1;
           publishedPageMessageIds.push(publishResult.messageId);
+          writeHashRecord(nextHashState, {
+            scope: 'main_catalog',
+            pageNo: pageIndex + 1,
+            combinedHash: mainFirstPassHash.combinedHash,
+            schemaVersion: hashSchemaVersion,
+          });
         }
 
         for (let pageIndex = 0; pageIndex < pageContents.length; pageIndex += 1) {
           const pageText = pageIndex === 0 ? mainCatalogContent : pageContents[pageIndex];
+          const mainSecondPassReplyMarkup = buildCatalogContentPageReplyMarkup({
+            chatId: channel.tgChatId,
+            currentPage: pageIndex + 1,
+            totalPages: pageContents.length,
+            pageMessageIds: publishedPageMessageIds,
+          }) ?? undefined;
+          const mainSecondPassHash = buildPageCombinedHash({
+            text: pageText,
+            replyMarkup: mainSecondPassReplyMarkup,
+            schemaVersion: hashSchemaVersion,
+          });
+          const mainSecondPassOldHash = readHashRecord(nextHashState, 'main_catalog', pageIndex + 1);
+          const shouldSkipMainSecondPass = shouldSkipByHash({
+            enabled: TYPEC_HASH_GATE_ENABLED,
+            forceRepublish: hashForceRepublish,
+            existingMessageId: publishedPageMessageIds[pageIndex],
+            oldRecord: mainSecondPassOldHash,
+            newCombinedHash: mainSecondPassHash.combinedHash,
+            schemaVersion: hashSchemaVersion,
+          });
+
+          if (shouldSkipMainSecondPass) {
+            hashGateSkipCount += 1;
+            continue;
+          }
+
+          hashGatePublishCount += 1;
           const republishResult = await publishCatalogMessage({
             botToken,
             chatId: channel.tgChatId,
             text: pageText,
             existingMessageId: publishedPageMessageIds[pageIndex],
-            replyMarkup: buildCatalogContentPageReplyMarkup({
-              chatId: channel.tgChatId,
-              currentPage: pageIndex + 1,
-              totalPages: pageContents.length,
-              pageMessageIds: publishedPageMessageIds,
-            }) ?? undefined,
+            replyMarkup: mainSecondPassReplyMarkup,
           });
 
           if (selfHealEnabledOnRun && republishResult.notModified) selfHealFixedCount += 1;
@@ -1826,6 +2185,13 @@ export async function handleCatalogJob(
             orphanCandidateIds: mainPageOrphanCandidateIds,
             scope: 'main_catalog',
             channelIdRaw,
+          });
+
+          writeHashRecord(nextHashState, {
+            scope: 'main_catalog',
+            pageNo: pageIndex + 1,
+            combinedHash: mainSecondPassHash.combinedHash,
+            schemaVersion: hashSchemaVersion,
           });
         }
 
@@ -1896,13 +2262,27 @@ export async function handleCatalogJob(
         },
       });
 
+      const detailPageCountByCollection = Object.fromEntries(
+        Object.entries(nextCollectionNavState?.detailPageMessageIds ?? {}).map(([name, ids]) => [name, ids.length]),
+      ) as Record<string, number>;
+
+      pruneCatalogHashState({
+        hashState: nextHashState,
+        mainPageCount: hasMainCatalogContent ? pageContents.length : 0,
+        indexPageCount: nextCollectionNavState?.indexPageMessageIds?.length ?? 0,
+        detailPageCountByCollection,
+      });
+
       try {
         await prisma.channel.update({
           where: { id: channelId },
           data: {
             navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
             lastNavUpdateAt: new Date(),
-            navReplyMarkup: mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState),
+            navReplyMarkup: mergeCatalogHashStateIntoReplyMarkup(
+              mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState),
+              nextHashState,
+            ),
             ...({ navPageMessageIds: publishedPageMessageIds } as any),
           } as any,
         });
@@ -1914,7 +2294,10 @@ export async function handleCatalogJob(
             data: {
               navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
               lastNavUpdateAt: new Date(),
-              navReplyMarkup: mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState) as any,
+              navReplyMarkup: mergeCatalogHashStateIntoReplyMarkup(
+                mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState),
+                nextHashState,
+              ) as any,
             },
           });
         } else {
@@ -1932,11 +2315,22 @@ export async function handleCatalogJob(
         },
       });
 
+      const hashGateTotal = hashGateSkipCount + hashGatePublishCount;
+      catalogMetrics.hashGateTotal += hashGateTotal;
+      catalogMetrics.hashGateSkipTotal += hashGateSkipCount;
+      catalogMetrics.hashGatePublishTotal += hashGatePublishCount;
+
       logger.info('[q_catalog] TypeC自愈修复统计', {
         runId,
         channelId: channelIdRaw,
         triggerType,
         selfHealEnabledOnRun,
+        hashGateEnabled: TYPEC_HASH_GATE_ENABLED,
+        hashForceRepublish,
+        hash_schema_version: hashSchemaVersion,
+        hash_gate_total: hashGateTotal,
+        hash_gate_skip_count: hashGateSkipCount,
+        hash_gate_publish_count: hashGatePublishCount,
         self_heal_fixed_count: selfHealFixedCount,
         self_heal_fallback_count: selfHealFallbackCount,
         self_heal_orphan_cleaned_count: selfHealOrphanCleanedCount,

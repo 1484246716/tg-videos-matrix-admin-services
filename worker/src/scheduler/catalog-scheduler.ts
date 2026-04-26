@@ -132,12 +132,26 @@ export async function scheduleDueCatalogTasks() {
     const publishRuns = catalogMetrics.publishRunSuccessTotal + catalogMetrics.publishRunFailedTotal;
     const avgDurationMs =
       publishRuns > 0 ? Math.round(catalogMetrics.publishDurationMsTotal / publishRuns) : 0;
+    const hashGateTotal = catalogMetrics.hashGateTotal;
+    const hashGateSkipRate = hashGateTotal > 0
+      ? Number((catalogMetrics.hashGateSkipTotal / hashGateTotal).toFixed(4))
+      : 0;
+    const hashGatePublishRate = hashGateTotal > 0
+      ? Number((catalogMetrics.hashGatePublishTotal / hashGateTotal).toFixed(4))
+      : 0;
 
     logger.info('typec_metrics', {
       tag: 'typec_metrics',
       message: 'TypeC 目录链路指标快照',
       ...catalogMetrics,
       avgDurationMs,
+      hashGateSummary: {
+        total: hashGateTotal,
+        skip: catalogMetrics.hashGateSkipTotal,
+        publish: catalogMetrics.hashGatePublishTotal,
+        skipRate: hashGateSkipRate,
+        publishRate: hashGatePublishRate,
+      },
       alertThresholds: {
         emptyRunConsecutive: TYPEC_ALERT_EMPTY_RUN_CONSECUTIVE_THRESHOLD,
         failedRun: TYPEC_ALERT_FAILED_RUN_THRESHOLD,

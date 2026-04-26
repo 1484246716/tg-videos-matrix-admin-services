@@ -203,6 +203,21 @@ export const TYPEC_CATALOG_SOURCE_BACKFILL_SLEEP_MS = (() => {
 export const TYPEC_SELF_HEAL_CLEANUP_ENABLED =
   process.env.TYPEC_SELF_HEAL_CLEANUP_ENABLED !== 'false';
 
+/** TypeC 是否启用内容哈希脏页更新（false 关闭） */
+export const TYPEC_HASH_GATE_ENABLED =
+  process.env.TYPEC_HASH_GATE_ENABLED !== 'false';
+
+/** TypeC 哈希结构版本号 */
+export const TYPEC_HASH_SCHEMA_VERSION = (() => {
+  const n = Number(process.env.TYPEC_HASH_SCHEMA_VERSION ?? '1');
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(1000, Math.floor(n));
+})();
+
+/** TypeC 当哈希版本变化时是否强制重发 */
+export const TYPEC_HASH_FORCE_REPUBLISH_ON_VERSION_CHANGE =
+  process.env.TYPEC_HASH_FORCE_REPUBLISH_ON_VERSION_CHANGE !== 'false';
+
 /** TypeC 合集索引是否展示空合集（默认 true） */
 export const TYPEC_COLLECTION_INDEX_SHOW_EMPTY =
   process.env.TYPEC_COLLECTION_INDEX_SHOW_EMPTY !== 'false';
