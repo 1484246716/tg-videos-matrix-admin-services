@@ -616,7 +616,7 @@ export class SearchService {
     }
 
     try {
-      const openSearchResult = await this.searchIndexerService.searchByContentTagViaReadAlias({
+      const openSearchResult = await this.searchIndexerService.searchByTagViaReadAlias({
         channelIds: effectiveChannelIds,
         limit,
         offset,

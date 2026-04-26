@@ -230,13 +230,14 @@ export class CloneChannelsService {
 
     if (scheduleType === 'interval') {
       const intervalSeconds = params.intervalSeconds;
-      if (!Number.isInteger(intervalSeconds) || intervalSeconds < 60 || intervalSeconds > 86400) {
+      const interval = Number(intervalSeconds);
+      if (!Number.isInteger(interval) || interval < 60 || interval > 86400) {
         throw new BadRequestException('intervalSeconds must be an integer between 60 and 86400 when scheduleType=interval');
       }
 
       return {
         scheduleType,
-        intervalSeconds,
+        intervalSeconds: interval,
       };
     }
 
@@ -960,8 +961,8 @@ export class CloneChannelsService {
       }),
     ]);
 
-    const removedQueueJobs = mainRemovedStats.reduce((sum, curr) => sum + curr, 0);
-    const removedGuardWaitJobs = guardRemovedStats.reduce((sum, curr) => sum + curr, 0);
+    const removedQueueJobs = mainRemovedStats.reduce<number>((sum, curr) => sum + Number(curr), 0);
+    const removedGuardWaitJobs = guardRemovedStats.reduce<number>((sum, curr) => sum + Number(curr), 0);
 
     return {
       deleted: deleted.count,

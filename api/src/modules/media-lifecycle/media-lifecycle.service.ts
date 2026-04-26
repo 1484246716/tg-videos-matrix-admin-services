@@ -265,9 +265,8 @@ export class MediaLifecycleService {
           aggregate,
         });
 
-        const sourceExpected = Number(groupTask?.sourceExpectedCount ?? 0);
         const expected = Number(groupTask?.expectedMediaCount ?? 0);
-        const total = sourceExpected > 0 ? sourceExpected : expected > 0 ? expected : aggregate.total;
+        const total = expected > 0 ? expected : aggregate.total;
         const arrived = Number(groupTask?.actualReadyCount ?? 0) > 0 ? Number(groupTask?.actualReadyCount ?? 0) : aggregate.total;
         groupProgress = {
           success: aggregate.success,
