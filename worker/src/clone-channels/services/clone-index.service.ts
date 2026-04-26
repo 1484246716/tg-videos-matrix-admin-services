@@ -65,6 +65,38 @@ function parseSingleMessageLink(raw?: string | null) {
   };
 }
 
+function decodeSingleMessageLinks(raw?: string | null) {
+  const value = String(raw ?? '').trim();
+  if (!value) return [] as string[];
+
+  if (value.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(value) as { links?: string[] };
+      if (Array.isArray(parsed.links)) {
+        return parsed.links.map((item) => String(item || '').trim()).filter(Boolean);
+      }
+    } catch {
+      // fallback as legacy single link
+    }
+  }
+
+  return [value];
+}
+
+function parseSingleMessageLinks(raw?: string | null) {
+  const links = decodeSingleMessageLinks(raw);
+  const map = new Map<string, NonNullable<ReturnType<typeof parseSingleMessageLink>>>();
+
+  for (const link of links) {
+    const parsed = parseSingleMessageLink(link);
+    if (!parsed) continue;
+    const key = `${parsed.channelUsername}:${parsed.messageId.toString()}`;
+    if (!map.has(key)) map.set(key, parsed);
+  }
+
+  return Array.from(map.values());
+}
+
 // 解析并校验内容类型过滤项，非法值自动忽略并回退默认集合。
 function parseContentTypes(raw: string[] | CloneContentType[] | undefined): CloneContentType[] {
   const allowed: CloneContentType[] = ['text', 'image', 'video'];
@@ -1062,23 +1094,39 @@ export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
     const lastFetchedMessageId = job.lastFetchedMessageId
       ? BigInt(job.lastFetchedMessageId)
       : channel?.lastFetchedMessageId ?? null;
-    const singleMessageTarget = task.singleMessageEnabled
-      ? parseSingleMessageLink(task.singleMessageLink)
-      : null;
+    const singleMessageTargets = task.singleMessageEnabled
+      ? parseSingleMessageLinks(task.singleMessageLink)
+      : [];
 
-    if (singleMessageTarget && singleMessageTarget.channelUsername !== channelUsername) {
+    if (task.singleMessageEnabled && singleMessageTargets.length === 0) {
+      throw new Error('single message mode enabled but no valid message links provided');
+    }
+
+    if (singleMessageTargets.some((item) => item.channelUsername !== channelUsername)) {
       throw new Error(
-        `invalid single message link channel mismatch: task=${channelUsername} link=${singleMessageTarget.channelUsername}`,
+        `invalid single message link channel mismatch: task=${channelUsername}`,
       );
     }
 
     const contentTypes = parseContentTypes(job.contentTypes ?? (task.contentTypes as string[]));
-    const messages = singleMessageTarget
-      ? await fetchSingleMessage({
-          channelUsername,
-          messageId: singleMessageTarget.messageId,
-          contentTypes,
-        })
+    const messages = singleMessageTargets.length > 0
+      ? Array.from(
+          new Map(
+            (
+              await Promise.all(
+                singleMessageTargets.map((target) =>
+                  fetchSingleMessage({
+                    channelUsername,
+                    messageId: target.messageId,
+                    contentTypes,
+                  }),
+                ),
+              )
+            )
+              .flat()
+              .map((item) => [`${item.messageId.toString()}:${item.groupKey}`, item] as const),
+          ).values(),
+        )
       : await fetchIncrementalMessages({
           channelUsername,
           lastFetchedMessageId,
@@ -1129,24 +1177,14 @@ export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
       });
     }
 
-    const currentRun = await prisma.cloneCrawlRun.findUnique({
-      where: { id: runId },
-      select: { id: true, channelTotal: true, channelSuccess: true, channelFailed: true },
-    });
-
-    const nextChannelSuccess = (currentRun?.channelSuccess ?? 0) + 1;
-    const channelTotal = currentRun?.channelTotal ?? 0;
-    const shouldFinish = channelTotal > 0 && nextChannelSuccess + (currentRun?.channelFailed ?? 0) >= channelTotal;
-
     await prisma.$transaction(async (tx) => {
       await tx.cloneCrawlRun.update({
         where: { id: runId },
         data: {
-          status: shouldFinish ? 'success' : 'running',
+          status: 'running',
           indexedCount: { increment: inserted },
           dedupCount: { increment: deduped },
           channelSuccess: { increment: 1 },
-          finishedAt: shouldFinish ? new Date() : undefined,
           downloadQueued:
             task.crawlMode === 'index_and_download'
               ? { increment: queuedDownloads }
@@ -1154,7 +1192,25 @@ export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
         },
       });
 
+      const runAfterIncrement = await tx.cloneCrawlRun.findUnique({
+        where: { id: runId },
+        select: { id: true, channelTotal: true, channelSuccess: true, channelFailed: true },
+      });
+
+      const shouldFinish =
+        (runAfterIncrement?.channelTotal ?? 0) > 0 &&
+        (runAfterIncrement?.channelSuccess ?? 0) + (runAfterIncrement?.channelFailed ?? 0) >=
+          (runAfterIncrement?.channelTotal ?? 0);
+
       if (shouldFinish) {
+        await tx.cloneCrawlRun.update({
+          where: { id: runId },
+          data: {
+            status: 'success',
+            finishedAt: new Date(),
+          },
+        });
+
         await markCloneTaskRunFinished({
           taskId,
           scheduleType: task.scheduleType,
@@ -1223,42 +1279,50 @@ export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
     });
 
     if (!shouldRetry) {
-      const run = await prisma.cloneCrawlRun.findUnique({
-        where: { id: runId },
-        select: {
-          id: true,
-          channelTotal: true,
-          channelSuccess: true,
-          channelFailed: true,
-          task: {
-            select: {
-              id: true,
-              scheduleType: true,
-              timezone: true,
-            },
-          },
-        },
-      });
-
-      const nextFailed = (run?.channelFailed ?? 0) + 1;
-      const total = run?.channelTotal ?? 0;
-      const shouldFinish = total > 0 && (run?.channelSuccess ?? 0) + nextFailed >= total;
-
       await prisma.$transaction(async (tx) => {
         await tx.cloneCrawlRun.updateMany({
           where: { id: runId },
           data: {
-            status: shouldFinish ? 'failed' : 'running',
+            status: 'running',
             channelFailed: { increment: 1 },
-            finishedAt: shouldFinish ? new Date() : undefined,
           },
         });
 
-        if (shouldFinish && run?.task) {
+        const runAfterIncrement = await tx.cloneCrawlRun.findUnique({
+          where: { id: runId },
+          select: {
+            id: true,
+            channelTotal: true,
+            channelSuccess: true,
+            channelFailed: true,
+            task: {
+              select: {
+                id: true,
+                scheduleType: true,
+                timezone: true,
+              },
+            },
+          },
+        });
+
+        const shouldFinish =
+          (runAfterIncrement?.channelTotal ?? 0) > 0 &&
+          (runAfterIncrement?.channelSuccess ?? 0) + (runAfterIncrement?.channelFailed ?? 0) >=
+            (runAfterIncrement?.channelTotal ?? 0);
+
+        if (shouldFinish && runAfterIncrement?.task) {
+          await tx.cloneCrawlRun.updateMany({
+            where: { id: runId },
+            data: {
+              status: 'failed',
+              finishedAt: new Date(),
+            },
+          });
+
           await markCloneTaskRunFinished({
-            taskId: run.task.id,
-            scheduleType: run.task.scheduleType,
-            timezone: run.task.timezone,
+            taskId: runAfterIncrement.task.id,
+            scheduleType: runAfterIncrement.task.scheduleType,
+            timezone: runAfterIncrement.task.timezone,
             tx,
           });
         }

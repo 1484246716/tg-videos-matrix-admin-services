@@ -1,4 +1,4 @@
-﻿import { access, copyFile, mkdir, open, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, open, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { constants as fsConstants } from 'node:fs';
 import { execFile } from 'node:child_process';
@@ -74,6 +74,69 @@ function resolveTargetFileName(params: {
   const { stem, ext } = splitVideoBaseAndExt(rawBaseName);
   const safeExt = ext || resolveFileExtensionByMime(params.mimeType);
   return `${stem}${safeExt}`;
+}
+
+function buildGroupedPrefix(params: {
+  channelUsername: string;
+  groupedId?: string | null;
+  groupKey?: string | null;
+  firstMessageText?: string | null;
+}) {
+  const textPrefix = sanitizeFileName(String(params.firstMessageText ?? '').replace(/[\r\n]+/g, ' '));
+  if (textPrefix) return textPrefix.length > 80 ? `${textPrefix.slice(0, 80).trim()}...` : textPrefix;
+
+  const channelBase = params.channelUsername.replace(/^@/, '');
+  const groupPart = String(params.groupedId ?? params.groupKey ?? '').trim() || 'group';
+  return sanitizeFileName(`${channelBase}-${groupPart}`) || 'group';
+}
+
+async function resolveGroupedTargetFileName(params: {
+  itemId: bigint;
+  taskId: bigint;
+  channelUsername: string;
+  groupedId?: string | null;
+  groupKey?: string | null;
+  mimeType?: string | null;
+}) {
+  const groupKey = String(params.groupKey ?? '').trim();
+  const groupedId = String(params.groupedId ?? '').trim();
+  if (!groupKey && !groupedId) return null;
+
+  const siblings = await prisma.cloneCrawlItem.findMany({
+    where: {
+      taskId: params.taskId,
+      channelUsername: params.channelUsername,
+      ...(groupKey ? { groupKey } : { groupedId }),
+      OR: [
+        { hasVideo: true },
+        { mimeType: { startsWith: 'image/' } },
+        { mimeType: { startsWith: 'video/' } },
+      ],
+    },
+    select: {
+      id: true,
+      messageId: true,
+      messageText: true,
+    },
+    orderBy: [{ messageId: 'asc' }, { id: 'asc' }],
+  });
+
+  if (!siblings.length) return null;
+
+  const idx = siblings.findIndex((s) => s.id === params.itemId);
+  if (idx < 0) return null;
+
+  const firstWithText = siblings.find((s) => String(s.messageText ?? '').trim().length > 0);
+  const prefix = buildGroupedPrefix({
+    channelUsername: params.channelUsername,
+    groupedId: groupedId || null,
+    groupKey: groupKey || null,
+    firstMessageText: firstWithText?.messageText,
+  });
+
+  const ext = resolveFileExtensionByMime(params.mimeType);
+  const sequence = String(idx + 1).padStart(2, '0');
+  return `${prefix}-${sequence}${ext}`;
 }
 
 async function ensureDir(targetDir: string) {
@@ -262,6 +325,7 @@ function startProgressLogger(params: {
   channelUsername: string;
   messageId: number;
   expectedSize?: bigint;
+  shouldReport?: () => Promise<boolean>;
   onProgress?: (data: { downloadedBytes: number; progressPct: number | null; speedMbps: number }) => Promise<void>;
 }) {
   const startedAt = Date.now();
@@ -269,6 +333,11 @@ function startProgressLogger(params: {
 
   const timer = setInterval(async () => {
     try {
+      if (params.shouldReport) {
+        const canReport = await params.shouldReport();
+        if (!canReport) return;
+      }
+
       const fsStat = await stat(params.tempFilePath);
       const currentSize = Math.max(0, fsStat.size);
       if (currentSize === lastLoggedSize) return;
@@ -472,6 +541,27 @@ async function canShortCircuitDownloadedItem(item: {
   return { shouldSkip: true as const, localPath };
 }
 
+async function isDownloadItemCancelled(itemId: bigint) {
+  const latest = await prisma.cloneCrawlItem.findUnique({
+    where: { id: itemId },
+    select: {
+      id: true,
+      downloadStatus: true,
+      downloadErrorCode: true,
+    },
+  });
+
+  if (!latest) {
+    return { cancelled: true as const, reason: 'item_deleted' as const };
+  }
+
+  if (latest.downloadStatus === 'failed_final' && latest.downloadErrorCode === 'manual_deleted') {
+    return { cancelled: true as const, reason: 'manual_deleted' as const };
+  }
+
+  return { cancelled: false as const };
+}
+
 export async function processCloneMediaDownload(job: CloneMediaDownloadJob, workerJobId?: string) {
   const itemId = BigInt(job.itemId);
   const runId = BigInt(job.runId);
@@ -653,10 +743,19 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
     }
     const targetExpectedBase = textAsFileName || job.expectedFileName;
 
+    const groupedFileName = await resolveGroupedTargetFileName({
+      itemId,
+      taskId,
+      channelUsername: item.channelUsername,
+      groupedId: job.groupedId ?? item.groupedId,
+      groupKey: job.groupKey ?? item.groupKey,
+      mimeType: resolvedMimeHint,
+    });
+
     const fileName = resolveTargetFileName({
       channelUsername: item.channelUsername,
       messageId: item.messageId,
-      expectedFileName: targetExpectedBase,
+      expectedFileName: groupedFileName || targetExpectedBase,
       mimeType: resolvedMimeHint,
     });
 
@@ -688,6 +787,10 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
       channelUsername: mediaRef.kind === 'tg_message' ? mediaRef.channelUsername : item.channelUsername,
       messageId: mediaRef.kind === 'tg_message' ? Number(mediaRef.messageId) : Number(item.messageId),
       expectedSize,
+      shouldReport: async () => {
+        const cancelledState = await isDownloadItemCancelled(itemId);
+        return !cancelledState.cancelled;
+      },
       onProgress: async ({ downloadedBytes, progressPct, speedMbps }) => {
         await prisma.cloneCrawlItem.updateMany({
           where: { id: itemId, downloadStatus: 'downloading' },
@@ -718,6 +821,19 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
     let downloadedBytes = BigInt(0);
     let mimeType: string | undefined;
 
+    const cancelledBeforeDownload = await isDownloadItemCancelled(itemId);
+    if (cancelledBeforeDownload.cancelled) {
+      logger.warn('[clone][下载/Download] 检测到任务已被强删除，跳过下载 / item cancelled before download', {
+        taskId: job.taskId,
+        runId: job.runId,
+        itemId: job.itemId,
+        reason: cancelledBeforeDownload.reason,
+      });
+      clearInterval(heartbeatTimer);
+      stopProgressLog();
+      return;
+    }
+
     try {
       const downloadResult = await downloadMediaToTempFile({
         mediaRef,
@@ -731,6 +847,18 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
     } finally {
       clearInterval(heartbeatTimer);
       stopProgressLog();
+    }
+
+    const cancelledAfterDownload = await isDownloadItemCancelled(itemId);
+    if (cancelledAfterDownload.cancelled) {
+      await rm(tempFilePath, { force: true });
+      logger.warn('[clone][下载/Download] 检测到任务下载中被强删除，已丢弃临时文件 / item cancelled during download, temp file dropped', {
+        taskId: job.taskId,
+        runId: job.runId,
+        itemId: job.itemId,
+        reason: cancelledAfterDownload.reason,
+      });
+      return;
     }
 
     const tempStat = await stat(tempFilePath);

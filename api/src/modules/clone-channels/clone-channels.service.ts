@@ -11,6 +11,8 @@ import { TelegramClient } from 'telegram';
 import { Api } from 'telegram';
 import { computeCheck } from 'telegram/Password';
 import { CloneDownloadStatus } from '@prisma/client';
+import IORedis from 'ioredis';
+import { Queue } from 'bullmq';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateCloneTaskDto } from './dto/create-clone-task.dto';
 import { UpdateCloneTaskDto } from './dto/update-clone-task.dto';
@@ -18,6 +20,18 @@ import { UpdateCloneTaskDto } from './dto/update-clone-task.dto';
 @Injectable()
 export class CloneChannelsService {
   private readonly logger = new Logger(CloneChannelsService.name);
+  private readonly redis = new IORedis(process.env.REDIS_URL || 'redis://localhost:6379', {
+    maxRetriesPerRequest: null,
+  });
+  private readonly cloneMediaDownloadQueue = new Queue('q_clone_media_download', {
+    connection: this.redis as any,
+  });
+  private readonly cloneGuardWaitQueue = new Queue('q_clone_download_guard_wait', {
+    connection: this.redis as any,
+  });
+  private readonly cloneRetryQueue = new Queue('q_clone_retry', {
+    connection: this.redis as any,
+  });
 
   private readonly loginFlowStore = new Map<string, {
     phoneCodeHashFromTg: string;
@@ -140,6 +154,45 @@ export class CloneChannelsService {
     };
   }
 
+  private parseSingleMessageLinks(rawLinks?: string[] | null, fallbackRawLink?: string | null) {
+    const list = Array.isArray(rawLinks) ? rawLinks : [];
+    const candidates = list.length > 0 ? list : (fallbackRawLink ? [fallbackRawLink] : []);
+
+    const parsed = candidates
+      .map((item) => this.parseSingleMessageLink(item))
+      .filter((item): item is NonNullable<ReturnType<CloneChannelsService['parseSingleMessageLink']>> => Boolean(item));
+
+    const dedupedMap = new Map<string, (typeof parsed)[number]>();
+    for (const row of parsed) {
+      const key = `${row.channelUsername}:${row.messageId.toString()}`;
+      if (!dedupedMap.has(key)) dedupedMap.set(key, row);
+    }
+
+    return Array.from(dedupedMap.values());
+  }
+
+  private encodeSingleMessageLinks(links: string[]) {
+    return JSON.stringify({ v: 1, links });
+  }
+
+  private decodeSingleMessageLinks(raw?: string | null) {
+    const value = String(raw ?? '').trim();
+    if (!value) return [] as string[];
+
+    if (value.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(value) as { v?: number; links?: string[] };
+        if (Array.isArray(parsed.links)) {
+          return parsed.links.map((item) => String(item || '').trim()).filter(Boolean);
+        }
+      } catch {
+        // fallback to single link parser below
+      }
+    }
+
+    return [value];
+  }
+
   private assertTaskId(id: string) {
     if (!/^\d+$/.test(id)) {
       throw new BadRequestException('invalid task id');
@@ -161,11 +214,36 @@ export class CloneChannelsService {
     return Number.isNaN(parsed.getTime()) ? undefined : parsed;
   }
 
-  private computeInitialNextRunAt(scheduleType: 'once' | 'hourly' | 'daily') {
+  private computeInitialNextRunAt(scheduleType: 'once' | 'interval' | 'hourly' | 'daily') {
     if (scheduleType === 'once') return new Date();
+    if (scheduleType === 'interval') return new Date();
     if (scheduleType === 'hourly') return new Date();
     if (scheduleType === 'daily') return new Date();
     return new Date();
+  }
+
+  private normalizeScheduleConfig(params: {
+    scheduleType?: 'once' | 'interval' | 'hourly' | 'daily';
+    intervalSeconds?: number | null;
+  }) {
+    const scheduleType = params.scheduleType ?? 'once';
+
+    if (scheduleType === 'interval') {
+      const intervalSeconds = params.intervalSeconds;
+      if (!Number.isInteger(intervalSeconds) || intervalSeconds < 60 || intervalSeconds > 86400) {
+        throw new BadRequestException('intervalSeconds must be an integer between 60 and 86400 when scheduleType=interval');
+      }
+
+      return {
+        scheduleType,
+        intervalSeconds,
+      };
+    }
+
+    return {
+      scheduleType,
+      intervalSeconds: null,
+    };
   }
 
   async createTask(dto: CreateCloneTaskDto, userId: string) {
@@ -177,37 +255,43 @@ export class CloneChannelsService {
     }
 
     const singleMessageEnabled = dto.singleMessageEnabled ?? false;
-    const parsedSingleMessage = singleMessageEnabled
-      ? this.parseSingleMessageLink(dto.singleMessageLink)
-      : null;
+    const parsedSingleMessages = singleMessageEnabled
+      ? this.parseSingleMessageLinks(dto.singleMessageLinks, dto.singleMessageLink)
+      : [];
 
-    if (singleMessageEnabled && !parsedSingleMessage) {
-      throw new BadRequestException('singleMessageLink is required when singleMessageEnabled=true');
+    if (singleMessageEnabled && parsedSingleMessages.length === 0) {
+      throw new BadRequestException('singleMessageLinks is required when singleMessageEnabled=true');
     }
 
     if (singleMessageEnabled && channels.length !== 1) {
       throw new BadRequestException('single-message clone task must contain exactly one channel');
     }
 
-    if (singleMessageEnabled && channels[0] !== parsedSingleMessage.channelUsername) {
-      throw new BadRequestException('singleMessageLink must match the selected channel');
+    if (singleMessageEnabled && parsedSingleMessages.some((item) => item.channelUsername !== channels[0])) {
+      throw new BadRequestException('all singleMessageLinks must match the selected channel');
     }
 
-    const scheduleType = dto.scheduleType ?? 'once';
+    const normalizedSchedule = this.normalizeScheduleConfig({
+      scheduleType: dto.scheduleType,
+      intervalSeconds: dto.intervalSeconds,
+    });
 
     const created = await this.taskModel.create({
       data: {
         name: dto.name,
-        scheduleType,
+        scheduleType: normalizedSchedule.scheduleType,
         scheduleCron: dto.scheduleCron,
+        intervalSeconds: normalizedSchedule.intervalSeconds,
         timezone: dto.timezone ?? 'Asia/Shanghai',
         dailyRunTime: dto.dailyRunTime,
-        nextRunAt: this.computeInitialNextRunAt(scheduleType),
+        nextRunAt: this.computeInitialNextRunAt(normalizedSchedule.scheduleType),
         crawlMode: dto.crawlMode ?? 'index_only',
         contentTypes: dto.contentTypes ?? ['text', 'image', 'video'],
         recentLimit: singleMessageEnabled ? 1 : dto.recentLimit ?? 100,
         singleMessageEnabled,
-        singleMessageLink: singleMessageEnabled ? parsedSingleMessage.normalizedLink : null,
+        singleMessageLink: singleMessageEnabled
+          ? this.encodeSingleMessageLinks(parsedSingleMessages.map((item) => item.normalizedLink))
+          : null,
         downloadMaxFileMb: dto.downloadMaxFileMb,
         globalDownloadConcurrency: dto.globalDownloadConcurrency ?? 4,
         retryMax: dto.retryMax ?? 5,
@@ -391,25 +475,40 @@ export class CloneChannelsService {
     const mergedChannels =
       normalizedChannels ?? existingTask.channels.map((channel) => channel.channelUsername);
     const singleMessageEnabled = dto.singleMessageEnabled ?? existingTask.singleMessageEnabled;
-    const parsedSingleMessage = singleMessageEnabled
-      ? this.parseSingleMessageLink(
+    const existingLinks = this.decodeSingleMessageLinks(existingTask.singleMessageLink);
+    const parsedSingleMessages = singleMessageEnabled
+      ? this.parseSingleMessageLinks(
+          dto.singleMessageLinks !== undefined ? dto.singleMessageLinks : undefined,
           dto.singleMessageLink !== undefined
             ? dto.singleMessageLink
-            : existingTask.singleMessageLink,
+            : (existingLinks[0] ?? null),
         )
-      : null;
+      : [];
 
-    if (singleMessageEnabled && !parsedSingleMessage) {
-      throw new BadRequestException('singleMessageLink is required when singleMessageEnabled=true');
+    if (singleMessageEnabled && dto.singleMessageLinks === undefined && dto.singleMessageLink === undefined && existingLinks.length > 1) {
+      const fromExisting = this.parseSingleMessageLinks(existingLinks, null);
+      if (fromExisting.length > 0) {
+        parsedSingleMessages.splice(0, parsedSingleMessages.length, ...fromExisting);
+      }
+    }
+
+    if (singleMessageEnabled && parsedSingleMessages.length === 0) {
+      throw new BadRequestException('singleMessageLinks is required when singleMessageEnabled=true');
     }
 
     if (singleMessageEnabled && mergedChannels.length !== 1) {
       throw new BadRequestException('single-message clone task must contain exactly one channel');
     }
 
-    if (singleMessageEnabled && mergedChannels[0] !== parsedSingleMessage.channelUsername) {
-      throw new BadRequestException('singleMessageLink must match the selected channel');
+    if (singleMessageEnabled && parsedSingleMessages.some((item) => item.channelUsername !== mergedChannels[0])) {
+      throw new BadRequestException('all singleMessageLinks must match the selected channel');
     }
+
+    const nextScheduleType = (dto.scheduleType ?? existingTask.scheduleType) as 'once' | 'interval' | 'hourly' | 'daily';
+    const normalizedSchedule = this.normalizeScheduleConfig({
+      scheduleType: nextScheduleType,
+      intervalSeconds: dto.intervalSeconds !== undefined ? dto.intervalSeconds : existingTask.intervalSeconds,
+    });
 
     const updated = await this.prisma.$transaction(async (tx) => {
       const row = await tx.cloneCrawlTask.update({
@@ -419,12 +518,15 @@ export class CloneChannelsService {
           status: dto.status,
           scheduleType: dto.scheduleType,
           scheduleCron: dto.scheduleCron,
+          intervalSeconds: normalizedSchedule.intervalSeconds,
           timezone: dto.timezone,
           dailyRunTime: dto.dailyRunTime,
           nextRunAt: dto.status === 'running' ? new Date() : undefined,
           recentLimit: singleMessageEnabled ? 1 : dto.recentLimit,
           singleMessageEnabled,
-          singleMessageLink: singleMessageEnabled ? parsedSingleMessage.normalizedLink : null,
+          singleMessageLink: singleMessageEnabled
+            ? this.encodeSingleMessageLinks(parsedSingleMessages.map((item) => item.normalizedLink))
+            : null,
           crawlMode: dto.crawlMode,
           contentTypes: dto.contentTypes,
           downloadMaxFileMb: dto.downloadMaxFileMb,
@@ -764,11 +866,110 @@ export class CloneChannelsService {
       throw new BadRequestException('ids is required');
     }
 
-    const deleted = await this.prisma.cloneCrawlItem.deleteMany({
+    const itemRows = await this.prisma.cloneCrawlItem.findMany({
       where: { id: { in: parsedIds } },
+      select: {
+        id: true,
+        downloadStatus: true,
+      },
     });
 
-    return { deleted: deleted.count };
+    const itemIdSet = new Set(itemRows.map((row) => row.id.toString()));
+    const existingIds = parsedIds.filter((id) => itemIdSet.has(id.toString()));
+
+    if (existingIds.length === 0) {
+      return {
+        deleted: 0,
+        cancelledRunning: 0,
+        removedQueueJobs: 0,
+        removedGuardWaitJobs: 0,
+        removedRetryJobs: 0,
+      };
+    }
+
+    const runningStatuses: CloneDownloadStatus[] = ['downloading', 'queued', 'failed_retryable', 'paused_by_guard'];
+
+    const cancelled = await this.prisma.cloneCrawlItem.updateMany({
+      where: {
+        id: { in: existingIds },
+        downloadStatus: {
+          in: runningStatuses,
+        },
+      },
+      data: {
+        downloadStatus: 'failed_final',
+        downloadLeaseUntil: null,
+        downloadHeartbeatAt: null,
+        downloadWorkerJobId: null,
+        downloadErrorCode: 'manual_deleted',
+        downloadError: 'Deleted by operator (force delete)',
+      } as any,
+    });
+
+    const itemIdStrings = existingIds.map((id) => id.toString());
+
+    const removeMainQueue = itemIdStrings.map(async (itemId) => {
+      const job = await this.cloneMediaDownloadQueue.getJob(`clone-download-item-${itemId}`);
+      if (!job) return 0;
+      try {
+        await job.remove();
+        return 1;
+      } catch {
+        return 0;
+      }
+    });
+
+    const removeGuardQueue = itemIdStrings.map(async (itemId) => {
+      const job = await this.cloneGuardWaitQueue.getJob(`clone-download-item-${itemId}`);
+      if (!job) return 0;
+      try {
+        await job.remove();
+        return 1;
+      } catch {
+        return 0;
+      }
+    });
+
+    const retryJobs = await this.cloneRetryQueue.getJobs(['waiting', 'delayed', 'prioritized', 'waiting-children']);
+    let removedRetryJobs = 0;
+
+    const retryTargets = new Set(itemIdStrings);
+    for (const job of retryJobs) {
+      const data = job.data as {
+        payload?: {
+          itemId?: string;
+        };
+      };
+
+      const retryItemId = String(data?.payload?.itemId ?? '').trim();
+      if (!retryItemId || !retryTargets.has(retryItemId)) continue;
+
+      try {
+        await job.remove();
+        removedRetryJobs += 1;
+      } catch {
+        // ignore remove race
+      }
+    }
+
+    const [mainRemovedStats, guardRemovedStats, deleted] = await Promise.all([
+      Promise.all(removeMainQueue),
+      Promise.all(removeGuardQueue),
+      this.prisma.cloneCrawlItem.deleteMany({
+        where: { id: { in: existingIds } },
+      }),
+    ]);
+
+    const removedQueueJobs = mainRemovedStats.reduce((sum, curr) => sum + curr, 0);
+    const removedGuardWaitJobs = guardRemovedStats.reduce((sum, curr) => sum + curr, 0);
+
+    return {
+      deleted: deleted.count,
+      cancelledRunning: cancelled.count,
+      removedQueueJobs,
+      removedGuardWaitJobs,
+      removedRetryJobs,
+    };
   }
 
   async pauseAllDownloads() {

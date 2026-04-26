@@ -16,7 +16,7 @@ import {
 } from '../../config/env';
 import { CloneChannelIndexJob, CloneContentType } from '../types/clone-queue.types';
 
-type CloneScheduleType = 'once' | 'hourly' | 'daily';
+type CloneScheduleType = 'once' | 'interval' | 'hourly' | 'daily';
 
 // 规范化频道用户名：去除 @ 前缀并统一小写。
 function normalizeChannelUsername(raw: string) {
@@ -122,12 +122,19 @@ export function computeCloneTaskNextRunAt(params: {
   scheduleType: CloneScheduleType;
   timezone: string;
   dailyRunTime?: string | null;
+  intervalSeconds?: number | null;
   from?: Date;
 }): Date | null {
   const now = params.from ?? new Date();
 
   if (params.scheduleType === 'once') {
     return null;
+  }
+
+  if (params.scheduleType === 'interval') {
+    const rawInterval = Number(params.intervalSeconds ?? 60);
+    const intervalSeconds = Number.isFinite(rawInterval) ? Math.min(86400, Math.max(60, Math.floor(rawInterval))) : 60;
+    return new Date(now.getTime() + intervalSeconds * 1000);
   }
 
   if (params.scheduleType === 'hourly') {
@@ -168,6 +175,7 @@ export async function markCloneTaskRunFinished(params: {
   scheduleType: CloneScheduleType;
   timezone: string;
   dailyRunTime?: string | null;
+  intervalSeconds?: number | null;
   tx?: Prisma.TransactionClient;
 }) {
   const db = params.tx ?? prisma;
@@ -175,6 +183,7 @@ export async function markCloneTaskRunFinished(params: {
     scheduleType: params.scheduleType,
     timezone: params.timezone,
     dailyRunTime: params.dailyRunTime,
+    intervalSeconds: params.intervalSeconds,
   });
 
   await (db as any).cloneCrawlTask.update({

@@ -971,6 +971,7 @@ model CloneCrawlTask {
   status                    CloneTaskStatus        @default(draft)
   scheduleType              CloneScheduleType      @default(once) @map("schedule_type")
   scheduleCron              String?                @map("schedule_cron") @db.VarChar(64)
+  intervalSeconds           Int?                   @map("interval_seconds")
   timezone                  String                 @default("Asia/Shanghai") @db.VarChar(64)
   dailyRunTime              String?                @map("daily_run_time") @db.VarChar(5)
   nextRunAt                 DateTime?              @map("next_run_at") @db.Timestamptz(6)
@@ -1100,6 +1101,7 @@ enum CloneTaskStatus {
 
 enum CloneScheduleType {
   once
+  interval
   hourly
   daily
 }

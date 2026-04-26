@@ -17,7 +17,7 @@ const TASK_STATUSES = [
   'partial_success',
   'completed',
 ] as const;
-const SCHEDULE_TYPES = ['once', 'hourly', 'daily'] as const;
+const SCHEDULE_TYPES = ['once', 'interval', 'hourly', 'daily'] as const;
 const CRAWL_MODES = ['index_only', 'index_and_download'] as const;
 const TARGET_PATH_TYPES = ['channel_path', 'collection_path'] as const;
 
@@ -44,6 +44,12 @@ export class UpdateCloneTaskDto {
   scheduleCron?: string;
 
   @IsOptional()
+  @IsInt()
+  @Min(60)
+  @Max(86400)
+  intervalSeconds?: number;
+
+  @IsOptional()
   @IsString()
   timezone?: string;
 
@@ -64,6 +70,11 @@ export class UpdateCloneTaskDto {
   @IsOptional()
   @IsString()
   singleMessageLink?: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  singleMessageLinks?: string[];
 
   @IsOptional()
   @IsIn(CRAWL_MODES)

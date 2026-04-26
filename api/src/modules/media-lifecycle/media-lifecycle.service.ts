@@ -237,7 +237,7 @@ export class MediaLifecycleService {
 
       const groupKey = latestDispatch?.groupKey || null;
       let groupStatus: GroupLifecycleStatus | null = null;
-      let groupProgress: { success: number; total: number } | null = null;
+      let groupProgress: { success: number; arrived: number; total: number } | null = null;
 
       if (groupKey) {
         const groupDispatches = dispatchTasks.filter(
@@ -265,10 +265,13 @@ export class MediaLifecycleService {
           aggregate,
         });
 
+        const sourceExpected = Number(groupTask?.sourceExpectedCount ?? 0);
         const expected = Number(groupTask?.expectedMediaCount ?? 0);
-        const total = expected > 0 ? expected : aggregate.total;
+        const total = sourceExpected > 0 ? sourceExpected : expected > 0 ? expected : aggregate.total;
+        const arrived = Number(groupTask?.actualReadyCount ?? 0) > 0 ? Number(groupTask?.actualReadyCount ?? 0) : aggregate.total;
         groupProgress = {
           success: aggregate.success,
+          arrived,
           total,
         };
       }

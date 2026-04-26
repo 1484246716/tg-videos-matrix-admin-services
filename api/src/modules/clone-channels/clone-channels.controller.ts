@@ -15,13 +15,13 @@ interface AuthRequest {
 export class CloneChannelsController {
   constructor(private readonly cloneChannelsService: CloneChannelsService) {}
 
-  @Permissions('channels:view')
+  @Permissions('clone-channels:create')
   @Post('tasks')
   createTask(@Body() dto: CreateCloneTaskDto, @Request() req: AuthRequest) {
     return this.cloneChannelsService.createTask(dto, req.user.userId);
   }
 
-  @Permissions('channels:view')
+  @Permissions('clone-channels:view')
   @Get('tasks')
   listTasks(
     @Query('keyword') keyword?: string,
@@ -49,7 +49,7 @@ export class CloneChannelsController {
     return this.cloneChannelsService.getTask(id);
   }
 
-  @Permissions('channels:update')
+  @Permissions('clone-channels:update')
   @Patch('tasks/:id')
   updateTask(@Param('id') id: string, @Body() dto: UpdateCloneTaskDto) {
     return this.cloneChannelsService.updateTask(id, dto);
