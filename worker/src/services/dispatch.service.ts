@@ -79,7 +79,8 @@ function resolveDispatchMethod(meta: Record<string, unknown> | null | undefined,
 function getFileStem(fileName: string) {
   const trimmed = fileName.trim();
   const stem = trimmed.replace(/\.[^./\\]+$/, '').trim();
-  return stem || trimmed;
+  const withoutSeq = stem.replace(/-\d{2}$/, '').trim();
+  return withoutSeq || stem || trimmed;
 }
 
 // 检查是否为 AI 生成失败的占位文本

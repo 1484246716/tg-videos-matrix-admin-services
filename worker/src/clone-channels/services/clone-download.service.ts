@@ -135,8 +135,8 @@ async function resolveGroupedTargetFileName(params: {
   });
 
   const ext = resolveFileExtensionByMime(params.mimeType);
-  const sequence = String(idx + 1).padStart(2, '0');
-  return `${prefix}-${sequence}${ext}`;
+  const suffix = idx === 0 ? '' : `-${String(idx).padStart(2, '0')}`;
+  return `${prefix}${suffix}${ext}`;
 }
 
 async function ensureDir(targetDir: string) {

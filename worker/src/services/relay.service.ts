@@ -5,7 +5,7 @@
 
 import { stat, unlink } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { MediaStatus } from '@prisma/client';
+import { DispatchMediaType, MediaStatus } from '@prisma/client';
 import { TYPEA_MAX_UPLOAD_SIZE_MB } from '../config/env';
 import { prisma, getTaskDefinitionModel } from '../infra/prisma';
 import { logger } from '../logger';
@@ -148,6 +148,17 @@ function parseCloneSourceMeta(filePath: string, groupedMeta: { groupKey: string;
 function buildStoredFileHash(fileHash: string, cloneSourceMeta: { sourceMessageId: string } | null) {
   if (!cloneSourceMeta?.sourceMessageId) return fileHash;
   return `${fileHash}:srcmsg:${cloneSourceMeta.sourceMessageId}`;
+}
+
+function inferDispatchMediaTypeFromFilePath(filePath: string): DispatchMediaType | null {
+  const ext = basename(filePath).toLowerCase().split('.').pop() || '';
+  if (['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'heic', 'heif'].includes(ext)) {
+    return DispatchMediaType.photo;
+  }
+  if (['mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v'].includes(ext)) {
+    return DispatchMediaType.video;
+  }
+  return null;
 }
 
 // ???????????? Skip Relay Scan File ??????????????
@@ -713,8 +724,13 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
         asset.status === MediaStatus.failed &&
         ingestFinalReason === TYPEA_INGEST_FINAL_REASON.retryable;
 
-      const cloneUploadedBySource = cloneSourceMeta
-        ? await prisma.mediaAsset.findFirst({
+      const currentDispatchMediaType = inferDispatchMediaTypeFromFilePath(filePath);
+      const normalizedCloneSourceChannelUsername = cloneSourceMeta?.sourceChannelUsername
+        ? cloneSourceMeta.sourceChannelUsername.trim().replace(/^@+/, '').toLowerCase()
+        : null;
+
+      const cloneUploadedBySourceCandidates = cloneSourceMeta
+        ? await prisma.mediaAsset.findMany({
             where: {
               channelId: channel.id,
               OR: [
@@ -727,8 +743,30 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
                 equals: cloneSourceMeta.sourceMessageId,
               },
             },
-            select: { id: true },
+            select: { id: true, sourceMeta: true, dispatchMediaType: true },
+            orderBy: { id: 'desc' },
+            take: 20,
           })
+        : [];
+
+      const cloneUploadedBySource = cloneSourceMeta
+        ? cloneUploadedBySourceCandidates.find((candidate) => {
+            const candidateMeta =
+              candidate.sourceMeta && typeof candidate.sourceMeta === 'object'
+                ? (candidate.sourceMeta as Record<string, unknown>)
+                : {};
+            const candidateSourceChannelUsernameRaw =
+              typeof candidateMeta.sourceChannelUsername === 'string'
+                ? candidateMeta.sourceChannelUsername
+                : null;
+            const candidateSourceChannelUsernameNormalized =
+              candidateSourceChannelUsernameRaw?.trim().replace(/^@+/, '').toLowerCase() || null;
+
+            return (
+              candidateSourceChannelUsernameNormalized === normalizedCloneSourceChannelUsername &&
+              candidate.dispatchMediaType === currentDispatchMediaType
+            );
+          }) ?? null
         : null;
 
       const isAlreadyUploadedDuplicate = cloneSourceMeta

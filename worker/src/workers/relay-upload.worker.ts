@@ -725,10 +725,29 @@ export const relayUploadWorker = new Worker(
       typeof sourceMetaForIdempotent.sourceMessageId === 'string'
         ? sourceMetaForIdempotent.sourceMessageId
         : null;
+    const sourceChannelUsernameForIdempotentRaw =
+      typeof sourceMetaForIdempotent.sourceChannelUsername === 'string'
+        ? sourceMetaForIdempotent.sourceChannelUsername
+        : null;
+    const sourceChannelUsernameForIdempotent =
+      sourceChannelUsernameForIdempotentRaw?.trim().replace(/^@+/, '').toLowerCase() || null;
+    const groupKeyForIdempotent =
+      typeof sourceMetaForIdempotent.groupKey === 'string' ? sourceMetaForIdempotent.groupKey : null;
     const isCloneCrawlAssetForIdempotent = sourceMetaForIdempotent.isCloneCrawlAsset === true;
 
+    logger.info('[q_relay_upload][idempotent] precheck snapshot', {
+      traceId,
+      mediaAssetId: mediaAssetIdRaw,
+      channelId: mediaAsset.channelId.toString(),
+      isCloneCrawlAsset: isCloneCrawlAssetForIdempotent,
+      sourceMessageId: sourceMessageIdForIdempotent,
+      sourceChannelUsernameRaw: sourceChannelUsernameForIdempotentRaw,
+      sourceChannelUsernameNormalized: sourceChannelUsernameForIdempotent,
+      groupKey: groupKeyForIdempotent,
+    });
+
     if (isCloneCrawlAssetForIdempotent && sourceMessageIdForIdempotent) {
-      const uploadedSameSource = await prisma.mediaAsset.findFirst({
+      const uploadedCandidates = await prisma.mediaAsset.findMany({
         where: {
           channelId: mediaAsset.channelId,
           id: { not: mediaAsset.id },
@@ -742,14 +761,76 @@ export const relayUploadWorker = new Worker(
             equals: sourceMessageIdForIdempotent,
           },
         },
+        orderBy: { id: 'desc' },
+        take: 20,
         select: {
           id: true,
+          status: true,
           relayMessageId: true,
           telegramFileId: true,
           telegramFileUniqueId: true,
           dispatchMediaType: true,
+          sourceMeta: true,
         },
       });
+
+      const usernameMatchedCandidates = uploadedCandidates.filter((candidate) => {
+        const candidateMeta =
+          candidate.sourceMeta && typeof candidate.sourceMeta === 'object'
+            ? (candidate.sourceMeta as Record<string, unknown>)
+            : null;
+        const candidateSourceChannelUsernameRaw =
+          typeof candidateMeta?.sourceChannelUsername === 'string'
+            ? candidateMeta.sourceChannelUsername
+            : null;
+        const candidateSourceChannelUsernameNormalized =
+          candidateSourceChannelUsernameRaw?.trim().replace(/^@+/, '').toLowerCase() || null;
+
+        return (
+          sourceChannelUsernameForIdempotent &&
+          candidateSourceChannelUsernameNormalized === sourceChannelUsernameForIdempotent
+        );
+      });
+
+      logger.info('[q_relay_upload][idempotent] candidate snapshot', {
+        traceId,
+        mediaAssetId: mediaAssetIdRaw,
+        channelId: mediaAsset.channelId.toString(),
+        sourceMessageId: sourceMessageIdForIdempotent,
+        sourceChannelUsernameNormalized: sourceChannelUsernameForIdempotent,
+        candidateCountBySourceMessageId: uploadedCandidates.length,
+        candidateCountBySourceMessageIdAndSourceChannelUsername: usernameMatchedCandidates.length,
+        candidateAssetIdsBySourceMessageId: uploadedCandidates.map((c) => c.id.toString()),
+        candidateSamples: uploadedCandidates.slice(0, 5).map((candidate) => {
+          const candidateMeta =
+            candidate.sourceMeta && typeof candidate.sourceMeta === 'object'
+              ? (candidate.sourceMeta as Record<string, unknown>)
+              : null;
+          const candidateSourceChannelUsernameRaw =
+            typeof candidateMeta?.sourceChannelUsername === 'string'
+              ? candidateMeta.sourceChannelUsername
+              : null;
+          const candidateSourceChannelUsernameNormalized =
+            candidateSourceChannelUsernameRaw?.trim().replace(/^@+/, '').toLowerCase() || null;
+          const candidateSourceMessageId =
+            typeof candidateMeta?.sourceMessageId === 'string' ? candidateMeta.sourceMessageId : null;
+
+          return {
+            mediaAssetId: candidate.id.toString(),
+            status: candidate.status,
+            dispatchMediaType: candidate.dispatchMediaType,
+            sourceMessageId: candidateSourceMessageId,
+            sourceChannelUsernameRaw: candidateSourceChannelUsernameRaw,
+            sourceChannelUsernameNormalized: candidateSourceChannelUsernameNormalized,
+            relayMessageIdPresent: Boolean(candidate.relayMessageId),
+            telegramFileIdPresent: Boolean(candidate.telegramFileId),
+          };
+        }),
+      });
+
+      const uploadedSameSource = sourceChannelUsernameForIdempotent
+        ? (usernameMatchedCandidates[0] ?? null)
+        : null;
 
       if (uploadedSameSource) {
         const ingestFinishedAt = new Date();
@@ -784,11 +865,16 @@ export const relayUploadWorker = new Worker(
           uploadMethod: 'recover_after_hang_up',
         });
 
-        logger.info('[q_relay_upload] 发送幂等命中，复用已上传 sourceMessageId', {
+        logger.warn('[q_relay_upload] 发送幂等命中，复用已上传 sourceMessageId', {
           traceId,
           mediaAssetId: mediaAssetIdRaw,
+          channelId: mediaAsset.channelId.toString(),
           sourceMessageId: sourceMessageIdForIdempotent,
+          sourceChannelUsernameNormalized: sourceChannelUsernameForIdempotent,
           uploadedFromMediaAssetId: uploadedSameSource.id.toString(),
+          matchedBySourceMessageIdOnly: false,
+          matchedBySourceChannelUsername: true,
+          reasonHint: 'source_channel_username_matched',
         });
 
         return {
@@ -798,6 +884,18 @@ export const relayUploadWorker = new Worker(
           mediaAssetId: mediaAssetIdRaw,
         };
       }
+
+      logger.info('[q_relay_upload][idempotent] no candidate hit, continue normal upload', {
+        traceId,
+        mediaAssetId: mediaAssetIdRaw,
+        channelId: mediaAsset.channelId.toString(),
+        sourceMessageId: sourceMessageIdForIdempotent,
+        sourceChannelUsernameNormalized: sourceChannelUsernameForIdempotent,
+        reason:
+          uploadedCandidates.length > 0
+            ? 'source_message_id_hit_but_source_channel_username_not_matched_or_missing'
+            : 'no_uploaded_candidate_by_source_message_id',
+      });
     }
 
     if (!mediaAsset.channelId) {
