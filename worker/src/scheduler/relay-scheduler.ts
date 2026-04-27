@@ -3,9 +3,11 @@
  * 在 bootstrap 定时触发，负责状态修复、分组轮转与投递 relay-upload worker。
  */
 
+import { stat } from 'node:fs/promises';
 import { MediaStatus } from '@prisma/client';
 import {
   MAX_SCHEDULE_BATCH,
+  RELAY_MTIME_COOLDOWN_MS,
   TYPEA_INGEST_LEASE_MS,
   TYPEA_INGEST_MAX_RETRIES,
   TYPEA_INGEST_STALE_MS,
@@ -16,6 +18,35 @@ import { logger } from '../logger';
 import { updateTaskDefinitionRunStatus } from '../services/task-definition.service';
 import { enqueueRelayAssetsFromTaskDefinition } from '../services/relay.service';
 import { TYPEA_INGEST_FINAL_REASON } from '../shared/metrics';
+
+async function shouldDeferHotStaleIngestingAsset(asset: {
+  id: bigint;
+  channelId: bigint;
+  localPath: string;
+}) {
+  try {
+    const fileStat = await stat(asset.localPath);
+    const ageMs = Date.now() - fileStat.mtimeMs;
+    if (ageMs < RELAY_MTIME_COOLDOWN_MS) {
+      return {
+        defer: true,
+        reason: 'mtime_cooldown_not_reached',
+        ageMs,
+      } as const;
+    }
+
+    return {
+      defer: false,
+      ageMs,
+    } as const;
+  } catch (error) {
+    return {
+      defer: true,
+      reason: 'stat_failed',
+      error: error instanceof Error ? error.message : String(error),
+    } as const;
+  }
+}
 
 // 扫描到期中转任务并按分组策略入队上传。
 export async function scheduleDueRelayUploadTasks() {
@@ -41,6 +72,7 @@ export async function scheduleDueRelayUploadTasks() {
       originalName: true,
       status: true,
       sourceMeta: true,
+      localPath: true,
       updatedAt: true,
     },
   });
@@ -116,68 +148,85 @@ export async function scheduleDueRelayUploadTasks() {
     const preparedAssetIds: string[] = [];
 
     for (const asset of groupAssets) {
-    const sourceMeta = (asset.sourceMeta ?? {}) as Record<string, unknown>;
-    const ingestRetryCountRaw = sourceMeta.ingestRetryCount;
-    const ingestRetryCount =
-      typeof ingestRetryCountRaw === 'number'
-        ? ingestRetryCountRaw
-        : typeof ingestRetryCountRaw === 'string' && /^\d+$/.test(ingestRetryCountRaw)
-          ? Number(ingestRetryCountRaw)
-          : 0;
+      const sourceMeta = (asset.sourceMeta ?? {}) as Record<string, unknown>;
+      const ingestRetryCountRaw = sourceMeta.ingestRetryCount;
+      const ingestRetryCount =
+        typeof ingestRetryCountRaw === 'number'
+          ? ingestRetryCountRaw
+          : typeof ingestRetryCountRaw === 'string' && /^\d+$/.test(ingestRetryCountRaw)
+            ? Number(ingestRetryCountRaw)
+            : 0;
 
-    if (asset.status === MediaStatus.ingesting) {
-      if (ingestRetryCount >= TYPEA_INGEST_MAX_RETRIES) {
-        await prisma.mediaAsset.update({
-          where: { id: asset.id },
-          data: {
-            status: MediaStatus.failed,
-            ingestError: `ingesting stale exceed max retries (${TYPEA_INGEST_MAX_RETRIES})`,
-            sourceMeta: {
-              ...sourceMeta,
-              ingestRetryCount,
-              ingestFinalReason: TYPEA_INGEST_FINAL_REASON.staleIngestingExceeded,
+      if (asset.status === MediaStatus.ingesting) {
+        // 备注：stale ingesting 的重调度不能只看任务心跳；文件若仍在静默冷却期，重投只会再次卡在 worker 的 wait_for_stable。
+        const cooldownDecision = await shouldDeferHotStaleIngestingAsset(asset);
+        if (cooldownDecision.defer) {
+          logger.info('[typea_metrics] stale ingesting deferred by file cooldown', {
+            mediaAssetId: asset.id.toString(),
+            channelId: asset.channelId.toString(),
+            filePath: asset.localPath,
+            reason: cooldownDecision.reason,
+            ageMs: 'ageMs' in cooldownDecision ? Math.floor(cooldownDecision.ageMs) : null,
+            requiredCooldownMs: RELAY_MTIME_COOLDOWN_MS,
+            statError: 'error' in cooldownDecision ? cooldownDecision.error : null,
+          });
+          continue;
+        }
+
+        if (ingestRetryCount >= TYPEA_INGEST_MAX_RETRIES) {
+          await prisma.mediaAsset.update({
+            where: { id: asset.id },
+            data: {
+              status: MediaStatus.failed,
+              ingestError: `ingesting stale exceed max retries (${TYPEA_INGEST_MAX_RETRIES})`,
+              sourceMeta: {
+                ...sourceMeta,
+                ingestRetryCount,
+                ingestFinalReason: TYPEA_INGEST_FINAL_REASON.staleIngestingExceeded,
+              },
             },
-          },
-        });
-        failedFinalCount += 1;
-        continue;
+          });
+          failedFinalCount += 1;
+          continue;
+        }
       }
 
-      staleRecoveredCount += 1;
-    }
+      const whereReady = {
+        id: asset.id,
+        status: MediaStatus.ready,
+        telegramFileId: null,
+        relayMessageId: null,
+      };
 
-    const whereReady = {
-      id: asset.id,
-      status: MediaStatus.ready,
-      telegramFileId: null,
-      relayMessageId: null,
-    };
-
-    const whereStaleIngesting = {
-      id: asset.id,
-      status: MediaStatus.ingesting,
-      telegramFileId: null,
-      relayMessageId: null,
-      updatedAt: { lte: staleIngestingBefore },
-    };
-
-    const updated = await prisma.mediaAsset.updateMany({
-      where: asset.status === MediaStatus.ready ? whereReady : whereStaleIngesting,
-      data: {
+      const whereStaleIngesting = {
+        id: asset.id,
         status: MediaStatus.ingesting,
-        updatedAt: new Date(),
-        sourceMeta: {
-          ...sourceMeta,
-          ingestRetryCount: asset.status === MediaStatus.ingesting ? ingestRetryCount + 1 : ingestRetryCount,
-          ingestLastScheduledAt: new Date().toISOString(),
-          ingestLeaseUntil: new Date(Date.now() + TYPEA_INGEST_LEASE_MS).toISOString(),
-          ingestLastHeartbeatAt: new Date().toISOString(),
-          ingestWorkerJobId: null,
-        },
-      },
-    });
+        telegramFileId: null,
+        relayMessageId: null,
+        updatedAt: { lte: staleIngestingBefore },
+      };
 
-    if (updated.count === 0) continue;
+      const updated = await prisma.mediaAsset.updateMany({
+        where: asset.status === MediaStatus.ready ? whereReady : whereStaleIngesting,
+        data: {
+          status: MediaStatus.ingesting,
+          updatedAt: new Date(),
+          sourceMeta: {
+            ...sourceMeta,
+            ingestRetryCount: asset.status === MediaStatus.ingesting ? ingestRetryCount + 1 : ingestRetryCount,
+            ingestLastScheduledAt: new Date().toISOString(),
+            ingestLeaseUntil: new Date(Date.now() + TYPEA_INGEST_LEASE_MS).toISOString(),
+            ingestLastHeartbeatAt: new Date().toISOString(),
+            ingestWorkerJobId: null,
+          },
+        },
+      });
+
+      if (updated.count === 0) continue;
+
+      if (asset.status === MediaStatus.ingesting) {
+        staleRecoveredCount += 1;
+      }
 
       preparedAssetIds.push(asset.id.toString());
     }
