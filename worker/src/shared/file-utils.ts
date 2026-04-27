@@ -23,6 +23,30 @@ import {
 } from '../config/env';
 import { logger } from '../logger';
 
+// 解析来自数据库的路径（通常为 Windows 绝对路径），并适配当前系统的运行环境
+// 解决 Linux/Docker 环境下，因为读取到 Windows 盘符路径导致创建目录错位的问题
+export function resolveChannelAbsolutePath(dbTargetPath: string): string {
+  if (!dbTargetPath) return process.cwd();
+
+  // 如果是在 Windows 环境下运行，直接返回原路径
+  if (process.platform === 'win32') {
+    return dbTargetPath;
+  }
+
+  // 如果是在 Linux (如 Docker) 环境下运行
+  // 提取 channels/ 之后的部分，拼接到当前环境的 CHANNELS_ROOT_DIR
+  const normalized = dbTargetPath.replace(/\\/g, '/');
+  const match = normalized.match(/\/channels\/(.+)$/i);
+  
+  if (match && match[1]) {
+    const rawRoot = (process.env.CHANNELS_ROOT_DIR || '/data/channels').trim();
+    return resolve(rawRoot, match[1]);
+  }
+
+  // fallback
+  return dbTargetPath;
+}
+
 const SUPPORTED_VIDEO_EXT = new Set([
   '.mp4',
   '.mkv',

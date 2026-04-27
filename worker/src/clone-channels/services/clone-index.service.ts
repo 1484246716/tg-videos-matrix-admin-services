@@ -19,6 +19,7 @@ import {
 import { CLONE_RETRY_MAX } from '../constants/clone-queue.constants';
 import { markCloneTaskRunFinished } from './clone-task.service';
 import { enqueueCloneGroupItem, shouldUseCloneL1L2 } from './clone-group-scheduler.service';
+import { resolveChannelAbsolutePath } from '../../shared/file-utils';
 
 // 将异常归类为可观测的重试原因码。
 function classifyRetryReason(err: unknown): CloneRetryReason {
@@ -1142,7 +1143,7 @@ export async function processCloneChannelIndex(job: CloneChannelIndexJob) {
       channelUsername,
       items: messages,
       crawlMode: task.crawlMode,
-      targetPath: task.targetPath,
+      targetPath: resolveChannelAbsolutePath(task.targetPath),
     });
 
     if (maxMessageId && channel) {

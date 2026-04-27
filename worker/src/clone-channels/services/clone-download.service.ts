@@ -19,6 +19,7 @@ import { CloneMediaRef, CloneRetryReason, CloneMediaDownloadJob } from '../types
 import { checkDownloadGuards, recordGuardTriggered } from './clone-guard.service';
 import { tryAcquireCloneChannelSlot, releaseCloneChannelSlot } from './clone-channel-fairness.service';
 import { withClient } from './clone-session.service';
+import { resolveChannelAbsolutePath } from '../../shared/file-utils';
 
 const execFileAsync = promisify(execFile);
 
@@ -652,7 +653,7 @@ export async function processCloneMediaDownload(job: CloneMediaDownloadJob, work
       return;
     }
 
-    const targetPath = job.targetPath ?? item.localPath ?? process.cwd();
+    const targetPath = resolveChannelAbsolutePath(job.targetPath ?? item.localPath ?? process.cwd());
 
     const guard = await checkDownloadGuards({
       taskId,
