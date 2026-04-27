@@ -33,18 +33,57 @@ export function resolveChannelAbsolutePath(dbTargetPath: string): string {
     return dbTargetPath;
   }
 
-  // 如果是在 Linux (如 Docker) 环境下运行
-  // 提取 channels/ 之后的部分，拼接到当前环境的 CHANNELS_ROOT_DIR
+  // ── Linux / Docker 环境下的路径适配 ──
+
+  const channelsRoot = (process.env.CHANNELS_ROOT_DIR || '/data/channels').trim();
+
+  // 统一反斜杠为正斜杠
   const normalized = dbTargetPath.replace(/\\/g, '/');
-  const match = normalized.match(/\/channels\/(.+)$/i);
-  
-  if (match && match[1]) {
-    const rawRoot = (process.env.CHANNELS_ROOT_DIR || '/data/channels').trim();
-    return resolve(rawRoot, match[1]);
+
+  // 策略 1：路径中包含 /channels/，提取其后的相对部分
+  const channelsMatch = normalized.match(/\/channels\/(.+)$/i);
+  if (channelsMatch && channelsMatch[1]) {
+    const result = resolve(channelsRoot, channelsMatch[1]);
+    logger.debug('[resolveChannelAbsolutePath] 策略1(channels截取)命中', {
+      input: dbTargetPath,
+      output: result,
+    });
+    return result;
   }
 
-  // fallback
-  return dbTargetPath;
+  // 策略 2：路径以 Windows 盘符开头 (如 D:/... 或 D:...)，去掉盘符前缀取最后一级目录名
+  const winDriveMatch = normalized.match(/^[a-zA-Z]:\//);
+  if (winDriveMatch) {
+    // 从 Windows 绝对路径中提取最后一级目录名作为频道目录
+    // 例如 D:/Project/.../频道测试H片(-xxx) → 频道测试H片(-xxx)
+    const lastSegment = normalized.split('/').filter(Boolean).pop();
+    if (lastSegment) {
+      const result = resolve(channelsRoot, lastSegment);
+      logger.debug('[resolveChannelAbsolutePath] 策略2(盘符剥离)命中', {
+        input: dbTargetPath,
+        output: result,
+        lastSegment,
+      });
+      return result;
+    }
+  }
+
+  // 策略 3：路径已经是 Linux 绝对路径 (/data/... 等)，直接使用
+  if (normalized.startsWith('/')) {
+    logger.debug('[resolveChannelAbsolutePath] 策略3(已是Linux绝对路径)', {
+      input: dbTargetPath,
+    });
+    return dbTargetPath;
+  }
+
+  // 策略 4：相对路径，拼到 CHANNELS_ROOT_DIR 下
+  const result = resolve(channelsRoot, normalized);
+  logger.warn('[resolveChannelAbsolutePath] 策略4(fallback相对路径拼接)', {
+    input: dbTargetPath,
+    output: result,
+    channelsRoot,
+  });
+  return result;
 }
 
 const SUPPORTED_VIDEO_EXT = new Set([
