@@ -23,8 +23,13 @@ import {
 } from '../config/env';
 import { logger } from '../logger';
 
-// 解析来自数据库的路径（通常为 Windows 绝对路径），并适配当前系统的运行环境
-// 解决 Linux/Docker 环境下，因为读取到 Windows 盘符路径导致创建目录错位的问题
+// 解析来自数据库的路径，并适配当前系统的运行环境
+// 解决 Linux/Docker 环境下，因为路径格式不同导致创建目录错位的问题
+// 支持的输入格式：
+//   - Windows 绝对路径: D:\...\channels\频道名
+//   - 仅频道目录名:    频道名(-xxx)
+//   - 带前导斜杠:      /频道名(-xxx)
+//   - 已正确的路径:     /data/channels/频道名(-xxx)
 export function resolveChannelAbsolutePath(dbTargetPath: string): string {
   if (!dbTargetPath) return process.cwd();
 
@@ -40,6 +45,14 @@ export function resolveChannelAbsolutePath(dbTargetPath: string): string {
   // 统一反斜杠为正斜杠
   const normalized = dbTargetPath.replace(/\\/g, '/');
 
+  // ✅ 如果路径已经以 CHANNELS_ROOT_DIR 开头，说明已经是正确路径，直接返回
+  if (normalized.startsWith(channelsRoot)) {
+    logger.debug('[resolveChannelAbsolutePath] 路径已在 channelsRoot 下，直接使用', {
+      input: dbTargetPath,
+    });
+    return normalized;
+  }
+
   // 策略 1：路径中包含 /channels/，提取其后的相对部分
   const channelsMatch = normalized.match(/\/channels\/(.+)$/i);
   if (channelsMatch && channelsMatch[1]) {
@@ -51,11 +64,9 @@ export function resolveChannelAbsolutePath(dbTargetPath: string): string {
     return result;
   }
 
-  // 策略 2：路径以 Windows 盘符开头 (如 D:/... 或 D:...)，去掉盘符前缀取最后一级目录名
+  // 策略 2：路径以 Windows 盘符开头 (如 D:/...)，提取最后一级目录名
   const winDriveMatch = normalized.match(/^[a-zA-Z]:\//);
   if (winDriveMatch) {
-    // 从 Windows 绝对路径中提取最后一级目录名作为频道目录
-    // 例如 D:/Project/.../频道测试H片(-xxx) → 频道测试H片(-xxx)
     const lastSegment = normalized.split('/').filter(Boolean).pop();
     if (lastSegment) {
       const result = resolve(channelsRoot, lastSegment);
@@ -68,17 +79,12 @@ export function resolveChannelAbsolutePath(dbTargetPath: string): string {
     }
   }
 
-  // 策略 3：路径已经是 Linux 绝对路径 (/data/... 等)，直接使用
-  if (normalized.startsWith('/')) {
-    logger.debug('[resolveChannelAbsolutePath] 策略3(已是Linux绝对路径)', {
-      input: dbTargetPath,
-    });
-    return dbTargetPath;
-  }
-
-  // 策略 4：相对路径，拼到 CHANNELS_ROOT_DIR 下
-  const result = resolve(channelsRoot, normalized);
-  logger.warn('[resolveChannelAbsolutePath] 策略4(fallback相对路径拼接)', {
+  // 策略 3：去掉前导斜杠，当作相对路径拼接到 CHANNELS_ROOT_DIR 下
+  // 例如 /频道测试H片(-xxx) → /data/channels/频道测试H片(-xxx)
+  // 例如 频道测试H片(-xxx) → /data/channels/频道测试H片(-xxx)
+  const relativePath = normalized.replace(/^\/+/, '');
+  const result = resolve(channelsRoot, relativePath);
+  logger.info('[resolveChannelAbsolutePath] 路径重定向到 channelsRoot', {
     input: dbTargetPath,
     output: result,
     channelsRoot,
