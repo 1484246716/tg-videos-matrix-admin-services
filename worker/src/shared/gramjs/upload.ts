@@ -6,7 +6,7 @@
 import { basename } from 'node:path';
 import { stat } from 'node:fs/promises';
 import { Api } from 'telegram';
-import { getGramjsClient } from './client';
+import { getGramjsBotClient } from './client';
 import type { GramjsSendResult, GramjsVideoMeta } from './types';
 
 // 通过 GramJS 发送媒体文件并返回消息标识。
@@ -21,7 +21,7 @@ export async function sendViaGramjs(args: {
   videoMeta?: GramjsVideoMeta;
   thumbnailPath?: string;
 }): Promise<GramjsSendResult> {
-  const client = await getGramjsClient();
+  const client = await getGramjsBotClient();
   const fileName = args.fileName ?? basename(args.filePath);
 
   // 获取文件大小

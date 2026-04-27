@@ -227,7 +227,3 @@ export async function getGramjsUserClient() {
   throw new Error('GramJS User 会话缺失：请先手机号登录或配置 GRAMJS_USER_SESSION');
 }
 
-// 向后兼容：默认返回 user client（clone 抓取场景）
-export async function getGramjsClient() {
-  return await getGramjsUserClient();
-}

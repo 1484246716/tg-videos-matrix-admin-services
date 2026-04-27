@@ -108,7 +108,7 @@ export async function withClient<T>(
 
 // 兼容断连入口：当前共享客户端实现下为 no-op。
 export async function disconnectClient(_accountId?: string): Promise<void> {
-  // 目前 shared/gramjs/client.ts 仅暴露单例 getGramjsClient，未暴露安全断开接口。
-  // 这里先保留兼容签名，后续若 client 层支持 disconnect，再接入真实释放逻辑。
+  // 目前 shared/gramjs/client.ts 维护了单例的 Bot/User 客户端，但未暴露安全的细粒度断开接口。
+  // 这里先保留兼容签名，后续若 client 层支持按 accountId disconnect，再接入真实释放逻辑。
   logger.info('[clone][session] disconnect requested (no-op with current shared client)');
 }
