@@ -166,7 +166,7 @@ export async function scheduleDueRelayUploadTasks() {
             channelId: asset.channelId.toString(),
             filePath: asset.localPath,
             reason: cooldownDecision.reason,
-            ageMs: 'ageMs' in cooldownDecision ? Math.floor(cooldownDecision.ageMs) : null,
+            ageMs: 'ageMs' in cooldownDecision ? Math.floor(cooldownDecision.ageMs as number) : null,
             requiredCooldownMs: RELAY_MTIME_COOLDOWN_MS,
             statError: 'error' in cooldownDecision ? cooldownDecision.error : null,
           });
