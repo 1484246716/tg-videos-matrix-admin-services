@@ -847,6 +847,24 @@ type CollectionCatalogEpisode = {
   isMissingPlaceholder?: boolean;
 };
 
+// 从标题前缀中去掉“第N集”以避免模板重复拼接
+function stripEpisodePrefixForTemplate(title: string, episodeNo: number) {
+  const escapedEpisodeNo = String(episodeNo).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const punctClass = '[:：—－.、，,）)\\-]*';
+
+  const patterns = [
+    new RegExp(`^第\\s*0*${escapedEpisodeNo}\\s*[集话章回期]\\s*${punctClass}\\s*`, 'u'),
+    new RegExp(`^0*${escapedEpisodeNo}\\s*[集话章回期]\\s*${punctClass}\\s*`, 'u'),
+  ];
+
+  let next = title.trim();
+  for (const pattern of patterns) {
+    next = next.replace(pattern, '').trim();
+  }
+
+  return next || title.trim();
+}
+
 // 格式化合集集标题
 function formatCollectionEpisodeTitle(args: {
   episodeNo: number;
@@ -860,9 +878,10 @@ function formatCollectionEpisodeTitle(args: {
   const fallbackTitle = (args.sourceTitle || '').trim() || `第${args.episodeNo}集`;
   const safeTemplate = (args.templateText || '').trim();
   if (safeTemplate) {
+    const dedupedTitle = stripEpisodePrefixForTemplate(fallbackTitle, args.episodeNo);
     return safeTemplate
       .replace(/\{episodeNo\}/g, String(args.episodeNo))
-      .replace(/\{title\}/g, fallbackTitle);
+      .replace(/\{title\}/g, dedupedTitle);
   }
 
   return fallbackTitle;
@@ -1133,7 +1152,7 @@ class CachedCollectionCatalogReadProvider implements CollectionCatalogReadProvid
       return {
         collectionName: snapshotNameMap.get(key) ?? item.collectionNameNormalized,
         episodeNo: item.episodeNo,
-        title: item.title || `第${item.episodeNo}集`,
+        title: item.title ?? '',
         messageUrl: item.telegramMessageUrl || '',
         isMissingPlaceholder: item.isMissingPlaceholder,
       } as CollectionCatalogEpisode;

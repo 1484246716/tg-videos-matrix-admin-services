@@ -1839,8 +1839,16 @@ export async function handleDispatchJob(
     }
 
     const aiProfile = await resolveDispatchAiProfile(task.channel.aiModelProfileId);
+    const dispatchScopedDir = resolveDispatchScopedDirFromMeta(mediaSourceMeta, task.mediaAsset.localPath ?? null);
+    const dispatchScopedDirName = dispatchScopedDir ? path.basename(dispatchScopedDir) : null;
+    const isCloneAsset = Boolean(dispatchScopedDirName && isDispatchScopedTempDirName(dispatchScopedDirName));
+    const shouldUseAiTemplate = Boolean(
+      task.channel.aiSystemPromptTemplate &&
+      aiProfile &&
+      (!isCloneAsset || task.channel.cloneUseAiPromptTemplate),
+    );
 
-    if (task.channel.aiSystemPromptTemplate && task.channel.cloneUseAiPromptTemplate && aiProfile) {
+    if (shouldUseAiTemplate) {
       try {
         finalCaption = await generateTextWithAiProfile(
           aiProfile,

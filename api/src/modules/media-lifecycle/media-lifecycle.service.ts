@@ -88,6 +88,35 @@ async function removeFileIfExists(filePath?: string | null) {
   }
 }
 
+function normalizeCollectionKey(name: string) {
+  return name
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseCollectionMeta(sourceMeta: unknown) {
+  if (!sourceMeta || typeof sourceMeta !== 'object') return null;
+  const meta = sourceMeta as Record<string, unknown>;
+  if (meta.isCollection !== true) return null;
+
+  const collectionName = typeof meta.collectionName === 'string' ? meta.collectionName : '';
+  const episodeNo =
+    typeof meta.episodeNo === 'number'
+      ? meta.episodeNo
+      : typeof meta.episodeNo === 'string' && /^\d+$/.test(meta.episodeNo)
+        ? Number(meta.episodeNo)
+        : null;
+
+  if (!collectionName || episodeNo === null) return null;
+
+  return {
+    collectionName,
+    episodeNo,
+  };
+}
+
+
 @Injectable()
 export class MediaLifecycleService {
   constructor(private readonly prisma: PrismaService) { }
@@ -720,6 +749,18 @@ export class MediaLifecycleService {
       },
     });
 
+    const snapshotDeleteKeys = new Map<string, { collectionNameNormalized: string; episodeNo: number }>();
+    for (const asset of targetAssets) {
+      const meta = parseCollectionMeta(asset.sourceMeta);
+      if (!meta) continue;
+      const collectionNameNormalized = normalizeCollectionKey(meta.collectionName);
+      const dedupKey = `${collectionNameNormalized}#${meta.episodeNo}`;
+      snapshotDeleteKeys.set(dedupKey, {
+        collectionNameNormalized,
+        episodeNo: meta.episodeNo,
+      });
+    }
+
     const forceNeededAsset = targetAssets.find((asset) => asset.status === 'ingesting');
     if (forceNeededAsset && !force) {
       const sourceMeta =
@@ -828,9 +869,113 @@ export class MediaLifecycleService {
           where: { id: { in: targetMediaAssetIds } },
         });
 
+        const affectedCollections = new Set<string>();
+        for (const snapshotKey of snapshotDeleteKeys.values()) {
+          await tx.collectionEpisodeSnapshot.deleteMany({
+            where: {
+              channelId: existing.channelId,
+              collectionNameNormalized: snapshotKey.collectionNameNormalized,
+              episodeNo: snapshotKey.episodeNo,
+            },
+          });
+          affectedCollections.add(snapshotKey.collectionNameNormalized);
+        }
+
+        for (const collectionNameNormalized of affectedCollections) {
+          const episodes = await tx.collectionEpisodeSnapshot.findMany({
+            where: {
+              channelId: existing.channelId,
+              collectionNameNormalized,
+            },
+            select: {
+              episodeNo: true,
+              sourceUpdatedAt: true,
+            },
+            orderBy: { episodeNo: 'asc' },
+          });
+
+          if (episodes.length === 0) {
+            await tx.collectionSnapshot.upsert({
+              where: {
+                channelId_collectionNameNormalized: {
+                  channelId: existing.channelId,
+                  collectionNameNormalized,
+                },
+              },
+              create: {
+                channelId: existing.channelId,
+                collectionName: collectionNameNormalized,
+                collectionNameNormalized,
+                episodeCount: 0,
+                minEpisodeNo: null,
+                maxEpisodeNo: null,
+                lastSourceUpdatedAt: null,
+                lastRebuildAt: new Date(),
+                version: BigInt(1),
+                isDeleted: true,
+              },
+              update: {
+                collectionName: collectionNameNormalized,
+                episodeCount: 0,
+                minEpisodeNo: null,
+                maxEpisodeNo: null,
+                lastSourceUpdatedAt: null,
+                lastRebuildAt: new Date(),
+                version: { increment: BigInt(1) },
+                isDeleted: true,
+              },
+            });
+            continue;
+          }
+
+          const collectionConfig = await tx.collection.findFirst({
+            where: { channelId: existing.channelId, nameNormalized: collectionNameNormalized },
+            select: { name: true },
+          });
+
+          const minEpisodeNo = episodes[0].episodeNo;
+          const maxEpisodeNo = episodes[episodes.length - 1].episodeNo;
+          const lastSourceUpdatedAt = episodes
+            .map((item) => item.sourceUpdatedAt)
+            .filter((value): value is Date => Boolean(value))
+            .sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
+
+          await tx.collectionSnapshot.upsert({
+            where: {
+              channelId_collectionNameNormalized: {
+                channelId: existing.channelId,
+                collectionNameNormalized,
+              },
+            },
+            create: {
+              channelId: existing.channelId,
+              collectionName: collectionConfig?.name ?? collectionNameNormalized,
+              collectionNameNormalized,
+              episodeCount: episodes.length,
+              minEpisodeNo,
+              maxEpisodeNo,
+              lastSourceUpdatedAt,
+              lastRebuildAt: new Date(),
+              version: BigInt(1),
+              isDeleted: false,
+            },
+            update: {
+              collectionName: collectionConfig?.name ?? collectionNameNormalized,
+              episodeCount: episodes.length,
+              minEpisodeNo,
+              maxEpisodeNo,
+              lastSourceUpdatedAt,
+              lastRebuildAt: new Date(),
+              version: { increment: BigInt(1) },
+              isDeleted: false,
+            },
+          });
+        }
+
         return {
           deletedMediaAssetIds: targetMediaAssetIds.map((assetId) => assetId.toString()),
           deletedDispatchTaskCount: dispatchTaskIds.length,
+          deletedSnapshotCount: snapshotDeleteKeys.size,
         };
       });
 
