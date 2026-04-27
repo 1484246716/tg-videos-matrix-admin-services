@@ -85,6 +85,8 @@ services:
       RELAY_MTIME_COOLDOWN_MS: ${RELAY_MTIME_COOLDOWN_MS}
       # 👇 解决前端跨域的核心变量穿透
       CORS_ORIGIN: ${CORS_ORIGIN}
+      GRAMJS_API_ID: ${GRAMJS_API_ID}
+      GRAMJS_API_HASH: ${GRAMJS_API_HASH}
     command: sh -c "pnpm --filter @tg-crm/api exec prisma generate && pnpm --filter @tg-crm/api run start"
     ports:
       - "3001:3001" # 如果你配置好反代后，为了安全，可以把这里的对外端口映射删掉
