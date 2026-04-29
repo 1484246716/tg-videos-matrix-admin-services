@@ -2126,6 +2126,80 @@ export async function handleDispatchJob(
         episodeNo,
         deletedCount,
       });
+
+      // ── 同步 upsert collectionEpisode 表 ──
+      // collectionEpisode 表通常为空（仅手动编辑标题时才创建），
+      // 此处 upsert 确保 dispatch 成功后自动创建/更新该记录，
+      // 使 catalog_publish 新内容检测（查 collectionEpisode.updatedAt）能感知到变更
+      if (collectionName && episodeNo !== null) {
+        try {
+          // 通过 channelId + nameNormalized 查找对应 Collection
+          const collectionNameNormalized = collectionName
+            .normalize('NFKC')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+          const collection = await prisma.collection.findFirst({
+            where: {
+              channelId: task.channelId,
+              nameNormalized: collectionNameNormalized,
+            },
+            select: { id: true },
+          });
+
+          if (collection) {
+            const fileNameSnapshot = getFileStem(task.mediaAsset.originalName) || `第${episodeNo}集`;
+            const ceResult = await withPrismaRetry(
+              () =>
+                prisma.collectionEpisode.upsert({
+                  where: { mediaAssetId: task.mediaAsset.id },
+                  update: {
+                    telegramMessageId: BigInt(sendResult.messageId),
+                    telegramMessageLink: sendResult.messageLink,
+                    publishedAt: new Date(),
+                    // updatedAt 由 @updatedAt 自动更新
+                  },
+                  create: {
+                    collectionId: collection.id,
+                    mediaAssetId: task.mediaAsset.id,
+                    episodeNo,
+                    fileNameSnapshot,
+                    parseStatus: 'ok',
+                    sortKey: String(episodeNo).padStart(6, '0'),
+                    telegramMessageId: BigInt(sendResult.messageId),
+                    telegramMessageLink: sendResult.messageLink,
+                    publishedAt: new Date(),
+                  },
+                }),
+              { label: 'dispatch.handleDispatchJob.upsertCollectionEpisode' },
+            );
+            logger.info('[dispatch] collectionEpisode 已同步 telegramMessage 信息', {
+              dispatchTaskId: dispatchTaskIdRaw,
+              mediaAssetId: task.mediaAsset.id.toString(),
+              collectionEpisodeId: ceResult.id.toString(),
+              telegramMessageId: String(sendResult.messageId),
+              collectionName,
+              episodeNo,
+            });
+          } else {
+            logger.warn('[dispatch] 未找到对应 Collection 记录，跳过 collectionEpisode 同步', {
+              dispatchTaskId: dispatchTaskIdRaw,
+              channelId: task.channelId.toString(),
+              collectionName,
+              collectionNameNormalized,
+            });
+          }
+        } catch (ceErr) {
+          // 不阻塞主分发流程
+          logger.warn('[dispatch] collectionEpisode 同步失败（不阻塞）', {
+            dispatchTaskId: dispatchTaskIdRaw,
+            mediaAssetId: task.mediaAsset.id.toString(),
+            collectionName,
+            episodeNo,
+            error: (ceErr as Error).message,
+          });
+        }
+      }
     } else {
       await upsertCatalogSourceItemFromSingle({
         channelId: task.channelId,

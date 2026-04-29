@@ -229,13 +229,24 @@ export const TYPEC_COLLECTION_FULL_SCAN_BATCH_SIZE = (() => {
   return Math.min(5000, Math.floor(n));
 })();
 
-/** TypeC 合集数据源（recent/full/cache，默认 full） */
+/**
+ * TypeC 合集数据源（recent/full/cache）
+ *
+ * 默认：cache
+ *   - cache  → 读 collectionEpisodeSnapshot 快照表（预计算缓存，推荐）
+ *   - full   → 读 collectionEpisode 表（该表仅在手动编辑集数标题时写入，通常为空，不可用）
+ *   - recent → 同 full，通常为空
+ *
+ * 【重要】collectionEpisode 不是合集主数据源，仅记录"手动标题覆盖"。
+ * 合集分发后真实数据写入 collectionEpisodeSnapshot（快照服务自动重建）。
+ * 使用 full/recent 时若 collectionEpisode 为空，合集目录渲染为空，TypeC 不发目录。
+ */
 export const TYPEC_COLLECTION_DATA_SOURCE =
-  process.env.TYPEC_COLLECTION_DATA_SOURCE === 'cache'
-    ? 'cache'
+  process.env.TYPEC_COLLECTION_DATA_SOURCE === 'full'
+    ? 'full'
     : process.env.TYPEC_COLLECTION_DATA_SOURCE === 'recent'
       ? 'recent'
-      : 'full';
+      : 'cache'; // 默认 cache：读快照表，保证合集目录正常生成
 
 /** TypeC 合集缓存过期阈值（秒） */
 export const TYPEC_COLLECTION_CACHE_STALE_SECONDS = (() => {
@@ -244,9 +255,16 @@ export const TYPEC_COLLECTION_CACHE_STALE_SECONDS = (() => {
   return Math.floor(n);
 })();
 
-/** TypeC 合集缓存不可用时是否回源DB */
+/**
+ * TypeC 合集缓存不可用时是否回源 DB
+ *
+ * 默认：false
+ * 关闭原因：db 路径查 collectionEpisode 表，该表通常为空（只在手动编辑标题时写入）。
+ * 若开启 fallback，缓存过期时会降级到空表，合集目录渲染为空，行为与不发无异。
+ * 如需开启 fallback，须确保 collectionEpisode 表已有完整数据。
+ */
 export const TYPEC_COLLECTION_CACHE_FALLBACK_TO_DB =
-  process.env.TYPEC_COLLECTION_CACHE_FALLBACK_TO_DB !== 'false';
+  process.env.TYPEC_COLLECTION_CACHE_FALLBACK_TO_DB === 'true';
 
 /** 合集快照增量刷新批次大小 */
 export const COLLECTION_SNAPSHOT_INCREMENTAL_BATCH_SIZE = (() => {

@@ -1275,24 +1275,57 @@ export async function handleCatalogJob(
       }
 
       // 当过了间隔检查期后，进一步判断距离上次有效更新是否有产生新的视频记录
+      // 注意：需同时感知普通视频（catalogSourceItem）和合集视频（collectionEpisode）两种更新来源
       if (channel.lastNavUpdateAt && triggerType !== 'manual_repair') {
-        const hasNewItem = TYPEC_READ_FROM_CATALOG_SOURCE
-          ? await (prisma as any).catalogSourceItem.findFirst({
+        let hasNewItem: { id: unknown } | null = null;
+        let newItemSource: 'catalog_source_item' | 'collection_episode' | 'dispatch_task' | null = null;
+
+        if (TYPEC_READ_FROM_CATALOG_SOURCE) {
+          // 1. 优先查普通视频/图集（catalogSourceItem）
+          const newNormalItem = await (prisma as any).catalogSourceItem.findFirst({
+            where: {
+              channelId,
+              publishedAt: { gt: channel.lastNavUpdateAt },
+            },
+            select: { id: true },
+          });
+
+          if (newNormalItem) {
+            hasNewItem = newNormalItem;
+            newItemSource = 'catalog_source_item';
+          } else {
+            // 2. 追加查询：是否有合集集数在上次目录更新后被更新过
+            //    collectionEpisode.updatedAt 在 Type B 分发成功写入 telegramMessageLink 后会变更
+            const newCollectionEpisode = await prisma.collectionEpisode.findFirst({
               where: {
-                channelId,
-                publishedAt: { gt: channel.lastNavUpdateAt },
-              },
-              select: { id: true },
-            })
-          : await prisma.dispatchTask.findFirst({
-              where: {
-                channelId,
-                status: TaskStatus.success,
-                telegramMessageId: { not: null },
-                finishedAt: { gt: channel.lastNavUpdateAt },
+                collection: { channelId },
+                updatedAt: { gt: channel.lastNavUpdateAt },
               },
               select: { id: true },
             });
+
+            if (newCollectionEpisode) {
+              hasNewItem = newCollectionEpisode;
+              newItemSource = 'collection_episode';
+            }
+          }
+        } else {
+          // fallback：直接查 dispatchTask（TYPEC_READ_FROM_CATALOG_SOURCE=false 时）
+          const newTask = await prisma.dispatchTask.findFirst({
+            where: {
+              channelId,
+              status: TaskStatus.success,
+              telegramMessageId: { not: null },
+              finishedAt: { gt: channel.lastNavUpdateAt },
+            },
+            select: { id: true },
+          });
+
+          if (newTask) {
+            hasNewItem = newTask;
+            newItemSource = 'dispatch_task';
+          }
+        }
 
         if (!hasNewItem) {
           catalogMetrics.publishRunSkippedTotal += 1;
@@ -1301,6 +1334,9 @@ export async function handleCatalogJob(
             channelId: channelIdRaw,
             triggerType,
             reason: 'no_new_records_since_last_update',
+            checkedSources: TYPEC_READ_FROM_CATALOG_SOURCE
+              ? ['catalog_source_item', 'collection_episode']
+              : ['dispatch_task'],
           });
 
           // 更新 lastNavUpdateAt，让频道重新进入下一个间隔等待，防止在接下来的几十分钟内每秒查一遍库
@@ -1311,6 +1347,13 @@ export async function handleCatalogJob(
 
           return { ok: true, skipped: true, reason: '没有新视频产生，跳过更新' };
         }
+
+        logger.info('[q_catalog] 新内容检测通过，继续执行目录更新', {
+          runId,
+          channelId: channelIdRaw,
+          triggerType,
+          newItemSource,
+        });
       }
     }
 
@@ -1472,17 +1515,16 @@ export async function handleCatalogJob(
       })();
 
     if (videos.length === 0) {
-      catalogMetrics.publishRunSkippedTotal += 1;
-      catalogMetrics.publishEmptyRunTotal += 1;
-      catalogMetrics.publishEmptyRunConsecutive += 1;
-      logger.info('[q_catalog] 跳过执行：无可用目录记录', {
+      // 普通视频列表为空时，不立即 return。
+      // 频道可能是纯合集频道（所有视频均为合集，catalogSourceItem 为空），合集目录仍需渲染。
+      // 此处仅记录日志，继续向下执行合集渲染逻辑；
+      // 若合集数据也为空，将在后续的合集渲染阶段各自跳过，最终由 hash 门控决定是否发布空目录。
+      logger.info('[q_catalog] 普通视频列表为空，检查是否有合集内容需要渲染', {
         runId,
         channelId: channelIdRaw,
         triggerType,
-        reason: 'no_catalog_records',
         dataSource: TYPEC_READ_FROM_CATALOG_SOURCE ? 'catalog_source_item' : 'dispatch_task',
       });
-      return { ok: true, skipped: true, reason: '没有可用的目录记录' };
     }
 
     catalogMetrics.publishEmptyRunConsecutive = 0;
