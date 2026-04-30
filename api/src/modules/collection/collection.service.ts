@@ -433,6 +433,8 @@ export class CollectionService {
       ...row,
       id: row.id.toString(),
       channelId: row.channelId.toString(),
+      coverAssetId: row.coverAssetId != null ? row.coverAssetId.toString() : null,
+      indexMessageId: row.indexMessageId != null ? row.indexMessageId.toString() : null,
       createdBy: row.createdBy != null ? row.createdBy.toString() : null,
       channel: row.channel
         ? {
