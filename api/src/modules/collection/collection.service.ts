@@ -429,8 +429,11 @@ export class CollectionService {
       ? Math.max(0, Math.floor((now - blockedEpisode.mediaUpdatedAt) / 1000))
       : null;
 
+    // 从 row 中排除包含 BigInt 的字段，避免序列化错误
+    const { episodes: _episodes, ...rowWithoutEpisodes } = row;
+
     return {
-      ...row,
+      ...rowWithoutEpisodes,
       id: row.id.toString(),
       channelId: row.channelId.toString(),
       coverAssetId: row.coverAssetId != null ? row.coverAssetId.toString() : null,
