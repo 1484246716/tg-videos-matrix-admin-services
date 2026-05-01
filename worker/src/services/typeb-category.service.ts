@@ -74,7 +74,6 @@ const ADULT_EXPLICIT_KEYWORDS = [
   '户外',
   '公共',
   '健身',
-  '剧情',
   '出轨',
   '偷情',
   '调教',
