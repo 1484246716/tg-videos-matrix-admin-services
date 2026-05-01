@@ -138,6 +138,13 @@ export const COLLECTION_AUTO_BYPASS_MARK =
   (process.env.COLLECTION_AUTO_BYPASS_MARK || 'skipped_auto_failed_prev').trim() ||
   'skipped_auto_failed_prev';
 
+/** 合集缺集 grace 期（毫秒），默认 15 分钟 */
+export const COLLECTION_SKIP_GRACE_MS = (() => {
+  const n = Number(process.env.COLLECTION_SKIP_GRACE_MS ?? '900000');  // 15 分钟
+  if (!Number.isFinite(n) || n < 300000) return 900000;  // 最小 5 分钟
+  return Math.min(3600000, Math.floor(n));  // 最大 1 小时
+})();
+
 /** 是否启用目录任务（TypeC/Catalog）频道级时间窗口保护 */
 export const CATALOG_CHANNEL_INTERVAL_GUARD_ENABLED = true;
 
