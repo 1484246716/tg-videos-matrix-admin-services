@@ -45,6 +45,18 @@ function parseCollectionMeta(sourceMeta: unknown) {
 }
 
 // ??????????????????????????????
+// 任务终态集合：已结束不会再变更的状态
+// 修复前Bug：增量刷新用 status=success 过滤查询，却用返回结果的最大ID推进游标，
+// 导致中间尚未成功的任务ID被游标跳过，后续即使变成success也无法补录到快照表。
+// 例：游标=11291时，11292/11293还是running，查询只返回11294，游标直接跳到11294，
+// 等11292变成success后，下次查 id>11294，11292永远不会再被扫到。
+const TERMINAL_STATUSES = new Set<TaskStatus>([
+  TaskStatus.success,
+  TaskStatus.failed,
+  TaskStatus.cancelled,
+  TaskStatus.dead,
+]);
+
 export async function refreshCollectionSnapshotIncremental() {
   const cursor = await prisma.collectionSnapshotCursor.upsert({
     where: { id: 1 },
@@ -53,11 +65,10 @@ export async function refreshCollectionSnapshotIncremental() {
     select: { id: true, lastDispatchId: true },
   });
 
+  // 修复：不再用 status=success 过滤查询，改为查出所有任务后按ID顺序判断
   const rows = await prisma.dispatchTask.findMany({
     where: {
       id: { gt: cursor.lastDispatchId },
-      status: TaskStatus.success,
-      telegramMessageId: { not: null },
     },
     orderBy: { id: 'asc' },
     take: COLLECTION_SNAPSHOT_INCREMENTAL_BATCH_SIZE,
@@ -65,6 +76,7 @@ export async function refreshCollectionSnapshotIncremental() {
       id: true,
       channelId: true,
       finishedAt: true,
+      status: true,
       telegramMessageId: true,
       telegramMessageLink: true,
       mediaAsset: {
@@ -80,10 +92,26 @@ export async function refreshCollectionSnapshotIncremental() {
     return { ok: true, scanned: 0, changed: 0 };
   }
 
+  // 计算安全前沿：从游标位置开始，按ID顺序遍历，遇到非终态任务就停止
+  // 游标只能推进到连续终态任务的最大ID，确保尚未完成的任务不会被跳过
+  let safeFrontier = cursor.lastDispatchId;
+  for (const row of rows) {
+    if (!TERMINAL_STATUSES.has(row.status)) break;
+    safeFrontier = row.id;
+  }
+
+  // 只处理安全前沿内的success任务（终态中只有success需要写入快照）
+  const processableRows = rows.filter(
+    (r) =>
+      r.id <= safeFrontier &&
+      r.status === TaskStatus.success &&
+      r.telegramMessageId !== null,
+  );
+
   let changed = 0;
   const changedHeadKeys = new Set<string>();
 
-  for (const row of rows) {
+  for (const row of processableRows) {
     const meta = parseCollectionMeta(row.mediaAsset?.sourceMeta);
     if (!meta) continue;
 
@@ -180,18 +208,35 @@ export async function refreshCollectionSnapshotIncremental() {
     });
   }
 
-  const lastId = rows[rows.length - 1].id;
+  // 游标推进到安全前沿而非返回结果的最大ID，防止跳过尚未完成的任务
   await prisma.collectionSnapshotCursor.update({
     where: { id: 1 },
-    data: { lastDispatchId: lastId },
+    data: { lastDispatchId: safeFrontier },
   });
 
   logger.info('[collection_snapshot] 增量刷新完成', {
     scanned: rows.length,
     changed,
     cursorFrom: cursor.lastDispatchId.toString(),
-    cursorTo: lastId.toString(),
+    cursorTo: safeFrontier.toString(),
+    safeFrontier: safeFrontier.toString(),
   });
 
   return { ok: true, scanned: rows.length, changed };
+}
+
+// 重置快照游标到0，触发全量补录
+// 适用场景：历史数据因游标跳跃Bug导致快照缺失，重置后增量刷新会从头扫描所有dispatch任务
+// 安全性：快照写入使用upsert（幂等），已有的集会被覆盖但数据不变，缺失的集会被补上
+export async function resetCollectionSnapshotCursor() {
+  const result = await prisma.collectionSnapshotCursor.update({
+    where: { id: 1 },
+    data: { lastDispatchId: BigInt(0) },
+  });
+
+  logger.info('[collection_snapshot] 游标已重置', {
+    lastDispatchId: result.lastDispatchId.toString(),
+  });
+
+  return { ok: true, lastDispatchId: result.lastDispatchId.toString() };
 }
