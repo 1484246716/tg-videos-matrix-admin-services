@@ -1715,6 +1715,7 @@ export async function handleCatalogJob(
             : [[] as CollectionCatalogEpisode[]];
         const existingDetailPages = existingNavState.detailPageMessageIds[name] ?? [];
         const publishedDetailPages: number[] = [];
+        const detailSecondPassRequired = new Set<number>();
         const detailOrphanCandidateIds = new Set<number>();
 
         const detailTexts: string[] = [];
@@ -1779,6 +1780,9 @@ export async function handleCatalogJob(
             if (selfHealEnabledOnRun && detailPublishResult.fallbackSent) selfHealFallbackCount += 1;
 
             publishedDetailPages.push(detailPublishResult.messageId);
+            if (detailPublishResult.isNewMessage || detailPublishResult.messageId !== existingDetailMessageId) {
+              detailSecondPassRequired.add(pageIndex + 1);
+            }
             writeHashRecord(nextHashState, {
               scope: 'collection_detail',
               collectionName: `${name}__firstpass`,
@@ -1806,14 +1810,14 @@ export async function handleCatalogJob(
               schemaVersion: hashSchemaVersion,
             });
             const detailSecondPassOldHash = readHashRecord(nextHashState, 'collection_detail', pageIndex + 1, name);
-            const shouldSkipDetailSecondPass = shouldSkipByHash({
-              enabled: TYPEC_HASH_GATE_ENABLED,
-              forceRepublish: hashForceRepublish,
-              existingMessageId: currentMessageId,
-              oldRecord: detailSecondPassOldHash,
-              newCombinedHash: detailSecondPassHash.combinedHash,
-              schemaVersion: hashSchemaVersion,
-            });
+          const shouldSkipDetailSecondPass = shouldSkipByHash({
+            enabled: TYPEC_HASH_GATE_ENABLED,
+            forceRepublish: hashForceRepublish,
+            existingMessageId: currentMessageId,
+            oldRecord: detailSecondPassOldHash,
+            newCombinedHash: detailSecondPassHash.combinedHash,
+            schemaVersion: hashSchemaVersion,
+          }) && !detailSecondPassRequired.has(pageIndex + 1);
 
             if (shouldSkipDetailSecondPass) {
               hashGateSkipCount += 1;
@@ -1903,6 +1907,7 @@ export async function handleCatalogJob(
       } else {
         const existingIndexPages = existingNavState.indexPageMessageIds;
         const publishedIndexPages: number[] = [];
+        const indexSecondPassRequired = new Set<number>();
         const indexOrphanCandidateIds = new Set<number>();
 
         for (let pageIndex = 0; pageIndex < indexPages.length; pageIndex += 1) {
@@ -1954,6 +1959,9 @@ export async function handleCatalogJob(
             if (selfHealEnabledOnRun && indexPublishResult.fallbackSent) selfHealFallbackCount += 1;
 
             publishedIndexPages.push(indexPublishResult.messageId);
+            if (indexPublishResult.isNewMessage || indexPublishResult.messageId !== existingIndexMessageId) {
+              indexSecondPassRequired.add(pageIndex + 1);
+            }
             writeHashRecord(nextHashState, {
               scope: 'collection_index',
               pageNo: pageIndex + 1,
@@ -1993,7 +2001,7 @@ export async function handleCatalogJob(
             oldRecord: indexSecondPassOldHash,
             newCombinedHash: indexSecondPassHash.combinedHash,
             schemaVersion: hashSchemaVersion,
-          });
+          }) && !indexSecondPassRequired.has(pageIndex + 1);
 
           if (shouldSkipIndexSecondPass) {
             hashGateSkipCount += 1;
@@ -2091,12 +2099,14 @@ export async function handleCatalogJob(
       }
     }
 
-    const mainCatalogContent = (() => {
-      const base = pageContents.join('\n\n');
-      if (!collectionNavEnabled || !collectionIndexLinkInMainCatalog) return base;
+    const mainCatalogPageContents = pageContents.map((pageText, index) => {
+      if (index !== 0 || !collectionNavEnabled || !collectionIndexLinkInMainCatalog) return pageText;
+      const base = pageText;
       const safeLink = escapeHtml(collectionIndexLinkInMainCatalog);
       return `${base}\n\n<a href="${safeLink}">📚 合集索引</a>`;
-    })();
+    });
+
+    const mainCatalogContent = mainCatalogPageContents.join('\n\n');
 
     const content = [mainCatalogContent, ...collectionSections].filter(Boolean).join('\n\n');
     const contentPreview = content.slice(0, 4000);
@@ -2109,6 +2119,7 @@ export async function handleCatalogJob(
       const channelAny = channel as any;
       const storedPageMessageIds = parseStoredPageMessageIds(channelAny.navPageMessageIds);
       const publishedPageMessageIds: number[] = [];
+      const mainSecondPassRequired = new Set<number>();
       const mainPageOrphanCandidateIds = new Set<number>();
       const existingMainNavMessageId = channel.navMessageId ? Number(channel.navMessageId) : null;
 
@@ -2132,7 +2143,7 @@ export async function handleCatalogJob(
         const publishResult = await publishCatalogMessage({
           botToken,
           chatId: channel.tgChatId,
-          text: mainCatalogContent,
+          text: mainCatalogPageContents[0] ?? mainCatalogContent,
           existingMessageId: existingMainNavMessageId,
           clearReplyMarkup: true,
         });
@@ -2158,7 +2169,7 @@ export async function handleCatalogJob(
         }
       } else {
         for (let pageIndex = 0; pageIndex < pageContents.length; pageIndex += 1) {
-          const pageText = pageIndex === 0 ? mainCatalogContent : pageContents[pageIndex];
+          const pageText = mainCatalogPageContents[pageIndex] ?? pageContents[pageIndex];
           const existingMainPageId = storedPageMessageIds[pageIndex] ?? null;
           const mainFirstPassHash = buildPageCombinedHash({
             text: pageText,
@@ -2191,6 +2202,9 @@ export async function handleCatalogJob(
           if (selfHealEnabledOnRun && publishResult.notModified) selfHealFixedCount += 1;
           if (selfHealEnabledOnRun && publishResult.fallbackSent) selfHealFallbackCount += 1;
           publishedPageMessageIds.push(publishResult.messageId);
+          if (publishResult.isNewMessage || publishResult.messageId !== existingMainPageId) {
+            mainSecondPassRequired.add(pageIndex + 1);
+          }
           writeHashRecord(nextHashState, {
             scope: 'main_catalog',
             pageNo: pageIndex + 1,
@@ -2200,7 +2214,7 @@ export async function handleCatalogJob(
         }
 
         for (let pageIndex = 0; pageIndex < pageContents.length; pageIndex += 1) {
-          const pageText = pageIndex === 0 ? mainCatalogContent : pageContents[pageIndex];
+          const pageText = mainCatalogPageContents[pageIndex] ?? pageContents[pageIndex];
           const mainSecondPassReplyMarkup = buildCatalogContentPageReplyMarkup({
             chatId: channel.tgChatId,
             currentPage: pageIndex + 1,
@@ -2220,7 +2234,7 @@ export async function handleCatalogJob(
             oldRecord: mainSecondPassOldHash,
             newCombinedHash: mainSecondPassHash.combinedHash,
             schemaVersion: hashSchemaVersion,
-          });
+          }) && !mainSecondPassRequired.has(pageIndex + 1);
 
           if (shouldSkipMainSecondPass) {
             hashGateSkipCount += 1;
