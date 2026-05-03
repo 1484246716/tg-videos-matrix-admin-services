@@ -1,6 +1,6 @@
 /**
- * ??????????????????????????????????
- * ?????collection-snapshot.worker -> refreshCollectionSnapshotIncremental -> collection snapshot ??????
+ * 合集快照增量刷新服务
+ * 链路：collection-snapshot.worker -> refreshCollectionSnapshotIncremental -> collection snapshot 表写入
  */
 
 import { TaskStatus } from '@prisma/client';
@@ -10,7 +10,11 @@ import {
 import { prisma } from '../infra/prisma';
 import { logger } from '../logger';
 
-// ??? normalize Collection Key ????????????????????????
+// 回看窗口：扫描最近1小时内变成success的任务，防止游标跳跃导致遗漏
+// 游标按ID推进时可能跳过尚未完成的任务，等这些任务变成success后，
+// 回看扫描通过 updatedAt 窗口捕获它们，确保最终一致
+const LOOKBACK_WINDOW_MS = 60 * 60 * 1000;
+
 function normalizeCollectionKey(name: string) {
   return name
     .normalize('NFKC')
@@ -18,14 +22,12 @@ function normalizeCollectionKey(name: string) {
     .trim();
 }
 
-// ?? get File Stem ?????????????????????
 function getFileStem(fileName: string) {
   const trimmed = fileName.trim();
   const stem = trimmed.replace(/\.[^./\\]+$/, '').trim();
   return stem || trimmed;
 }
 
-// ?? parse Collection Meta ????????????????????????
 function parseCollectionMeta(sourceMeta: unknown) {
   if (!sourceMeta || typeof sourceMeta !== 'object') return null;
   const meta = sourceMeta as Record<string, unknown>;
@@ -44,18 +46,22 @@ function parseCollectionMeta(sourceMeta: unknown) {
   return { collectionName, episodeNo };
 }
 
-// ??????????????????????????????
-// 任务终态集合：已结束不会再变更的状态
-// 修复前Bug：增量刷新用 status=success 过滤查询，却用返回结果的最大ID推进游标，
-// 导致中间尚未成功的任务ID被游标跳过，后续即使变成success也无法补录到快照表。
-// 例：游标=11291时，11292/11293还是running，查询只返回11294，游标直接跳到11294，
-// 等11292变成success后，下次查 id>11294，11292永远不会再被扫到。
-const TERMINAL_STATUSES = new Set<TaskStatus>([
-  TaskStatus.success,
-  TaskStatus.failed,
-  TaskStatus.cancelled,
-  TaskStatus.dead,
-]);
+// 前瞻扫描 + 回看扫描共用的 select 字段
+const DISPATCH_TASK_SELECT = {
+  id: true,
+  channelId: true,
+  finishedAt: true,
+  status: true,
+  updatedAt: true,
+  telegramMessageId: true,
+  telegramMessageLink: true,
+  mediaAsset: {
+    select: {
+      originalName: true,
+      sourceMeta: true,
+    },
+  },
+} as const;
 
 export async function refreshCollectionSnapshotIncremental() {
   const cursor = await prisma.collectionSnapshotCursor.upsert({
@@ -65,53 +71,77 @@ export async function refreshCollectionSnapshotIncremental() {
     select: { id: true, lastDispatchId: true },
   });
 
-  // 修复：不再用 status=success 过滤查询，改为查出所有任务后按ID顺序判断
+  // === 前瞻扫描：按ID顺序从游标位置向后扫描 ===
+  // 不再按 status=success 过滤，避免原始Bug：
+  // 旧逻辑用 status=success 过滤查询，却用返回结果的最大ID推进游标，
+  // 导致中间尚未成功的任务ID被游标跳过，后续即使变成success也无法补录。
+  // 例：游标=11291时，11292/11293还是running，查询只返回11294，游标直接跳到11294，
+  // 等11292变成success后，下次查 id>11294，11292永远不会再被扫到。
   const rows = await prisma.dispatchTask.findMany({
     where: {
       id: { gt: cursor.lastDispatchId },
     },
     orderBy: { id: 'asc' },
     take: COLLECTION_SNAPSHOT_INCREMENTAL_BATCH_SIZE,
-    select: {
-      id: true,
-      channelId: true,
-      finishedAt: true,
-      status: true,
-      telegramMessageId: true,
-      telegramMessageLink: true,
-      mediaAsset: {
-        select: {
-          originalName: true,
-          sourceMeta: true,
-        },
-      },
-    },
+    select: DISPATCH_TASK_SELECT,
   });
 
   if (rows.length === 0) {
-    return { ok: true, scanned: 0, changed: 0 };
+    return { ok: true, scanned: 0, changed: 0, forwardChanged: 0, lookbackChanged: 0 };
   }
 
-  // 计算安全前沿：从游标位置开始，按ID顺序遍历，遇到非终态任务就停止
-  // 游标只能推进到连续终态任务的最大ID，确保尚未完成的任务不会被跳过
-  let safeFrontier = cursor.lastDispatchId;
-  for (const row of rows) {
-    if (!TERMINAL_STATUSES.has(row.status)) break;
-    safeFrontier = row.id;
-  }
+  // 游标推进到本批最大ID（不再用safeFrontier停等）
+  // 被跳过的活跃任务后续变成success后，由回看扫描兜底补录
+  const newCursor = rows[rows.length - 1].id;
 
-  // 只处理安全前沿内的success任务（终态中只有success需要写入快照）
-  const processableRows = rows.filter(
+  // 前瞻结果中，只有success且已发送的任务才写入快照
+  const forwardRows = rows.filter(
     (r) =>
-      r.id <= safeFrontier &&
       r.status === TaskStatus.success &&
       r.telegramMessageId !== null,
   );
 
+  // === 回看扫描：捕获最近1小时内变成success的任务 ===
+  // 无论任务ID在游标前还是游标后，只要 updatedAt 在窗口内就扫描
+  // 这确保了：即使游标曾经跳过某个任务，当它变成success后也能被补录
+  const lookbackSince = new Date(Date.now() - LOOKBACK_WINDOW_MS);
+  const lookbackRows = await prisma.dispatchTask.findMany({
+    where: {
+      status: TaskStatus.success,
+      telegramMessageId: { not: null },
+      updatedAt: { gt: lookbackSince },
+    },
+    orderBy: { id: 'asc' },
+    take: COLLECTION_SNAPSHOT_INCREMENTAL_BATCH_SIZE,
+    select: DISPATCH_TASK_SELECT,
+  });
+
+  // 合并去重：前瞻 + 回看
+  const seenIds = new Set<string>();
+  const mergedRows: typeof rows = [];
+  for (const r of forwardRows) {
+    const key = r.id.toString();
+    if (!seenIds.has(key)) {
+      seenIds.add(key);
+      mergedRows.push(r);
+    }
+  }
+  for (const r of lookbackRows) {
+    const key = r.id.toString();
+    if (!seenIds.has(key)) {
+      seenIds.add(key);
+      mergedRows.push(r);
+    }
+  }
+  const lookbackOnlyCount = mergedRows.length - forwardRows.length;
+
   let changed = 0;
+  let forwardChanged = 0;
+  let lookbackChanged = 0;
+  const forwardIdSet = new Set(forwardRows.map((r) => r.id.toString()));
   const changedHeadKeys = new Set<string>();
 
-  for (const row of processableRows) {
+  for (const row of mergedRows) {
     const meta = parseCollectionMeta(row.mediaAsset?.sourceMeta);
     if (!meta) continue;
 
@@ -150,6 +180,11 @@ export async function refreshCollectionSnapshotIncremental() {
     });
 
     changed += 1;
+    if (forwardIdSet.has(row.id.toString())) {
+      forwardChanged += 1;
+    } else {
+      lookbackChanged += 1;
+    }
     changedHeadKeys.add(`${row.channelId.toString()}::${collectionNameNormalized}`);
   }
 
@@ -208,21 +243,23 @@ export async function refreshCollectionSnapshotIncremental() {
     });
   }
 
-  // 游标推进到安全前沿而非返回结果的最大ID，防止跳过尚未完成的任务
+  // 游标推进到本批最大ID
   await prisma.collectionSnapshotCursor.update({
     where: { id: 1 },
-    data: { lastDispatchId: safeFrontier },
+    data: { lastDispatchId: newCursor },
   });
 
   logger.info('[collection_snapshot] 增量刷新完成', {
     scanned: rows.length,
     changed,
+    forwardChanged,
+    lookbackChanged,
+    lookbackOnlyCount,
     cursorFrom: cursor.lastDispatchId.toString(),
-    cursorTo: safeFrontier.toString(),
-    safeFrontier: safeFrontier.toString(),
+    cursorTo: newCursor.toString(),
   });
 
-  return { ok: true, scanned: rows.length, changed };
+  return { ok: true, scanned: rows.length, changed, forwardChanged, lookbackChanged };
 }
 
 // 重置快照游标到0，触发全量补录
