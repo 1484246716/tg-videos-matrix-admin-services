@@ -1810,7 +1810,7 @@ export async function handleCatalogJob(
               schemaVersion: hashSchemaVersion,
             });
             const detailSecondPassOldHash = readHashRecord(nextHashState, 'collection_detail', pageIndex + 1, name);
-          const shouldSkipDetailSecondPass = selfHealOnly
+          const shouldSkipDetailSecondPass = options?.selfHealOnly
             ? (shouldSkipByHash({
                 enabled: TYPEC_HASH_GATE_ENABLED,
                 forceRepublish: hashForceRepublish,
