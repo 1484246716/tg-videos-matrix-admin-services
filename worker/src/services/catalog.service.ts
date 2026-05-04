@@ -1810,7 +1810,16 @@ export async function handleCatalogJob(
               schemaVersion: hashSchemaVersion,
             });
             const detailSecondPassOldHash = readHashRecord(nextHashState, 'collection_detail', pageIndex + 1, name);
-          const shouldSkipDetailSecondPass = false;
+          const shouldSkipDetailSecondPass = selfHealOnly
+            ? (shouldSkipByHash({
+                enabled: TYPEC_HASH_GATE_ENABLED,
+                forceRepublish: hashForceRepublish,
+                existingMessageId: currentMessageId,
+                oldRecord: detailSecondPassOldHash,
+                newCombinedHash: detailSecondPassHash.combinedHash,
+                schemaVersion: hashSchemaVersion,
+              }) && !detailSecondPassRequired.has(pageIndex + 1))
+            : false;
 
             if (shouldSkipDetailSecondPass) {
               hashGateSkipCount += 1;
