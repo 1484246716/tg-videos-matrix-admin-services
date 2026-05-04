@@ -1607,7 +1607,7 @@ export async function handleCatalogJob(
       channelNavPageSize: navPageSize,
       regularVideoCount: videos.length,
     });
-    const videoPages = navPagingEnabled ? chunkVideos(videos, navPageSize) : [videos];
+    const videoPages = (navPagingEnabled && videos.length > 0) ? chunkVideos(videos, navPageSize) : [videos];
     const pageContents = videoPages.map((pageVideos, index) =>
       renderCatalogPageContent({
         navTemplateText: channel.navTemplateText!,
@@ -1810,14 +1810,7 @@ export async function handleCatalogJob(
               schemaVersion: hashSchemaVersion,
             });
             const detailSecondPassOldHash = readHashRecord(nextHashState, 'collection_detail', pageIndex + 1, name);
-          const shouldSkipDetailSecondPass = shouldSkipByHash({
-            enabled: TYPEC_HASH_GATE_ENABLED,
-            forceRepublish: hashForceRepublish,
-            existingMessageId: currentMessageId,
-            oldRecord: detailSecondPassOldHash,
-            newCombinedHash: detailSecondPassHash.combinedHash,
-            schemaVersion: hashSchemaVersion,
-          }) && !detailSecondPassRequired.has(pageIndex + 1);
+          const shouldSkipDetailSecondPass = false;
 
             if (shouldSkipDetailSecondPass) {
               hashGateSkipCount += 1;
