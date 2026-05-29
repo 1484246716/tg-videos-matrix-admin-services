@@ -15,6 +15,7 @@ import {
   scanChannelVideos,
   waitForFileStable,
 } from '../shared/file-utils';
+import { parseEpisodeNoFromText } from '../shared/collection-episode';
 import { tryAcquireRelayPathLock, releaseRelayPathLock } from '../shared/relay-path-lock';
 import { TYPEA_INGEST_ERROR_CODE, TYPEA_INGEST_FINAL_REASON } from '../shared/metrics';
 
@@ -193,21 +194,7 @@ function parseCollectionMeta(filePath: string) {
   const collectionName = parts[0];
   const fileName = parts[parts.length - 1];
 
-  const patterns = [
-    /\[第\s*(\d+)\s*(?:集|话|話)\]/,
-    /第\s*(\d+)\s*(?:集|话|話)/,
-    /S\d+E(\d+)/i,
-  ];
-
-  let episodeNo: number | null = null;
-  for (const pattern of patterns) {
-    const match = fileName.match(pattern);
-    if (!match || !match[1]) continue;
-    const parsed = Number(match[1]);
-    if (!Number.isFinite(parsed) || parsed <= 0) continue;
-    episodeNo = parsed;
-    break;
-  }
+  const episodeNo = parseEpisodeNoFromText(fileName);
 
   const episodeParseFailed = episodeNo === null;
   const orderKey = `${collectionName}#${episodeNo ? String(episodeNo).padStart(4, '0') : '0000'}`;

@@ -25,6 +25,7 @@ import { dispatchQueue } from '../infra/redis';
 import { logger } from '../logger';
 import { catalogSourceWriteMetrics } from '../shared/metrics';
 import { releaseChannelLock, tryAcquireChannelLock } from '../shared/channel-lock';
+import { parseEpisodeNoFromText } from '../shared/collection-episode';
 import { updateTaskDefinitionRunStatus } from '../services/task-definition.service';
 
 /**
@@ -69,27 +70,6 @@ type DispatchGroupTaskUpsertResult = {
   sealedAt: Date | null;
   sealReason: string | null;
 };
-
-/**
- * 从文件名/文本中尽量解析 episodeNo（用于合集集号解析失败的兜底修复）。
- * 注意：这里只是“尝试性”解析，不保证覆盖所有命名风格。
- */
-function parseEpisodeNoFromText(text: string) {
-  const patterns = [
-    /\[第\s*(\d+)\s*(?:集|话|話)\]/,
-    /第\s*(\d+)\s*(?:集|话|話)/,
-    /S\d+E(\d+)/i,
-  ];
-
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (!match || !match[1]) continue;
-    const parsed = Number(match[1]);
-    if (!Number.isFinite(parsed) || parsed <= 0) continue;
-    return parsed;
-  }
-  return null;
-}
 
 /**
  * 频道发送频率控制：根据 lastPostAt + postIntervalSec 计算下次允许派发时间。

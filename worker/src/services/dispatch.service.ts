@@ -15,6 +15,7 @@ import {
 import { prisma, withPrismaRetry } from '../infra/prisma';
 import { searchIndexQueue } from '../infra/redis';
 import { logger, logError } from '../logger';
+import { formatCollectionEpisodeTitle } from '../shared/collection-episode';
 import { getBackoffSeconds } from '../shared/dispatch-utils';
 import { catalogSourceWriteMetrics } from '../shared/metrics';
 import { sendPhotoByTelegram, sendTelegramRequest, sendVideoByTelegram, TelegramError, TelegramResponse, TelegramSendResult } from '../shared/telegram';
@@ -135,8 +136,18 @@ function getCollectionDisplayName(name: string) {
 }
 
 // 构建合集集标题
-function buildCollectionEpisodeTitle(collectionName: string, episodeNo: number) {
-  return `${getCollectionDisplayName(collectionName)}第${episodeNo}集`;
+function buildCollectionEpisodeTitle(args: {
+  collectionName: string;
+  episodeNo: number;
+  sourceTitle?: string | null;
+  templateText?: string | null;
+}) {
+  return formatCollectionEpisodeTitle({
+    collectionName: getCollectionDisplayName(args.collectionName),
+    episodeNo: args.episodeNo,
+    sourceTitle: args.sourceTitle,
+    templateText: args.templateText,
+  });
 }
 
 // 将集标题应用到文案中
@@ -1807,10 +1818,35 @@ export async function handleDispatchJob(
     const isCollectionAsset = collectionMeta.isCollection;
     const collectionName = collectionMeta.collectionName ?? '';
     const episodeNo = collectionMeta.episodeNo;
+    const collectionNameNormalized = collectionName
+      ? collectionName.normalize('NFKC').replace(/\s+/g, ' ').trim()
+      : '';
+    const collectionRecord =
+      isCollectionAsset && collectionName && episodeNo !== null
+        ? await prisma.collection.findFirst({
+            where: {
+              channelId: task.channelId,
+              nameNormalized: collectionNameNormalized,
+            },
+            select: {
+              id: true,
+              templateText: true,
+            },
+          })
+        : null;
+    const collectionEpisodeTitle =
+      isCollectionAsset && collectionName && episodeNo !== null
+        ? buildCollectionEpisodeTitle({
+            collectionName,
+            episodeNo,
+            sourceTitle: originalNameStem,
+            templateText: collectionRecord?.templateText ?? null,
+          })
+        : null;
 
     const enhancedCollectionVideoName =
       isCollectionAsset && collectionName && episodeNo !== null
-        ? `${buildCollectionEpisodeTitle(collectionName, episodeNo)} ${originalNameStem}`.trim()
+        ? `${collectionEpisodeTitle} ${originalNameStem}`.trim()
         : null;
 
     const aiSearchVideoName = enhancedCollectionVideoName ?? originalNameStem;
@@ -1822,9 +1858,9 @@ export async function handleDispatchJob(
           `基础视频名：${task.mediaAsset.originalName}`,
           `增强视频名：${aiSearchVideoName}`,
           `合集名：${collectionName}`,
-          `集数：第${episodeNo}集`,
+          `集数标题：${collectionEpisodeTitle}`,
           runtimeHint,
-          '要求：必须优先依据“增强视频名（合集名+第N集+视频名）”进行搜索与理解，再按系统提示词要求的格式输出；禁止编造。',
+          '要求：必须优先依据“增强视频名（合集标题+视频名）”进行搜索与理解，再按系统提示词要求的格式输出；禁止编造。',
         ].join('\n')
         : [
           '请为这个视频生成文案。',
@@ -1889,7 +1925,12 @@ export async function handleDispatchJob(
     if (isCollectionAsset && collectionName && episodeNo !== null) {
       finalCaption = applyCollectionEpisodeTitle(
         finalCaption || '',
-        buildCollectionEpisodeTitle(collectionName, episodeNo),
+        collectionEpisodeTitle || buildCollectionEpisodeTitle({
+          collectionName,
+          episodeNo,
+          sourceTitle: originalNameStem,
+          templateText: collectionRecord?.templateText ?? null,
+        }),
       );
     }
 
@@ -2133,19 +2174,7 @@ export async function handleDispatchJob(
       // 使 catalog_publish 新内容检测（查 collectionEpisode.updatedAt）能感知到变更
       if (collectionName && episodeNo !== null) {
         try {
-          // 通过 channelId + nameNormalized 查找对应 Collection
-          const collectionNameNormalized = collectionName
-            .normalize('NFKC')
-            .replace(/\s+/g, ' ')
-            .trim();
-
-          const collection = await prisma.collection.findFirst({
-            where: {
-              channelId: task.channelId,
-              nameNormalized: collectionNameNormalized,
-            },
-            select: { id: true },
-          });
+          const collection = collectionRecord;
 
           if (collection) {
             const fileNameSnapshot = getFileStem(task.mediaAsset.originalName) || `第${episodeNo}集`;
