@@ -11,8 +11,10 @@ RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.li
 RUN apt-get update -y && apt-get install -y openssl ffmpeg
 
 # 2. Pin pnpm so Docker and local installs use the same behavior.
-RUN corepack enable && corepack prepare pnpm@10.28.2 --activate
-RUN pnpm config set registry https://registry.npmmirror.com
+# Node 25 slim images do not always include Corepack, so install pnpm explicitly.
+RUN npm config set registry https://registry.npmmirror.com && \
+    npm install -g pnpm@10.28.2 && \
+    pnpm config set registry https://registry.npmmirror.com
 
 # 3. Copy workspace manifests first to maximize Docker layer cache hits.
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
