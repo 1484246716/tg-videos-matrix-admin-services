@@ -1428,16 +1428,6 @@ export async function handleCatalogJob(
         });
 
         if (sourceRows.length === 0) {
-          if (catalogTaskId) {
-            await prisma.catalogTask.update({
-              where: { id: catalogTaskId },
-              data: {
-                status: CatalogTaskStatus.cancelled,
-                finishedAt: new Date(),
-                errorMessage: '没有可用的目录投影记录',
-              },
-            });
-          }
           return [] as CatalogVideo[];
         }
 
@@ -1596,6 +1586,33 @@ export async function handleCatalogJob(
         .map((item) => item.name),
       filtered_collections: filteredCollections,
     });
+
+    if (videos.length === 0 && collectionConfigs.length === 0) {
+      catalogMetrics.publishRunSkippedTotal += 1;
+      logger.info('[q_catalog] 跳过执行：没有可用的目录数据', {
+        runId,
+        channelId: channelIdRaw,
+        triggerType,
+        reason: 'no_available_catalog_data',
+        dataSource: TYPEC_READ_FROM_CATALOG_SOURCE ? 'catalog_source_item' : 'dispatch_task',
+        collectionEpisodeCount: collectionEpisodesAll.length,
+      });
+
+      if (catalogTaskId) {
+        await prisma.catalogTask.update({
+          where: { id: catalogTaskId },
+          data: {
+            status: CatalogTaskStatus.cancelled,
+            finishedAt: new Date(),
+            errorMessage: TYPEC_READ_FROM_CATALOG_SOURCE
+              ? '没有可用的目录数据（普通目录投影和合集均为空）'
+              : '没有可用的目录数据（成功分发记录和合集均为空）',
+          },
+        });
+      }
+
+      return { ok: true, skipped: true, reason: '没有可用的目录数据' };
+    }
 
     const navPageSize = Math.max(1, Math.min(100, (channel as any).navPageSize ?? 10));
     const navPagingEnabled = typeof (channel as any).navPagingEnabled === 'boolean'

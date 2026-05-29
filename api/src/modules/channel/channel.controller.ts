@@ -54,6 +54,15 @@ export class ChannelController {
     return this.channelService.create(dto, req.user.userId, req.user.role);
   }
 
+  @Permissions('channels:delete')
+  @Post('clear-folders')
+  clearRealFolders(
+    @Body() body: { ids?: string[]; skipMinAgeCheck?: boolean },
+    @Request() req: AuthRequest,
+  ) {
+    return this.channelService.clearRealFolders(body, req.user.userId, req.user.role);
+  }
+
   @Permissions('channels:update')
   @Patch('batch')
   batchUpdate(
@@ -144,6 +153,12 @@ export class ChannelController {
   @Post(':id/catalog-repair')
   repairCatalog(@Param('id') id: string, @Request() req: AuthRequest) {
     return this.channelService.repairCatalog(id, req.user.userId, req.user.role);
+  }
+
+  @Permissions('channels:update')
+  @Post(':id/recreate-folder')
+  recreateFolder(@Param('id') id: string, @Request() req: AuthRequest) {
+    return this.channelService.recreateFolder(id, req.user.userId, req.user.role);
   }
 
   @Permissions('channels:delete')

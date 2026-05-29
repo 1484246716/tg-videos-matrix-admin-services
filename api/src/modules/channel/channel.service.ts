@@ -7,10 +7,10 @@ import {
   HttpException,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { Prisma } from '@prisma/client';
+import { CloneDownloadStatus, MediaStatus, Prisma } from '@prisma/client';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
-import { access, mkdir, rename, rm } from 'node:fs/promises';
-import { dirname, normalize, resolve } from 'node:path';
+import { access, mkdir, rename, rm, stat } from 'node:fs/promises';
+import { dirname, isAbsolute, normalize, relative, resolve } from 'node:path';
 import { ContentTaxonomyService } from '../content-taxonomy/content-taxonomy.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateChannelDto } from './dto/create-channel.dto';
@@ -21,6 +21,7 @@ import IORedis from 'ioredis';
 
 @Injectable()
 export class ChannelService {
+  private readonly clearFolderMinAgeMs = 3 * 24 * 60 * 60 * 1000;
   private catalogQueue: Queue | null = null;
   private redisConnection: IORedis | null = null;
 
@@ -143,7 +144,12 @@ export class ChannelService {
   private getChannelsRootDir() {
     const raw = (process.env.CHANNELS_ROOT_DIR || './data/channels').trim();
 
-    if (/^\/[a-zA-Z]/.test(raw)) {
+    if (process.platform === 'win32' && /^\/[a-zA-Z](?:\/|$)/.test(raw)) {
+      const driveStyle = raw.match(/^\/([a-zA-Z])\/(.+)$/);
+      if (driveStyle?.[1] && driveStyle?.[2]) {
+        return resolve(`${driveStyle[1]}:/${driveStyle[2]}`);
+      }
+
       const driveRelative = raw.replace(/^\//, '');
       const workspaceRoot = resolve(process.cwd(), '..', '..');
       return resolve(workspaceRoot, driveRelative);
@@ -152,34 +158,74 @@ export class ChannelService {
     return resolve(raw);
   }
 
+  private normalizePortablePath(input: string) {
+    return input
+      .trim()
+      .replace(/\\/g, '/')
+      .replace(/\/+/g, '/')
+      .replace(/\/+$/, '');
+  }
+
+  private portablePathSegments(input: string) {
+    return this.normalizePortablePath(input)
+      .replace(/^[a-zA-Z]:/, '')
+      .replace(/^\/+/, '')
+      .split('/')
+      .filter(Boolean);
+  }
+
+  private getRelativePathFromPortableRoot(inputPath: string, rootPath: string) {
+    const normalizedInput = this.normalizePortablePath(inputPath);
+    const normalizedRoot = this.normalizePortablePath(rootPath);
+    const inputForCompare = process.platform === 'win32' ? normalizedInput.toLowerCase() : normalizedInput;
+    const rootForCompare = process.platform === 'win32' ? normalizedRoot.toLowerCase() : normalizedRoot;
+
+    if (inputForCompare === rootForCompare) return '';
+    if (inputForCompare.startsWith(`${rootForCompare}/`)) {
+      return normalizedInput.slice(normalizedRoot.length + 1);
+    }
+
+    const inputSegments = this.portablePathSegments(normalizedInput);
+    const rootSegments = this.portablePathSegments(normalizedRoot);
+    const comparableInputSegments = inputSegments.map((segment) => segment.toLowerCase());
+    const comparableRootSegments = rootSegments.map((segment) => segment.toLowerCase());
+
+    for (let i = 0; i <= inputSegments.length - rootSegments.length; i += 1) {
+      const matched = comparableRootSegments.every(
+        (segment, idx) => comparableInputSegments[i + idx] === segment,
+      );
+      if (matched) {
+        return inputSegments.slice(i + rootSegments.length).join('/');
+      }
+    }
+
+    return null;
+  }
+
   private resolveChannelFolderPath(folderPath: string, options?: { allowLegacyAbsolute?: boolean }) {
     const root = this.getChannelsRootDir();
-    const normalizedInput = normalize(folderPath.trim().replace(/\\/g, '/'));
+    const normalizedInput = this.normalizePortablePath(folderPath);
 
     if (!normalizedInput) {
       throw new ConflictException('目录路径不能为空');
     }
 
-    const isDriveAbsolute = /^[a-zA-Z]:[\\/]/.test(normalizedInput);
+    const isDriveAbsolute = /^[a-zA-Z]:\//.test(normalizedInput);
+    const rootRelativeFromAbsolute = this.getRelativePathFromPortableRoot(normalizedInput, root);
+    const isRootAbsolute = normalizedInput.startsWith('/') && rootRelativeFromAbsolute !== null;
+    const isPortableAbsolute = isDriveAbsolute || isRootAbsolute;
 
-    if (isDriveAbsolute) {
+    if (isPortableAbsolute) {
       if (!options?.allowLegacyAbsolute) {
-        throw new ConflictException('目录路径不合法，禁止使用盘符绝对路径');
+        throw new ConflictException('目录路径不合法，禁止使用绝对路径');
       }
 
-      const absolutePath = resolve(normalizedInput);
-      const safeRoot = root.endsWith('\/') ? root : `${root}/`;
-      const safeRootWin = root.endsWith('\\') ? root : `${root}\\`;
-
-      if (
-        absolutePath !== root &&
-        !absolutePath.startsWith(safeRoot) &&
-        !absolutePath.startsWith(safeRootWin)
-      ) {
+      const rootRelativePath = rootRelativeFromAbsolute;
+      if (rootRelativePath === null) {
         throw new ConflictException('目录路径不合法，禁止越权访问');
       }
 
-      return absolutePath;
+      return resolve(root, rootRelativePath);
     }
 
     const relativePath = normalizedInput.replace(/^[\\/]+/, '');
@@ -237,6 +283,126 @@ export class ChannelService {
   private async removeFolder(folderPath: string) {
     const target = this.resolveChannelFolderPath(folderPath);
     await rm(target, { recursive: true, force: true });
+  }
+
+  private isPathInside(parentPath: string, targetPath: string) {
+    const parent = resolve(parentPath);
+    const target = resolve(targetPath);
+    const relativePath = relative(parent, target);
+    return relativePath === '' || (!!relativePath && !relativePath.startsWith('..') && !isAbsolute(relativePath));
+  }
+
+  private async clearFolderOnly(folderPath: string, options?: { skipMinAgeCheck?: boolean }) {
+    const root = this.getChannelsRootDir();
+    const target = this.resolveChannelFolderPath(folderPath, { allowLegacyAbsolute: true });
+
+    if (target === root) {
+      throw new ConflictException('禁止清除频道根目录');
+    }
+
+    let targetStat: Awaited<ReturnType<typeof stat>>;
+    try {
+      targetStat = await stat(target);
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') {
+        return target;
+      }
+      throw error;
+    }
+
+    if (!targetStat.isDirectory()) {
+      throw new ConflictException('真实路径不是目录，拒绝清除');
+    }
+
+    if (!options?.skipMinAgeCheck) {
+      const ageMs = Date.now() - targetStat.mtimeMs;
+      if (ageMs < this.clearFolderMinAgeMs) {
+        const availableAt = new Date(targetStat.mtimeMs + this.clearFolderMinAgeMs).toISOString();
+        throw new ConflictException(`真实目录最后修改时间未超过 3 天，暂不允许清除，可清除时间: ${availableAt}`);
+      }
+    }
+
+    await rm(target, { recursive: true, force: true });
+    return target;
+  }
+
+  private async assertNoInFlightMediaJobs(channel: { id: bigint; folderPath: string }) {
+    const uploadingCount = await this.prisma.mediaAsset.count({
+      where: {
+        channelId: channel.id,
+        status: MediaStatus.ingesting,
+      },
+    });
+
+    if (uploadingCount > 0) {
+      throw new ConflictException(`该频道存在 ${uploadingCount} 个视频正在上传，暂不允许清除真实目录`);
+    }
+
+    const channelDir = this.resolveChannelFolderPath(channel.folderPath, { allowLegacyAbsolute: true });
+    const channelDirSlash = channelDir.replace(/\\/g, '/').replace(/\/+$/, '');
+    const channelDirBackslash = channelDir.replace(/\//g, '\\').replace(/\\+$/, '');
+
+    const activeDownloadStatuses: CloneDownloadStatus[] = [
+      CloneDownloadStatus.queued,
+      CloneDownloadStatus.downloading,
+    ];
+
+    const cloneTasks = await this.prisma.cloneCrawlTask.findMany({
+      where: {
+        targetPath: channel.folderPath,
+      },
+      select: { id: true },
+    });
+
+    const downloadingCount = await this.prisma.cloneCrawlItem.count({
+      where: {
+        downloadStatus: { in: activeDownloadStatuses },
+        OR: [
+          ...(cloneTasks.length > 0
+            ? [{ taskId: { in: cloneTasks.map((task) => task.id) } }]
+            : []),
+          { localPath: { startsWith: `${channelDirSlash}/` } },
+          { localPath: { startsWith: `${channelDirBackslash}\\` } },
+        ],
+      },
+    });
+
+    if (downloadingCount > 0) {
+      throw new ConflictException(`该频道存在 ${downloadingCount} 个视频正在下载或等待下载，暂不允许清除真实目录`);
+    }
+  }
+
+  private async recreateFolderWithCollections(channel: {
+    folderPath: string;
+    collections: Array<{ name: string; nameNormalized: string }>;
+  }) {
+    const channelDir = this.resolveChannelFolderPath(channel.folderPath, { allowLegacyAbsolute: true });
+    await mkdir(channelDir, { recursive: true });
+
+    const collectionDirs: string[] = [];
+    if (channel.collections.length > 0) {
+      const collectionRoot = resolve(channelDir, 'Collection');
+      if (!this.isPathInside(channelDir, collectionRoot)) {
+        throw new ConflictException('合集目录路径不合法');
+      }
+
+      await mkdir(collectionRoot, { recursive: true });
+
+      for (const collection of channel.collections) {
+        const collectionName = (collection.nameNormalized || collection.name || '').trim();
+        if (!collectionName) continue;
+
+        const collectionDir = resolve(collectionRoot, collectionName);
+        if (!this.isPathInside(collectionRoot, collectionDir)) {
+          throw new ConflictException(`合集目录路径不合法: ${collectionName}`);
+        }
+
+        await mkdir(collectionDir, { recursive: true });
+        collectionDirs.push(collectionDir);
+      }
+    }
+
+    return { channelDir, collectionDirs };
   }
 
   async list(
@@ -938,6 +1104,133 @@ export class ChannelService {
       selfHealOnly: true,
       jobId,
       runId,
+    };
+  }
+
+  async clearRealFolders(body: { ids?: string[]; skipMinAgeCheck?: boolean }, userId?: string, role?: string) {
+    const ids = Array.isArray(body?.ids)
+      ? body.ids.map((id) => String(id).trim()).filter(Boolean)
+      : [];
+
+    if (ids.length === 0) {
+      throw new BadRequestException('请选择需要清除真实目录的频道');
+    }
+
+    const uniqueIds = [...new Set(ids)];
+    const skipMinAgeCheck = body?.skipMinAgeCheck === true && uniqueIds.length === 1;
+    const channelIds = uniqueIds.map((id) => this.parseSafeBigInt(id));
+    if (channelIds.some((id) => id === null)) {
+      throw new BadRequestException('频道 ID 不合法');
+    }
+
+    const channels = await this.prisma.channel.findMany({
+      where:
+        role === 'admin'
+          ? { id: { in: channelIds as bigint[] } }
+          : {
+              id: { in: channelIds as bigint[] },
+              createdBy: userId ? BigInt(userId) : undefined,
+            },
+      select: {
+        id: true,
+        name: true,
+        folderPath: true,
+      },
+    });
+
+    if (channels.length !== uniqueIds.length) {
+      throw new NotFoundException('部分频道不存在或无权限操作');
+    }
+
+    const results: Array<{
+      channelId: string;
+      channelName: string;
+      folderPath: string;
+      absolutePath?: string;
+      ok: boolean;
+      error?: string;
+    }> = [];
+
+    for (const channel of channels) {
+      try {
+        await this.assertNoInFlightMediaJobs({
+          id: channel.id,
+          folderPath: channel.folderPath,
+        });
+        const absolutePath = await this.clearFolderOnly(channel.folderPath, { skipMinAgeCheck });
+        await this.prisma.channel.update({
+          where: { id: channel.id },
+          data: { status: 'paused' },
+        });
+        results.push({
+          channelId: channel.id.toString(),
+          channelName: channel.name,
+          folderPath: channel.folderPath,
+          absolutePath,
+          ok: true,
+        });
+      } catch (error) {
+        results.push({
+          channelId: channel.id.toString(),
+          channelName: channel.name,
+          folderPath: channel.folderPath,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return {
+      ok: results.every((item) => item.ok),
+      requested: uniqueIds.length,
+      cleared: results.filter((item) => item.ok).length,
+      failed: results.filter((item) => !item.ok).length,
+      results,
+    };
+  }
+
+  async recreateFolder(id: string, userId?: string, role?: string) {
+    const channelId = this.parseSafeBigInt(id);
+    if (!channelId) {
+      throw new BadRequestException('频道 ID 不合法');
+    }
+
+    const channel = await this.prisma.channel.findFirst({
+      where:
+        role === 'admin'
+          ? { id: channelId }
+          : { id: channelId, createdBy: userId ? BigInt(userId) : undefined },
+      select: {
+        id: true,
+        name: true,
+        folderPath: true,
+        collections: {
+          select: {
+            name: true,
+            nameNormalized: true,
+          },
+        },
+      },
+    });
+
+    if (!channel) {
+      throw new NotFoundException('channel not found');
+    }
+
+    const recreated = await this.recreateFolderWithCollections(channel);
+    await this.prisma.channel.update({
+      where: { id: channel.id },
+      data: { status: 'active' },
+    });
+
+    return {
+      ok: true,
+      channelId: channel.id.toString(),
+      channelName: channel.name,
+      folderPath: channel.folderPath,
+      absolutePath: recreated.channelDir,
+      collectionFolderCount: recreated.collectionDirs.length,
+      collectionFolders: recreated.collectionDirs,
     };
   }
 
