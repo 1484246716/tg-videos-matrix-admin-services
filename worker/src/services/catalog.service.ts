@@ -1281,7 +1281,7 @@ export async function handleCatalogJob(
       // 注意：需同时感知普通视频（catalogSourceItem）和合集视频（collectionEpisode）两种更新来源
       if (channel.lastNavUpdateAt && triggerType !== 'manual_repair') {
         let hasNewItem: { id: unknown } | null = null;
-        let newItemSource: 'catalog_source_item' | 'collection_episode' | 'dispatch_task' | null = null;
+        let newItemSource: 'catalog_source_item' | 'collection_episode' | 'collection_snapshot' | 'dispatch_task' | null = null;
 
         if (TYPEC_READ_FROM_CATALOG_SOURCE) {
           // 1. 优先查普通视频/图集（catalogSourceItem）
@@ -1310,6 +1310,20 @@ export async function handleCatalogJob(
             if (newCollectionEpisode) {
               hasNewItem = newCollectionEpisode;
               newItemSource = 'collection_episode';
+            } else {
+              const rebuiltCollectionSnapshot = await prisma.collectionSnapshot.findFirst({
+                where: {
+                  channelId,
+                  isDeleted: false,
+                  lastRebuildAt: { gt: channel.lastNavUpdateAt },
+                },
+                select: { id: true },
+              });
+
+              if (rebuiltCollectionSnapshot) {
+                hasNewItem = rebuiltCollectionSnapshot;
+                newItemSource = 'collection_snapshot';
+              }
             }
           }
         } else {
@@ -1338,14 +1352,8 @@ export async function handleCatalogJob(
             triggerType,
             reason: 'no_new_records_since_last_update',
             checkedSources: TYPEC_READ_FROM_CATALOG_SOURCE
-              ? ['catalog_source_item', 'collection_episode']
+              ? ['catalog_source_item', 'collection_episode', 'collection_snapshot']
               : ['dispatch_task'],
-          });
-
-          // 更新 lastNavUpdateAt，让频道重新进入下一个间隔等待，防止在接下来的几十分钟内每秒查一遍库
-          await prisma.channel.update({
-            where: { id: channelId },
-            data: { lastNavUpdateAt: guardNow },
           });
 
           return { ok: true, skipped: true, reason: '没有新视频产生，跳过更新' };
@@ -1772,9 +1780,21 @@ export async function handleCatalogJob(
           detailTexts.push(detailText);
 
           const existingDetailMessageId = existingDetailPages[pageIndex] ?? null;
+          const canReuseExistingDetailMarkup =
+            episodePages.length > 1 &&
+            existingDetailPages.length === episodePages.length &&
+            existingDetailPages.every((messageId) => typeof messageId === 'number' && messageId > 0);
+          const firstPassReplyMarkup = canReuseExistingDetailMarkup
+            ? (buildCollectionDetailReplyMarkup({
+                chatId: channel.tgChatId,
+                currentPage: pageIndex + 1,
+                totalPages: episodePages.length,
+                detailPageMessageIds: existingDetailPages,
+              }) ?? undefined)
+            : undefined;
           const firstPassHash = buildPageCombinedHash({
             text: detailText,
-            replyMarkup: undefined,
+            replyMarkup: firstPassReplyMarkup,
             schemaVersion: hashSchemaVersion,
           });
           const firstPassOldHashRecord = readHashRecord(
@@ -1802,6 +1822,7 @@ export async function handleCatalogJob(
               chatId: channel.tgChatId,
               text: detailText,
               existingMessageId: existingDetailMessageId,
+              replyMarkup: firstPassReplyMarkup,
             });
 
             if (selfHealEnabledOnRun && detailPublishResult.notModified) selfHealFixedCount += 1;

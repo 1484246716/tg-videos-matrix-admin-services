@@ -63,131 +63,13 @@ const DISPATCH_TASK_SELECT = {
   },
 } as const;
 
-export async function refreshCollectionSnapshotIncremental() {
-  const cursor = await prisma.collectionSnapshotCursor.upsert({
-    where: { id: 1 },
-    create: { id: 1, lastDispatchId: BigInt(0) },
-    update: {},
-    select: { id: true, lastDispatchId: true },
-  });
+type SnapshotHeadKeySet = Set<string>;
 
-  // === 前瞻扫描：按ID顺序从游标位置向后扫描 ===
-  // 不再按 status=success 过滤，避免原始Bug：
-  // 旧逻辑用 status=success 过滤查询，却用返回结果的最大ID推进游标，
-  // 导致中间尚未成功的任务ID被游标跳过，后续即使变成success也无法补录。
-  // 例：游标=11291时，11292/11293还是running，查询只返回11294，游标直接跳到11294，
-  // 等11292变成success后，下次查 id>11294，11292永远不会再被扫到。
-  const rows = await prisma.dispatchTask.findMany({
-    where: {
-      id: { gt: cursor.lastDispatchId },
-    },
-    orderBy: { id: 'asc' },
-    take: COLLECTION_SNAPSHOT_INCREMENTAL_BATCH_SIZE,
-    select: DISPATCH_TASK_SELECT,
-  });
+function addSnapshotHeadKey(keys: SnapshotHeadKeySet, channelId: bigint, collectionNameNormalized: string) {
+  keys.add(`${channelId.toString()}::${collectionNameNormalized}`);
+}
 
-  if (rows.length === 0) {
-    return { ok: true, scanned: 0, changed: 0, forwardChanged: 0, lookbackChanged: 0 };
-  }
-
-  // 游标推进到本批最大ID（不再用safeFrontier停等）
-  // 被跳过的活跃任务后续变成success后，由回看扫描兜底补录
-  const newCursor = rows[rows.length - 1].id;
-
-  // 前瞻结果中，只有success且已发送的任务才写入快照
-  const forwardRows = rows.filter(
-    (r) =>
-      r.status === TaskStatus.success &&
-      r.telegramMessageId !== null,
-  );
-
-  // === 回看扫描：捕获最近1小时内变成success的任务 ===
-  // 无论任务ID在游标前还是游标后，只要 updatedAt 在窗口内就扫描
-  // 这确保了：即使游标曾经跳过某个任务，当它变成success后也能被补录
-  const lookbackSince = new Date(Date.now() - LOOKBACK_WINDOW_MS);
-  const lookbackRows = await prisma.dispatchTask.findMany({
-    where: {
-      status: TaskStatus.success,
-      telegramMessageId: { not: null },
-      updatedAt: { gt: lookbackSince },
-    },
-    orderBy: { id: 'asc' },
-    take: COLLECTION_SNAPSHOT_INCREMENTAL_BATCH_SIZE,
-    select: DISPATCH_TASK_SELECT,
-  });
-
-  // 合并去重：前瞻 + 回看
-  const seenIds = new Set<string>();
-  const mergedRows: typeof rows = [];
-  for (const r of forwardRows) {
-    const key = r.id.toString();
-    if (!seenIds.has(key)) {
-      seenIds.add(key);
-      mergedRows.push(r);
-    }
-  }
-  for (const r of lookbackRows) {
-    const key = r.id.toString();
-    if (!seenIds.has(key)) {
-      seenIds.add(key);
-      mergedRows.push(r);
-    }
-  }
-  const lookbackOnlyCount = mergedRows.length - forwardRows.length;
-
-  let changed = 0;
-  let forwardChanged = 0;
-  let lookbackChanged = 0;
-  const forwardIdSet = new Set(forwardRows.map((r) => r.id.toString()));
-  const changedHeadKeys = new Set<string>();
-
-  for (const row of mergedRows) {
-    const meta = parseCollectionMeta(row.mediaAsset?.sourceMeta);
-    if (!meta) continue;
-
-    const collectionNameNormalized = normalizeCollectionKey(meta.collectionName);
-    const title = getFileStem(row.mediaAsset?.originalName || '') || `第${meta.episodeNo}集`;
-
-    await prisma.collectionEpisodeSnapshot.upsert({
-      where: {
-        channelId_collectionNameNormalized_episodeNo: {
-          channelId: row.channelId,
-          collectionNameNormalized,
-          episodeNo: meta.episodeNo,
-        },
-      },
-      create: {
-        channelId: row.channelId,
-        collectionNameNormalized,
-        episodeNo: meta.episodeNo,
-        telegramMessageId: row.telegramMessageId,
-        telegramMessageUrl: row.telegramMessageLink,
-        title,
-        isMissingPlaceholder: false,
-        sourceDispatchTaskId: row.id,
-        sourceUpdatedAt: row.finishedAt,
-        snapshotUpdatedAt: new Date(),
-      },
-      update: {
-        telegramMessageId: row.telegramMessageId,
-        telegramMessageUrl: row.telegramMessageLink,
-        title,
-        isMissingPlaceholder: false,
-        sourceDispatchTaskId: row.id,
-        sourceUpdatedAt: row.finishedAt,
-        snapshotUpdatedAt: new Date(),
-      },
-    });
-
-    changed += 1;
-    if (forwardIdSet.has(row.id.toString())) {
-      forwardChanged += 1;
-    } else {
-      lookbackChanged += 1;
-    }
-    changedHeadKeys.add(`${row.channelId.toString()}::${collectionNameNormalized}`);
-  }
-
+async function rebuildSnapshotHeads(changedHeadKeys: SnapshotHeadKeySet) {
   for (const key of changedHeadKeys) {
     const [channelIdRaw, collectionNameNormalized] = key.split('::');
     const channelId = BigInt(channelIdRaw);
@@ -242,6 +124,202 @@ export async function refreshCollectionSnapshotIncremental() {
       },
     });
   }
+}
+
+export async function refreshCollectionSnapshotIncremental() {
+  const cursor = await prisma.collectionSnapshotCursor.upsert({
+    where: { id: 1 },
+    create: { id: 1, lastDispatchId: BigInt(0) },
+    update: {},
+    select: { id: true, lastDispatchId: true },
+  });
+
+  // === 前瞻扫描：按ID顺序从游标位置向后扫描 ===
+  // 不再按 status=success 过滤，避免原始Bug：
+  // 旧逻辑用 status=success 过滤查询，却用返回结果的最大ID推进游标，
+  // 导致中间尚未成功的任务ID被游标跳过，后续即使变成success也无法补录。
+  // 例：游标=11291时，11292/11293还是running，查询只返回11294，游标直接跳到11294，
+  // 等11292变成success后，下次查 id>11294，11292永远不会再被扫到。
+  const rows = await prisma.dispatchTask.findMany({
+    where: {
+      id: { gt: cursor.lastDispatchId },
+    },
+    orderBy: { id: 'asc' },
+    take: COLLECTION_SNAPSHOT_INCREMENTAL_BATCH_SIZE,
+    select: DISPATCH_TASK_SELECT,
+  });
+
+  // 游标推进到本批最大ID（不再用safeFrontier停等）
+  // 被跳过的活跃任务后续变成success后，由回看扫描兜底补录
+  const newCursor = rows.length > 0 ? rows[rows.length - 1].id : cursor.lastDispatchId;
+
+  // 前瞻结果中，只有success且已发送的任务才写入快照
+  const forwardRows = rows.filter(
+    (r) =>
+      r.status === TaskStatus.success &&
+      r.telegramMessageId !== null,
+  );
+
+  // === 回看扫描：捕获最近1小时内变成success的任务 ===
+  // 无论任务ID在游标前还是游标后，只要 updatedAt 在窗口内就扫描
+  // 这确保了：即使游标曾经跳过某个任务，当它变成success后也能被补录
+  const lookbackSince = new Date(Date.now() - LOOKBACK_WINDOW_MS);
+  const lookbackRows = await prisma.dispatchTask.findMany({
+    where: {
+      status: TaskStatus.success,
+      telegramMessageId: { not: null },
+      updatedAt: { gt: lookbackSince },
+    },
+    orderBy: { id: 'asc' },
+    take: COLLECTION_SNAPSHOT_INCREMENTAL_BATCH_SIZE,
+    select: DISPATCH_TASK_SELECT,
+  });
+
+  // 合并去重：前瞻 + 回看
+  const seenIds = new Set<string>();
+  const mergedRows: typeof rows = [];
+  for (const r of forwardRows) {
+    const key = r.id.toString();
+    if (!seenIds.has(key)) {
+      seenIds.add(key);
+      mergedRows.push(r);
+    }
+  }
+  for (const r of lookbackRows) {
+    const key = r.id.toString();
+    if (!seenIds.has(key)) {
+      seenIds.add(key);
+      mergedRows.push(r);
+    }
+  }
+  const lookbackOnlyCount = mergedRows.length - forwardRows.length;
+
+  let changed = 0;
+  let forwardChanged = 0;
+  let lookbackChanged = 0;
+  let collectionEpisodeChanged = 0;
+  const forwardIdSet = new Set(forwardRows.map((r) => r.id.toString()));
+  const changedHeadKeys = new Set<string>();
+
+  for (const row of mergedRows) {
+    const meta = parseCollectionMeta(row.mediaAsset?.sourceMeta);
+    if (!meta) continue;
+
+    const collectionNameNormalized = normalizeCollectionKey(meta.collectionName);
+    const title = getFileStem(row.mediaAsset?.originalName || '') || `第${meta.episodeNo}集`;
+
+    await prisma.collectionEpisodeSnapshot.upsert({
+      where: {
+        channelId_collectionNameNormalized_episodeNo: {
+          channelId: row.channelId,
+          collectionNameNormalized,
+          episodeNo: meta.episodeNo,
+        },
+      },
+      create: {
+        channelId: row.channelId,
+        collectionNameNormalized,
+        episodeNo: meta.episodeNo,
+        telegramMessageId: row.telegramMessageId,
+        telegramMessageUrl: row.telegramMessageLink,
+        title,
+        isMissingPlaceholder: false,
+        sourceDispatchTaskId: row.id,
+        sourceUpdatedAt: row.finishedAt,
+        snapshotUpdatedAt: new Date(),
+      },
+      update: {
+        telegramMessageId: row.telegramMessageId,
+        telegramMessageUrl: row.telegramMessageLink,
+        title,
+        isMissingPlaceholder: false,
+        sourceDispatchTaskId: row.id,
+        sourceUpdatedAt: row.finishedAt,
+        snapshotUpdatedAt: new Date(),
+      },
+    });
+
+    changed += 1;
+    if (forwardIdSet.has(row.id.toString())) {
+      forwardChanged += 1;
+    } else {
+      lookbackChanged += 1;
+    }
+    addSnapshotHeadKey(changedHeadKeys, row.channelId, collectionNameNormalized);
+  }
+
+  const collectionEpisodeRows = await prisma.collectionEpisode.findMany({
+    where: {
+      telegramMessageId: { not: null },
+      updatedAt: { gt: lookbackSince },
+    },
+    orderBy: { id: 'asc' },
+    take: COLLECTION_SNAPSHOT_INCREMENTAL_BATCH_SIZE,
+    select: {
+      episodeNo: true,
+      episodeTitle: true,
+      fileNameSnapshot: true,
+      telegramMessageId: true,
+      telegramMessageLink: true,
+      publishedAt: true,
+      updatedAt: true,
+      collection: {
+        select: {
+          channelId: true,
+          nameNormalized: true,
+        },
+      },
+      mediaAsset: {
+        select: {
+          originalName: true,
+        },
+      },
+    },
+  });
+
+  for (const row of collectionEpisodeRows) {
+    const collectionNameNormalized = normalizeCollectionKey(row.collection.nameNormalized);
+    const title =
+      (row.episodeTitle || '').trim() ||
+      getFileStem(row.fileNameSnapshot || '') ||
+      getFileStem(row.mediaAsset?.originalName || '') ||
+      `第${row.episodeNo}集`;
+
+    await prisma.collectionEpisodeSnapshot.upsert({
+      where: {
+        channelId_collectionNameNormalized_episodeNo: {
+          channelId: row.collection.channelId,
+          collectionNameNormalized,
+          episodeNo: row.episodeNo,
+        },
+      },
+      create: {
+        channelId: row.collection.channelId,
+        collectionNameNormalized,
+        episodeNo: row.episodeNo,
+        telegramMessageId: row.telegramMessageId,
+        telegramMessageUrl: row.telegramMessageLink,
+        title,
+        isMissingPlaceholder: false,
+        sourceDispatchTaskId: null,
+        sourceUpdatedAt: row.publishedAt ?? row.updatedAt,
+        snapshotUpdatedAt: new Date(),
+      },
+      update: {
+        telegramMessageId: row.telegramMessageId,
+        telegramMessageUrl: row.telegramMessageLink,
+        title,
+        isMissingPlaceholder: false,
+        sourceUpdatedAt: row.publishedAt ?? row.updatedAt,
+        snapshotUpdatedAt: new Date(),
+      },
+    });
+
+    collectionEpisodeChanged += 1;
+    addSnapshotHeadKey(changedHeadKeys, row.collection.channelId, collectionNameNormalized);
+  }
+
+  await rebuildSnapshotHeads(changedHeadKeys);
 
   // 游标推进到本批最大ID
   await prisma.collectionSnapshotCursor.update({
@@ -254,12 +332,13 @@ export async function refreshCollectionSnapshotIncremental() {
     changed,
     forwardChanged,
     lookbackChanged,
+    collectionEpisodeChanged,
     lookbackOnlyCount,
     cursorFrom: cursor.lastDispatchId.toString(),
     cursorTo: newCursor.toString(),
   });
 
-  return { ok: true, scanned: rows.length, changed, forwardChanged, lookbackChanged };
+  return { ok: true, scanned: rows.length, changed, forwardChanged, lookbackChanged, collectionEpisodeChanged };
 }
 
 // 重置快照游标到0，触发全量补录
