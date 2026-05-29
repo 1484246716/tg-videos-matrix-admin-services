@@ -114,6 +114,7 @@ function renderCatalogPageContent(args: {
   videos: CatalogVideo[];
   pageNo: number;
   totalPages: number;
+  updateTimeText?: string;
 }) {
   let content = args.navTemplateText;
   content = content.replace(/{{channel_name}}/g, args.channelName);
@@ -129,10 +130,12 @@ function renderCatalogPageContent(args: {
       .join('');
   });
 
-  const beijingTimeStr = new Date(Date.now() + 8 * 3600 * 1000)
-    .toISOString()
-    .replace('T', ' ')
-    .slice(0, 19);
+  const beijingTimeStr =
+    args.updateTimeText ??
+    new Date(Date.now() + 8 * 3600 * 1000)
+      .toISOString()
+      .replace('T', ' ')
+      .slice(0, 19);
   content = content.replace(/{{update_time}}/g, beijingTimeStr);
 
   if (args.totalPages > 1) {
@@ -1625,6 +1628,13 @@ export async function handleCatalogJob(
       regularVideoCount: videos.length,
     });
     const videoPages = (navPagingEnabled && videos.length > 0) ? chunkVideos(videos, navPageSize) : [videos];
+    const stableUpdateTimeText =
+      options?.selfHealOnly && channel.lastNavUpdateAt
+        ? new Date(channel.lastNavUpdateAt.getTime() + 8 * 3600 * 1000)
+            .toISOString()
+            .replace('T', ' ')
+            .slice(0, 19)
+        : undefined;
     const pageContents = videoPages.map((pageVideos, index) =>
       renderCatalogPageContent({
         navTemplateText: channel.navTemplateText!,
@@ -1632,6 +1642,7 @@ export async function handleCatalogJob(
         videos: pageVideos,
         pageNo: index + 1,
         totalPages: videoPages.length,
+        updateTimeText: stableUpdateTimeText,
       }),
     );
 
@@ -2133,6 +2144,64 @@ export async function handleCatalogJob(
     let pinAttempted = false;
     let pinSuccess: boolean | null = null;
     let pinErrorMessage: string | null = null;
+    const existingMainNavMessageIdForSelfHeal = channel.navMessageId ? Number(channel.navMessageId) : null;
+
+    if (
+      options?.selfHealOnly &&
+      hasMainCatalogContent &&
+      pageContents.length <= 1 &&
+      hashGatePublishCount === 0 &&
+      selfHealOrphanCleanedCount === 0
+    ) {
+      const singlePageHash = buildPageCombinedHash({
+        text: mainCatalogPageContents[0] ?? mainCatalogContent,
+        replyMarkup: { inline_keyboard: [] },
+        schemaVersion: hashSchemaVersion,
+      });
+      const singlePageOldHash = readHashRecord(nextHashState, 'main_catalog', 1);
+      const shouldSkipSelfHealSinglePage = shouldSkipByHash({
+        enabled: TYPEC_HASH_GATE_ENABLED,
+        forceRepublish: hashForceRepublish,
+        existingMessageId: existingMainNavMessageIdForSelfHeal,
+        oldRecord: singlePageOldHash,
+        newCombinedHash: singlePageHash.combinedHash,
+        schemaVersion: hashSchemaVersion,
+      });
+
+      if (shouldSkipSelfHealSinglePage && existingMainNavMessageIdForSelfHeal) {
+        catalogMetrics.publishRunSkippedTotal += 1;
+        logger.info('[q_catalog] 自愈任务无差异，跳过目录更新', {
+          runId,
+          channelId: channelIdRaw,
+          triggerType,
+          reason: 'no_self_heal_diff',
+          hashGateSkipCount: hashGateSkipCount + 1,
+        });
+
+        if (catalogTaskId) {
+          await prisma.catalogTask.update({
+            where: { id: catalogTaskId },
+            data: {
+              status: CatalogTaskStatus.success,
+              finishedAt: new Date(),
+              telegramMessageId: BigInt(existingMainNavMessageIdForSelfHeal),
+              contentPreview,
+              errorMessage: null,
+            },
+          });
+        }
+
+        return {
+          ok: true,
+          skipped: true,
+          reason: 'no_self_heal_diff',
+          channelId: channelIdRaw,
+          messageId: existingMainNavMessageIdForSelfHeal,
+          runId,
+          triggerType,
+        };
+      }
+    }
 
     try {
       const channelAny = channel as any;
@@ -2367,16 +2436,20 @@ export async function handleCatalogJob(
         detailPageCountByCollection,
       });
 
+      const channelUpdateBase = {
+        navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
+        ...(options?.selfHealOnly ? {} : { lastNavUpdateAt: new Date() }),
+        navReplyMarkup: mergeCatalogHashStateIntoReplyMarkup(
+          mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState),
+          nextHashState,
+        ),
+      };
+
       try {
         await prisma.channel.update({
           where: { id: channelId },
           data: {
-            navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
-            lastNavUpdateAt: new Date(),
-            navReplyMarkup: mergeCatalogHashStateIntoReplyMarkup(
-              mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState),
-              nextHashState,
-            ),
+            ...channelUpdateBase,
             ...({ navPageMessageIds: publishedPageMessageIds } as any),
           } as any,
         });
@@ -2385,14 +2458,7 @@ export async function handleCatalogJob(
         if (updateMessage.includes('Unknown argument `navPageMessageIds`')) {
           await prisma.channel.update({
             where: { id: channelId },
-            data: {
-              navMessageId: finalMessageId ? BigInt(finalMessageId) : null,
-              lastNavUpdateAt: new Date(),
-              navReplyMarkup: mergeCatalogHashStateIntoReplyMarkup(
-                mergeCollectionNavStateIntoReplyMarkup(channel.navReplyMarkup, nextCollectionNavState),
-                nextHashState,
-              ) as any,
-            },
+            data: channelUpdateBase as any,
           });
         } else {
           throw updateError;
