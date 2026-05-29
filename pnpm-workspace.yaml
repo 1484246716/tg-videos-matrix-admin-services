@@ -5,7 +5,10 @@ packages:
 
 ignoredBuiltDependencies:
   - '@nestjs/core'
+  - bufferutil
+  - es5-ext
   - msgpackr-extract
+  - utf-8-validate
 
 onlyBuiltDependencies:
   - '@prisma/client'
