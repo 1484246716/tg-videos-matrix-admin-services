@@ -298,6 +298,10 @@ export const GRAMJS_BOT_TOKEN = process.env.GRAMJS_BOT_TOKEN || '';
 /** GramJS 用户会话串（推荐用于 clone 抓取） */
 export const GRAMJS_USER_SESSION = process.env.GRAMJS_USER_SESSION || '';
 
+/** 是否开启大文件走 GramJS 用户会话上传 */
+export const GRAMJS_LARGE_FILE_USE_USER_SESSION =
+  process.env.GRAMJS_LARGE_FILE_USE_USER_SESSION === 'true';
+
 /** GramJS 兼容会话串（历史变量，优先级低于 GRAMJS_USER_SESSION） */
 export const GRAMJS_SESSION = process.env.GRAMJS_SESSION || '';
 

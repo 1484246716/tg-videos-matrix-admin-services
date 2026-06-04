@@ -6,7 +6,8 @@
 import { basename } from 'node:path';
 import { stat } from 'node:fs/promises';
 import { Api } from 'telegram';
-import { getGramjsBotClient } from './client';
+import { GRAMJS_LARGE_FILE_USE_USER_SESSION } from '../../config/env';
+import { getGramjsBotClient, getGramjsUserClient } from './client';
 import type { GramjsSendResult, GramjsVideoMeta } from './types';
 
 // 通过 GramJS 发送媒体文件并返回消息标识。
@@ -21,7 +22,9 @@ export async function sendViaGramjs(args: {
   videoMeta?: GramjsVideoMeta;
   thumbnailPath?: string;
 }): Promise<GramjsSendResult> {
-  const client = await getGramjsBotClient();
+  const client = GRAMJS_LARGE_FILE_USE_USER_SESSION
+    ? await getGramjsUserClient({ forceEnvSession: true })
+    : await getGramjsBotClient();
   const fileName = args.fileName ?? basename(args.filePath);
 
   // 获取文件大小

@@ -19,6 +19,7 @@ import { logger } from '../../logger';
 let cachedBotClient: TelegramClient | null = null;
 let cachedUserClient: TelegramClient | null = null;
 let cachedUserClientPhone: string | null = null;
+let cachedUserClientSource: 'db' | 'env' | null = null;
 
 // 解密数据库中保存的加密 session 字符串。
 function decryptSession(encrypted: string) {
@@ -95,15 +96,24 @@ export async function getGramjsBotClient() {
 }
 
 // 获取并缓存 GramJS User 客户端（优先 DB，会话不足时回退 ENV）。
-export async function getGramjsUserClient() {
+export async function getGramjsUserClient(options: { forceEnvSession?: boolean } = {}) {
+  const forceEnvSession = options.forceEnvSession === true;
   if (cachedUserClient) {
     try {
       if (await cachedUserClient.isUserAuthorized()) {
-        return cachedUserClient;
+        if (!forceEnvSession || cachedUserClientSource === 'env') {
+          return cachedUserClient;
+        }
+
+        logger.info('[gramjs] cached DB user client ignored because env session is required', {
+          cachedSessionSource: cachedUserClientSource,
+          accountPhone: cachedUserClientPhone,
+        });
+      } else {
+        logger.warn('[gramjs] cached user client unauthorized, dropping cache', {
+          accountPhone: cachedUserClientPhone,
+        });
       }
-      logger.warn('[gramjs] cached user client unauthorized, dropping cache', {
-        accountPhone: cachedUserClientPhone,
-      });
     } catch (error) {
       logger.warn('[gramjs] cached user client check failed, dropping cache', {
         accountPhone: cachedUserClientPhone,
@@ -118,14 +128,16 @@ export async function getGramjsUserClient() {
     }
     cachedUserClient = null;
     cachedUserClientPhone = null;
+    cachedUserClientSource = null;
   }
 
   if (!GRAMJS_API_ID || !GRAMJS_API_HASH) {
     throw new Error('GramJS User 配置缺失：GRAMJS_API_ID / GRAMJS_API_HASH');
   }
 
-  try {
-    const candidates = await resolveUserSessionsFromDb();
+  if (!forceEnvSession) {
+    try {
+      const candidates = await resolveUserSessionsFromDb();
 
     for (const candidate of candidates) {
       const session = new StringSession(candidate.session);
@@ -166,6 +178,7 @@ export async function getGramjsUserClient() {
 
         cachedUserClient = client;
         cachedUserClientPhone = candidate.accountPhone;
+        cachedUserClientSource = 'db';
 
         logger.info('[gramjs] user client authorized', {
           sessionSource: 'db',
@@ -198,13 +211,14 @@ export async function getGramjsUserClient() {
         });
       }
     }
-  } catch (error) {
-    logger.warn('[gramjs] failed to load user sessions from db, fallback to env', {
-      reason: error instanceof Error ? error.message : String(error),
-    });
+    } catch (error) {
+      logger.warn('[gramjs] failed to load user sessions from db, fallback to env', {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
-  const envSession = GRAMJS_USER_SESSION || GRAMJS_SESSION;
+  const envSession = forceEnvSession ? GRAMJS_USER_SESSION : (GRAMJS_USER_SESSION || GRAMJS_SESSION);
   if (envSession) {
     const session = new StringSession(envSession);
     const client = new TelegramClient(session, GRAMJS_API_ID, GRAMJS_API_HASH, {
@@ -219,11 +233,11 @@ export async function getGramjsUserClient() {
 
     cachedUserClient = client;
     cachedUserClientPhone = null;
+    cachedUserClientSource = 'env';
 
-    logger.info('[gramjs] user client authorized', { sessionSource: 'env' });
+    logger.info('[gramjs] user client authorized', { sessionSource: 'env', forced: forceEnvSession });
     return client;
   }
 
   throw new Error('GramJS User 会话缺失：请先手机号登录或配置 GRAMJS_USER_SESSION');
 }
-
