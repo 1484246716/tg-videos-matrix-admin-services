@@ -310,6 +310,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
           select: {
             id: true,
             status: true,
+            ingestError: true,
             sourceMeta: true,
             telegramFileId: true,
             relayMessageId: true,
@@ -577,6 +578,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
         select: {
           id: true,
           status: true,
+          ingestError: true,
           sourceMeta: true,
           telegramFileId: true,
           relayMessageId: true,
@@ -594,6 +596,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
           select: {
             id: true,
             status: true,
+            ingestError: true,
             sourceMeta: true,
             telegramFileId: true,
             relayMessageId: true,
@@ -631,6 +634,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
             select: {
               id: true,
               status: true,
+              ingestError: true,
               sourceMeta: true,
               telegramFileId: true,
               relayMessageId: true,
@@ -687,6 +691,7 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
             select: {
               id: true,
               status: true,
+              ingestError: true,
               sourceMeta: true,
               telegramFileId: true,
               relayMessageId: true,
@@ -710,6 +715,43 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
       const isRetryableFailed =
         asset.status === MediaStatus.failed &&
         ingestFinalReason === TYPEA_INGEST_FINAL_REASON.retryable;
+      const ingestRetryCountRaw = sourceMeta.ingestRetryCount;
+      const ingestRetryCount =
+        typeof ingestRetryCountRaw === 'number'
+          ? ingestRetryCountRaw
+          : typeof ingestRetryCountRaw === 'string' && /^\d+$/.test(ingestRetryCountRaw)
+            ? Number(ingestRetryCountRaw)
+            : 0;
+
+      if (isRetryableFailed && ingestRetryCount >= (definition.maxRetries ?? 3)) {
+        await prisma.mediaAsset.update({
+          where: { id: asset.id },
+          data: {
+            status: MediaStatus.failed,
+            ingestError: asset.ingestError || `retryable failed exceed max retries (${definition.maxRetries ?? 3})`,
+            sourceMeta: {
+              ...sourceMeta,
+              ingestRetryCount,
+              ingestFinalReason: TYPEA_INGEST_FINAL_REASON.failedFinal,
+              ingestFinalizedAt: new Date().toISOString(),
+              ingestFinalizedReason: 'retryable_failed_exceed_definition_max_retries',
+              relayChannelId: definition.relayChannelId.toString(),
+              taskDefinitionId: definition.id.toString(),
+            },
+          },
+        });
+
+        logger.warn('[typea_metrics] relay scan finalized retryable failed asset', {
+          mediaAssetId: asset.id.toString(),
+          ingestRetryCount,
+          maxRetries: definition.maxRetries ?? 3,
+          typea_failed_final_total: 1,
+          metric_labels: {
+            typea_failed_final_total: 'TypeA 失败终态总数',
+          },
+        });
+        continue;
+      }
 
       const currentDispatchMediaType = inferDispatchMediaTypeFromFilePath(filePath);
       const normalizedCloneSourceChannelUsername = cloneSourceMeta?.sourceChannelUsername

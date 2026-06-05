@@ -6,12 +6,14 @@ import {
   BadRequestException,
   ForbiddenException,
 } from '@nestjs/common';
+import { Queue } from 'bullmq';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 import { access, unlink } from 'node:fs/promises';
 import IORedis from 'ioredis';
 import { PrismaService } from '../prisma/prisma.service';
 
 let mediaLifecycleRedis: IORedis | null = null;
+let relayUploadQueue: Queue | null = null;
 
 function getMediaLifecycleRedis() {
   if (mediaLifecycleRedis) return mediaLifecycleRedis;
@@ -21,6 +23,14 @@ function getMediaLifecycleRedis() {
     console.error('[redis] media-lifecycle redis error:', error?.message ?? error);
   });
   return mediaLifecycleRedis;
+}
+
+function getRelayUploadQueue() {
+  if (relayUploadQueue) return relayUploadQueue;
+  relayUploadQueue = new Queue('q_relay_upload', {
+    connection: getMediaLifecycleRedis() as any,
+  });
+  return relayUploadQueue;
 }
 
 const STAGE_FILTER_MAP: Record<string, { mediaStatus?: any; dispatchStatus?: any; catalogStatus?: any }> = {
@@ -86,6 +96,51 @@ async function removeFileIfExists(filePath?: string | null) {
       reason: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+async function cleanupRelayUploadJobs(mediaAssetIds: bigint[], groupJobIds: string[] = []) {
+  const queue = getRelayUploadQueue();
+  const jobIds = Array.from(new Set([
+    ...mediaAssetIds.map((assetId) => `relay-upload-${assetId.toString()}`),
+    ...groupJobIds.filter((jobId) => jobId.trim()),
+  ]));
+
+  const results: Array<{
+    jobId: string;
+    found: boolean;
+    state?: string;
+    removed: boolean;
+    reason?: string;
+  }> = [];
+
+  for (const jobId of jobIds) {
+    try {
+      const job = await queue.getJob(jobId);
+      if (!job) {
+        results.push({ jobId, found: false, removed: false, reason: 'not_found' });
+        continue;
+      }
+
+      const state = await job.getState();
+      const removed = await queue.remove(jobId, { removeChildren: true });
+      results.push({
+        jobId,
+        found: true,
+        state,
+        removed: removed > 0,
+        reason: removed > 0 ? 'removed' : 'locked_or_active',
+      });
+    } catch (error) {
+      results.push({
+        jobId,
+        found: true,
+        removed: false,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return results;
 }
 
 function normalizeCollectionKey(name: string) {
@@ -736,6 +791,9 @@ export class MediaLifecycleService {
     }
 
     const targetMediaAssetIds = [...targetMediaAssetIdSet].map((rawId) => BigInt(rawId));
+    const groupRelayJobIds = safeGroupKey
+      ? [`relay-upload-group-${existing.channelId.toString()}::${safeGroupKey}`]
+      : [];
 
     const targetAssets = await this.prisma.mediaAsset.findMany({
       where: { id: { in: targetMediaAssetIds } },
@@ -788,6 +846,8 @@ export class MediaLifecycleService {
     }
 
     try {
+      const relayUploadJobCleanup = await cleanupRelayUploadJobs(targetMediaAssetIds, groupRelayJobIds);
+
       const fileDeleteResults = await Promise.all(
         targetAssets.map(async (asset) => {
           const localDelete = await removeFileIfExists(asset.localPath);
@@ -984,6 +1044,7 @@ export class MediaLifecycleService {
         ok: true,
         deletedMediaAssetIds: deleted.deletedMediaAssetIds,
         deletedDispatchTaskCount: deleted.deletedDispatchTaskCount,
+        relayUploadJobCleanup,
         physicalDeleted: fileDeleteResults,
       };
     } catch (error) {

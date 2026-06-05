@@ -316,7 +316,7 @@ export const GRAMJS_UPLOAD_WORKERS = Number(
 
 /** 超过该大小（MB）优先走 GramJS 上传 */
 export const RELAY_UPLOAD_GRAMJS_THRESHOLD_MB = Number(
-  process.env.RELAY_UPLOAD_GRAMJS_THRESHOLD_MB || '1024',
+  process.env.RELAY_UPLOAD_GRAMJS_THRESHOLD_MB || '20',
 );
 
 /** 超过该大小（MB）时发送为 document 而非普通 video */

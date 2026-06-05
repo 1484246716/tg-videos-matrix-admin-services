@@ -86,6 +86,26 @@ function calcIngestDurationSec(startedAt?: Date | null, finishedAt?: Date | null
   return Math.floor(diffMs / 1000);
 }
 
+function getErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== 'object') return null;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' && code.trim() ? code.trim() : null;
+}
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === 'object') {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === 'string' && message.trim()) return message.trim();
+  }
+  return String(error);
+}
+
+function isFatalTelegramRpcError(errorCode: string | null, message: string) {
+  if (errorCode === 'TG_400') return true;
+  return /DOUBLE_VALUE_INVALID|INTEGER_VALUE_INVALID|PHOTO_INVALID_DIMENSIONS|FILE_PARTS_INVALID|MSG_ID_INVALID/i.test(message);
+}
+
 // 构建上传进度缓存 key。
 function buildProgressKey(mediaAssetId: string) {
   return `media:progress:${mediaAssetId}`;
@@ -941,6 +961,7 @@ export const relayUploadWorker = new Worker(
     }
 
     const selectedRelayChannelId = relayChannel.id?.toString?.() ?? String(relayChannel.id);
+    const selectedRelayChatId = relayChannel.tgChatId.toString();
 
     logger.info('[q_relay_upload] 固定选中中转频道(按频道绑定bot)', {
       traceId,
@@ -948,6 +969,7 @@ export const relayUploadWorker = new Worker(
       channelId: channel.id.toString(),
       channelBotId: channel.defaultBotId.toString(),
       relayChannelId: selectedRelayChannelId,
+      relayChatId: selectedRelayChatId,
       relayBotId: relayChannel.bot.id.toString(),
       sourceRelayChannelId: relayChannelIdRaw,
       pickMode: 'fixed_by_channel_bot',
@@ -1043,7 +1065,9 @@ export const relayUploadWorker = new Worker(
         traceId,
         stage: 'start',
         mediaAssetId: mediaAssetIdRaw,
-        relayChannelId: relayChannelIdRaw,
+        relayChannelId: selectedRelayChannelId,
+        relayChatId: selectedRelayChatId,
+        sourceRelayChannelId: relayChannelIdRaw,
         uploadMethod: 'gramjs_sendVideo',
         fileSize,
       });
@@ -1053,10 +1077,12 @@ export const relayUploadWorker = new Worker(
       const logGramjsProgressMilestone = createProgressMilestoneLogger({
         traceId,
         mediaAssetId: mediaAssetIdRaw,
-        relayChannelId: relayChannelIdRaw,
+        relayChannelId: selectedRelayChannelId,
         stage: 'gramjs_progress',
         extra: {
           uploadMethod: 'gramjs_sendVideo',
+          relayChatId: selectedRelayChatId,
+          sourceRelayChannelId: relayChannelIdRaw,
         },
       });
 
@@ -1098,7 +1124,9 @@ export const relayUploadWorker = new Worker(
         traceId,
         stage: 'send_request',
         mediaAssetId: mediaAssetIdRaw,
-        relayChannelId: relayChannelIdRaw,
+        relayChannelId: selectedRelayChannelId,
+        relayChatId: selectedRelayChatId,
+        sourceRelayChannelId: relayChannelIdRaw,
         durationMs: Date.now() - uploadStart,
       });
 
@@ -1230,10 +1258,12 @@ export const relayUploadWorker = new Worker(
     const logUploadProgressMilestone = createProgressMilestoneLogger({
       traceId,
       mediaAssetId: mediaAssetIdRaw,
-      relayChannelId: relayChannelIdRaw,
+      relayChannelId: selectedRelayChannelId,
       stage: 'upload_progress_percent',
       extra: {
         uploadMethod,
+        relayChatId: selectedRelayChatId,
+        sourceRelayChannelId: relayChannelIdRaw,
       },
     });
 
@@ -1286,7 +1316,9 @@ export const relayUploadWorker = new Worker(
       traceId,
       stage: 'start',
       mediaAssetId: mediaAssetIdRaw,
-      relayChannelId: relayChannelIdRaw,
+      relayChannelId: selectedRelayChannelId,
+      relayChatId: selectedRelayChatId,
+      sourceRelayChannelId: relayChannelIdRaw,
       uploadMethod,
     });
 
@@ -1298,7 +1330,9 @@ export const relayUploadWorker = new Worker(
         traceId,
         stage: 'upload_progress',
         mediaAssetId: mediaAssetIdRaw,
-        relayChannelId: relayChannelIdRaw,
+        relayChannelId: selectedRelayChannelId,
+        relayChatId: selectedRelayChatId,
+        sourceRelayChannelId: relayChannelIdRaw,
         elapsedMs: Date.now() - uploadStart,
       });
     }, 60 * 1000);
@@ -1321,7 +1355,9 @@ export const relayUploadWorker = new Worker(
         traceId,
         stage: 'send_request',
         mediaAssetId: mediaAssetIdRaw,
-        relayChannelId: relayChannelIdRaw,
+        relayChannelId: selectedRelayChannelId,
+        relayChatId: selectedRelayChatId,
+        sourceRelayChannelId: relayChannelIdRaw,
         durationMs: Date.now() - uploadStart,
       });
 
@@ -1429,7 +1465,9 @@ export const relayUploadWorker = new Worker(
       traceId,
       stage: 'send_request',
       mediaAssetId: mediaAssetIdRaw,
-      relayChannelId: relayChannelIdRaw,
+      relayChannelId: selectedRelayChannelId,
+      relayChatId: selectedRelayChatId,
+      sourceRelayChannelId: relayChannelIdRaw,
       durationMs: Date.now() - uploadStart,
     });
 
@@ -1557,12 +1595,14 @@ relayUploadWorker.on('failed', async (job, err) => {
             ? Number(ingestRetryCountRaw)
             : 0;
 
-      const message = err instanceof Error ? err.message : String(err);
+      const errorCode = getErrorCode(err);
+      const message = getErrorMessage(err);
       const isCommandMissing = /spawn\s+(ffmpeg|ffprobe)\s+ENOENT/i.test(message);
       const isFileMissing = message.includes('ENOENT: no such file or directory') && !isCommandMissing;
       // Telegram RPC 确定性错误（参数非法），重试无效，直接标记 failedFinal
-      const isTelegramRpcFatal = /DOUBLE_VALUE_INVALID|INTEGER_VALUE_INVALID|PHOTO_INVALID_DIMENSIONS|FILE_PARTS_INVALID|MSG_ID_INVALID/i.test(message);
-      const exceeded = ingestRetryCount >= TYPEA_INGEST_MAX_RETRIES;
+      const isTelegramRpcFatal = isFatalTelegramRpcError(errorCode, message);
+      const nextIngestRetryCount = isTelegramRpcFatal ? ingestRetryCount : ingestRetryCount + 1;
+      const exceeded = nextIngestRetryCount >= TYPEA_INGEST_MAX_RETRIES;
       const finalOnMissing = TYPEA_FAIL_ON_FILE_MISSING && isFileMissing;
       const isFinal = exceeded || finalOnMissing || isTelegramRpcFatal;
 
@@ -1581,19 +1621,21 @@ relayUploadWorker.on('failed', async (job, err) => {
               : isCommandMissing
                 ? 'TOOL_MISSING: ffmpeg/ffprobe not found in PATH'
                 : isTelegramRpcFatal
-                  ? `TG_RPC_FATAL: ${message}`
+                  ? `TG_RPC_FATAL${errorCode ? ` (${errorCode})` : ''}: ${message}`
                   : message || '未知错误',
             ingestFinishedAt,
             ingestDurationSec: null,
             sourceMeta: {
               ...sourceMeta,
-              ingestRetryCount,
+              ingestRetryCount: nextIngestRetryCount,
               ingestErrorCode: isFileMissing
                 ? TYPEA_INGEST_ERROR_CODE.srcFileMissing
-                : TYPEA_INGEST_ERROR_CODE.ingestRuntimeError,
+                : errorCode ?? TYPEA_INGEST_ERROR_CODE.ingestRuntimeError,
               ingestFinalReason: isFinal
                 ? TYPEA_INGEST_FINAL_REASON.failedFinal
                 : TYPEA_INGEST_FINAL_REASON.retryable,
+              ingestLastErrorAt: new Date().toISOString(),
+              ingestLastErrorMessage: message || '未知错误',
               ingestLeaseUntil: null,
               ingestWorkerJobId: null,
               ingestLastHeartbeatAt: new Date().toISOString(),
@@ -1610,9 +1652,15 @@ relayUploadWorker.on('failed', async (job, err) => {
         task_run_total: 1,
         task_failed_total: 1,
         task_dead_total: isFinal ? 1 : 0,
-        ingestRetryCount,
+        ingestRetryCount: nextIngestRetryCount,
+        previousIngestRetryCount: ingestRetryCount,
         maxRetries: TYPEA_INGEST_MAX_RETRIES,
         failOnFileMissing: TYPEA_FAIL_ON_FILE_MISSING,
+        errorCode,
+        isTelegramRpcFatal,
+        ingestFinalReason: isFinal
+          ? TYPEA_INGEST_FINAL_REASON.failedFinal
+          : TYPEA_INGEST_FINAL_REASON.retryable,
         metric_labels: {
           typea_file_missing_total: 'TypeA 源文件缺失总数',
           typea_failed_final_total: 'TypeA 失败终态总数',
