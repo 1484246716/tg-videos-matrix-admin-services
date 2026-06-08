@@ -52,6 +52,7 @@ export const TYPEA_INGEST_ERROR_CODE = {
   ingestRuntimeError: 'INGEST_RUNTIME_ERROR',
   ingestStuckTimeout: 'INGEST_STUCK_TIMEOUT',
   fileTooLarge: 'FILE_TOO_LARGE',
+  moovAtomNotFound: 'MOOV_ATOM_NOT_FOUND',
 } as const;
 
 export const TYPEA_INGEST_FINAL_REASON = {

@@ -13,6 +13,7 @@ import {
   RELAY_ENABLE_FFPROBE_CHECK,
   RELAY_FFPROBE_MIN_DURATION_SEC,
   RELAY_FFPROBE_TIMEOUT_MS,
+  RELAY_MOOV_ATOM_FAIL_STALE_MS,
   RELAY_MIN_STABLE_CHECKS,
   RELAY_MTIME_COOLDOWN_MS,
   RELAY_STABLE_INTERVAL_MS,
@@ -113,6 +114,29 @@ const SUPPORTED_TEXT_EXT = new Set(['.txt']);
 const execFileAsync = promisify(execFile);
 // 简单异步等待函数。
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export function isMoovAtomNotFoundError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /moov atom not found/i.test(message);
+}
+
+export async function getStaleMoovAtomFailureDecision(filePath: string, error: unknown) {
+  if (!isMoovAtomNotFoundError(error)) {
+    return { shouldFailFinal: false, reason: 'not_moov_atom_error' } as const;
+  }
+
+  const fileStat = await stat(filePath);
+  const ageMs = Date.now() - fileStat.mtimeMs;
+  const shouldFailFinal = ageMs >= RELAY_MOOV_ATOM_FAIL_STALE_MS;
+
+  return {
+    shouldFailFinal,
+    reason: shouldFailFinal ? 'stale_moov_atom_not_found' : 'mtime_not_stale_enough',
+    ageMs,
+    thresholdMs: RELAY_MOOV_ATOM_FAIL_STALE_MS,
+    fileSize: Number(fileStat.size),
+  } as const;
+}
 
 export type VideoProbeMeta = {
   durationSec: number | null;

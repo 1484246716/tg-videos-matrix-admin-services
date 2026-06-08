@@ -15,6 +15,7 @@ import { logger, logError, toReadableErrorSummary } from '../logger';
 import {
   createVideoThumbnail,
   ensureMp4Faststart,
+  getStaleMoovAtomFailureDecision,
   getVideoProbeMeta,
   waitForFileStable,
 } from '../shared/file-utils';
@@ -1579,13 +1580,83 @@ relayUploadWorker.on('failed', async (job, err) => {
     try {
       const asset = await prisma.mediaAsset.findUnique({
         where: { id: BigInt(mediaAssetIdRaw) },
-        select: { status: true, sourceMeta: true },
+        select: { status: true, sourceMeta: true, localPath: true, fileSize: true },
       });
 
       const sourceMeta =
         asset?.sourceMeta && typeof asset.sourceMeta === 'object'
           ? (asset.sourceMeta as Record<string, unknown>)
           : {};
+
+      if (asset && asset.status !== MediaStatus.relay_uploaded) {
+        try {
+          const moovDecision = await getStaleMoovAtomFailureDecision(asset.localPath, err);
+          if (moovDecision.shouldFailFinal) {
+            const ingestFinishedAt = new Date();
+            const ingestError = `MOOV_ATOM_NOT_FOUND: ffprobe failed after ${Math.floor(moovDecision.ageMs / 60000)} minutes; source deleted`;
+
+            await prisma.mediaAsset.updateMany({
+              where: { id: BigInt(mediaAssetIdRaw), status: { not: MediaStatus.relay_uploaded } },
+              data: {
+                status: MediaStatus.failed,
+                ingestError,
+                ingestFinishedAt,
+                ingestDurationSec: null,
+                sourceMeta: {
+                  ...sourceMeta,
+                  ingestErrorCode: TYPEA_INGEST_ERROR_CODE.moovAtomNotFound,
+                  ingestFinalReason: TYPEA_INGEST_FINAL_REASON.failedFinal,
+                  ingestLastErrorAt: new Date().toISOString(),
+                  ingestLastErrorMessage: err instanceof Error ? err.message : String(err),
+                  ingestFailureAction: 'delete_source_file',
+                  staleMoovAtomAgeMs: Math.floor(moovDecision.ageMs),
+                  staleMoovAtomThresholdMs: moovDecision.thresholdMs,
+                  staleMoovAtomReason: moovDecision.reason,
+                  ingestLeaseUntil: null,
+                  ingestWorkerJobId: null,
+                  ingestLastHeartbeatAt: new Date().toISOString(),
+                  ingestStage: 'failed',
+                },
+              } as any,
+            });
+
+            try {
+              await unlink(asset.localPath);
+              logger.warn('[q_relay_upload] stale moov atom failure marked failed and source deleted', {
+                mediaAssetId: mediaAssetIdRaw,
+                filePath: asset.localPath,
+                fileSize: asset.fileSize?.toString?.() ?? null,
+                ageMs: Math.floor(moovDecision.ageMs),
+                thresholdMs: moovDecision.thresholdMs,
+                action: 'mark_failed_delete_source',
+              });
+            } catch (deleteError) {
+              logger.warn('[q_relay_upload] stale moov atom failure marked failed but source delete failed', {
+                mediaAssetId: mediaAssetIdRaw,
+                filePath: asset.localPath,
+                reason: deleteError instanceof Error ? deleteError.message : String(deleteError),
+                action: 'mark_failed_delete_source_failed',
+              });
+            }
+
+            logger.info('[typea_metrics] relay upload failed', {
+              mediaAssetId: mediaAssetIdRaw,
+              typea_failed_final_total: 1,
+              task_run_total: 1,
+              task_failed_total: 1,
+              task_dead_total: 1,
+              ingestErrorCode: TYPEA_INGEST_ERROR_CODE.moovAtomNotFound,
+              ingestFinalReason: TYPEA_INGEST_FINAL_REASON.failedFinal,
+            });
+            return;
+          }
+        } catch (moovHandleError) {
+          logger.warn('[q_relay_upload] stale moov atom failure handling skipped', {
+            mediaAssetId: mediaAssetIdRaw,
+            reason: moovHandleError instanceof Error ? moovHandleError.message : String(moovHandleError),
+          });
+        }
+      }
 
       const ingestRetryCountRaw = sourceMeta.ingestRetryCount;
       const ingestRetryCount =

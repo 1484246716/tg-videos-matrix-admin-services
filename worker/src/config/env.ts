@@ -373,6 +373,13 @@ export const RELAY_FFPROBE_TIMEOUT_MS = parseInt(process.env.RELAY_FFPROBE_TIMEO
 /** FFprobe 判定最小时长（秒） */
 export const RELAY_FFPROBE_MIN_DURATION_SEC = parseInt(process.env.RELAY_FFPROBE_MIN_DURATION_SEC || '1', 10);
 
+/** Mark old MP4 moov atom failures as final bad files and delete source */
+export const RELAY_MOOV_ATOM_FAIL_STALE_MS = (() => {
+  const n = Number(process.env.RELAY_MOOV_ATOM_FAIL_STALE_MS ?? '1800000');
+  if (!Number.isFinite(n) || n < 60000) return 1800000;
+  return Math.min(24 * 60 * 60 * 1000, Math.floor(n));
+})();
+
 /** 本地路径锁 TTL（毫秒） */
 export const RELAY_LOCAL_PATH_LOCK_TTL_MS = Number(
   process.env.RELAY_LOCAL_PATH_LOCK_TTL_MS || '120000',

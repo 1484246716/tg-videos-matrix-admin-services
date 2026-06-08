@@ -11,6 +11,7 @@ import { prisma, getTaskDefinitionModel } from '../infra/prisma';
 import { logger } from '../logger';
 import {
   buildRelayPathFingerprint,
+  getStaleMoovAtomFailureDecision,
   hashFile,
   scanChannelVideos,
   waitForFileStable,
@@ -34,6 +35,117 @@ async function removeLocalDuplicateFile(filePath: string, mediaAssetId: string) 
       mediaAssetId,
       error: error instanceof Error ? error.message : String(error),
       action: 'delete_local_duplicate_file_failed',
+    });
+  }
+}
+
+async function markStaleMoovAtomFailureAndDelete(args: {
+  channelId: bigint;
+  filePath: string;
+  relayChannelId: bigint;
+  taskDefinitionId: bigint;
+  priority: number;
+  maxRetries: number;
+  reason: string;
+  ageMs: number;
+  thresholdMs: number;
+  fileSize: number;
+}) {
+  const { pathNormalized, pathFingerprint } = buildRelayPathFingerprint(args.channelId, args.filePath);
+  const fileHash = `bad-moov:${pathFingerprint}`;
+  const ingestError = `MOOV_ATOM_NOT_FOUND: ffprobe failed after ${Math.floor(args.ageMs / 60000)} minutes; source deleted`;
+  const failedAt = new Date().toISOString();
+
+  const existing = await prisma.mediaAsset.findFirst({
+    where: {
+      OR: [
+        { channelId: args.channelId, pathFingerprint },
+        {
+          fileHash,
+          fileSize: BigInt(args.fileSize),
+        },
+      ],
+    },
+    select: {
+      id: true,
+      status: true,
+      sourceMeta: true,
+    },
+  });
+
+  const sourceMeta =
+    existing?.sourceMeta && typeof existing.sourceMeta === 'object'
+      ? (existing.sourceMeta as Record<string, unknown>)
+      : {};
+
+  if (existing && existing.status !== MediaStatus.relay_uploaded && existing.status !== MediaStatus.deleted) {
+    await prisma.mediaAsset.update({
+      where: { id: existing.id },
+      data: {
+        status: MediaStatus.failed,
+        ingestError,
+        sourceMeta: {
+          ...sourceMeta,
+          relayChannelId: args.relayChannelId.toString(),
+          taskDefinitionId: args.taskDefinitionId.toString(),
+          ingestErrorCode: TYPEA_INGEST_ERROR_CODE.moovAtomNotFound,
+          ingestFinalReason: TYPEA_INGEST_FINAL_REASON.failedFinal,
+          ingestFailedAt: failedAt,
+          ingestFailureAction: 'delete_source_file',
+          staleMoovAtomAgeMs: Math.floor(args.ageMs),
+          staleMoovAtomThresholdMs: args.thresholdMs,
+          staleMoovAtomReason: args.reason,
+          ingestLeaseUntil: null,
+          ingestWorkerJobId: null,
+        },
+      },
+    });
+  } else if (!existing) {
+    await prisma.mediaAsset.create({
+      data: {
+        channelId: args.channelId,
+        originalName: basename(args.filePath),
+        localPath: args.filePath,
+        pathNormalized,
+        pathFingerprint,
+        fileSize: BigInt(args.fileSize),
+        fileHash,
+        status: MediaStatus.failed,
+        ingestError,
+        sourceMeta: {
+          relayChannelId: args.relayChannelId.toString(),
+          taskDefinitionId: args.taskDefinitionId.toString(),
+          relayPriority: args.priority,
+          relayMaxRetries: args.maxRetries,
+          ingestErrorCode: TYPEA_INGEST_ERROR_CODE.moovAtomNotFound,
+          ingestFinalReason: TYPEA_INGEST_FINAL_REASON.failedFinal,
+          ingestFailedAt: failedAt,
+          ingestFailureAction: 'delete_source_file',
+          staleMoovAtomAgeMs: Math.floor(args.ageMs),
+          staleMoovAtomThresholdMs: args.thresholdMs,
+          staleMoovAtomReason: args.reason,
+        },
+      },
+    });
+  }
+
+  try {
+    await unlink(args.filePath);
+    logger.warn('[relay] stale moov atom failure marked failed and source deleted', {
+      channelId: args.channelId.toString(),
+      filePath: args.filePath,
+      fileSize: args.fileSize,
+      ageMs: Math.floor(args.ageMs),
+      thresholdMs: args.thresholdMs,
+      reason: args.reason,
+      action: 'mark_failed_delete_source',
+    });
+  } catch (deleteError) {
+    logger.warn('[relay] stale moov atom failure marked failed but source delete failed', {
+      channelId: args.channelId.toString(),
+      filePath: args.filePath,
+      reason: deleteError instanceof Error ? deleteError.message : String(deleteError),
+      action: 'mark_failed_delete_source_failed',
     });
   }
 }
@@ -290,6 +402,29 @@ export async function enqueueRelayAssetsFromTaskDefinition(taskDefinitionId: big
       try {
         await waitForFileStable(filePath);
       } catch (error) {
+        try {
+          const moovDecision = await getStaleMoovAtomFailureDecision(filePath, error);
+          if (moovDecision.shouldFailFinal) {
+            await markStaleMoovAtomFailureAndDelete({
+              channelId: channel.id,
+              filePath,
+              relayChannelId: definition.relayChannelId,
+              taskDefinitionId: definition.id,
+              priority: definition.priority,
+              maxRetries: definition.maxRetries,
+              reason: moovDecision.reason,
+              ageMs: moovDecision.ageMs,
+              thresholdMs: moovDecision.thresholdMs,
+              fileSize: moovDecision.fileSize,
+            });
+          }
+        } catch (moovHandleError) {
+          logger.warn('[relay] stale moov atom failure handling skipped', {
+            filePath,
+            reason: moovHandleError instanceof Error ? moovHandleError.message : String(moovHandleError),
+          });
+        }
+
         logger.warn('[relay] 文件未稳定或不可用，跳过', {
           filePath,
           reason: error instanceof Error ? error.message : String(error),
