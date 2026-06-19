@@ -48,6 +48,12 @@ export class MediaLifecycleController {
   }
 
   @Permissions('media-lifecycle:view')
+  @Get('dashboard-summary')
+  getDashboardSummary(@Request() req?: AuthRequest) {
+    return this.mediaLifecycleService.getDashboardSummary(req?.user.userId, req?.user.role);
+  }
+
+  @Permissions('media-lifecycle:view')
   @Get(':id')
   getDetail(@Param('id') id: string, @Request() req: AuthRequest) {
     return this.mediaLifecycleService.getDetail(id, req.user.userId, req.user.role);

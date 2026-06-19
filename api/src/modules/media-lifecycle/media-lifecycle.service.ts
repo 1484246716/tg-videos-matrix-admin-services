@@ -465,6 +465,58 @@ export class MediaLifecycleService {
     };
   }
 
+  async getDashboardSummary(userId?: string, role?: string) {
+    const now = new Date();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const last7Days = new Date(now.getTime() - 7 * dayMs);
+    const last30Days = new Date(now.getTime() - 30 * dayMs);
+    const todayStart = new Date(now);
+    todayStart.setHours(0, 0, 0, 0);
+
+    const channelFilter = role === 'admin' ? undefined : { createdBy: userId ? BigInt(userId) : undefined };
+
+    const [
+      totalMedia,
+      last7DaysMedia,
+      last30DaysMedia,
+      todayMedia,
+      failedMedia,
+      dispatchedToday,
+      totalChannels,
+      totalBots,
+    ] = await this.prisma.$transaction([
+      this.prisma.mediaAsset.count({ where: { channel: channelFilter } }),
+      this.prisma.mediaAsset.count({ where: { createdAt: { gte: last7Days }, channel: channelFilter } }),
+      this.prisma.mediaAsset.count({ where: { createdAt: { gte: last30Days }, channel: channelFilter } }),
+      this.prisma.mediaAsset.count({ where: { createdAt: { gte: todayStart }, channel: channelFilter } }),
+      this.prisma.mediaAsset.count({ where: { status: 'failed', channel: channelFilter } }),
+      this.prisma.dispatchTask.count({
+        where: {
+          status: 'success',
+          finishedAt: { gte: todayStart },
+          channel: channelFilter,
+        },
+      }),
+      this.prisma.channel.count(),
+      this.prisma.bot.count(),
+    ]);
+
+    const todaySuccessRate = todayMedia > 0 ? Number(((dispatchedToday / todayMedia) * 100).toFixed(1)) : 0;
+
+    return {
+      media: {
+        total: totalMedia,
+        last7Days: last7DaysMedia,
+        last30Days: last30DaysMedia,
+        today: todayMedia,
+        failed: failedMedia,
+        todaySuccessRate,
+      },
+      channels: { total: totalChannels },
+      bots: { total: totalBots },
+    };
+  }
+
   async getProgress(ids: string[]) {
     if (!ids.length) return {};
     const redis = getMediaLifecycleRedis();
