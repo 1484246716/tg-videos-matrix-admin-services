@@ -65,7 +65,7 @@ services:
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/tg_crm?schema=public
       REDIS_URL: ${REDIS_URL}
       NODE_ENV: ${NODE_ENV}
       PORT: ${PORT}
@@ -123,7 +123,7 @@ services:
       ffmpeg:
         condition: service_started
     environment:
-      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/tg_crm?schema=public
       REDIS_URL: ${REDIS_URL}
       NODE_ENV: ${NODE_ENV}
       SCHEDULER_POLL_MS: ${SCHEDULER_POLL_MS:-10000}
